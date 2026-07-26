@@ -43,7 +43,7 @@ def test_artifact_schema_round_trip(tmp_path):
     write_json_artifact(path, manifest)
     loaded = read_json_artifact(path, RunManifest)
     assert loaded == manifest
-    assert json.loads(path.read_text(encoding='utf-8'))['schema_version'] == '1.0'
+    assert json.loads(path.read_text(encoding='utf-8'))['schema_version'] == '1.1'
 
 
 def test_prediction_and_audit_round_trip(tmp_path):

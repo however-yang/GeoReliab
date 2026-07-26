@@ -7,7 +7,7 @@ from enum import Enum
 import math
 from typing import Any, Iterable
 
-from .contracts import ScientificValidity
+from .contracts import RunMode, ScientificValidity
 
 
 GEOMETRY_DELTA_THRESHOLD = 0.05
@@ -36,12 +36,17 @@ class GateStatus(str, Enum):
     FAIL = "FAIL"
     BLOCKED = "BLOCKED"
 
+    @property
+    def is_terminal(self) -> bool:
+        return self in (GateStatus.PASS, GateStatus.FAIL)
+
 
 class SelectedTrack(str, Enum):
     GEOMETRY = "GEOMETRY_CAUSAL_AUDIT"
     GEORELIAB = "GEORELIAB"
     STOP = "STOP_AND_RETURN_RESOURCES"
     BLOCKED = "BLOCKED_MISSING_EVIDENCE"
+    BLOCKED_PENDING_GEOMETRY = 'BLOCKED_PENDING_GEOMETRY'
     NON_SCIENTIFIC = "BLOCKED_NON_SCIENTIFIC_FIXTURE"
 
 
@@ -131,6 +136,8 @@ class GeometryGateInput:
     matched_intervention_effective: bool
     evidence: tuple[GeometryEvidence, ...]
     fixed_inputs_verified: bool
+    run_mode: RunMode = RunMode.REAL
+    evidence_schema_version: str = '1.1'
 
 
 def _models_with_geometry_coverage(
@@ -172,14 +179,39 @@ def _models_with_control_coverage(
     }
 
 
+def _scientific_evidence_reason(
+    scientific_validity: ScientificValidity,
+    run_mode: RunMode,
+    evidence_schema_version: str,
+) -> str | None:
+    if run_mode is RunMode.SMOKE or (
+        scientific_validity is ScientificValidity.NON_SCIENTIFIC_SMOKE
+    ):
+        return 'NON_SCIENTIFIC_SMOKE'
+    if run_mode is RunMode.FIXTURE or (
+        scientific_validity is ScientificValidity.NON_SCIENTIFIC_FIXTURE
+    ):
+        return 'NON_SCIENTIFIC_FIXTURE'
+    if scientific_validity is not ScientificValidity.SCIENTIFIC:
+        return 'NON_SCIENTIFIC_EVIDENCE'
+    if run_mode is not RunMode.REAL:
+        return 'SCIENTIFIC_REAL_TEST_EVIDENCE_REQUIRED'
+    if evidence_schema_version != '1.1':
+        return 'SCHEMA_V1_1_TEST_EVIDENCE_REQUIRED'
+    return None
+
+
 def evaluate_geometry_gate(value: GeometryGateInput) -> GateDecision:
     """Apply the approved Geometry MVE engineering and scientific gates."""
 
-    if value.scientific_validity is not ScientificValidity.SCIENTIFIC:
+    evidence_reason = _scientific_evidence_reason(
+        value.scientific_validity, value.run_mode, value.evidence_schema_version
+    )
+    if evidence_reason is not None:
         return GateDecision(
             lane="geometry",
             status=GateStatus.BLOCKED,
-            reason_codes=("NON_SCIENTIFIC_FIXTURE",),
+            reason_codes=(evidence_reason,),
             details={},
             scientific_validity=value.scientific_validity,
         )
@@ -458,16 +490,21 @@ class GeoReliabGateInput:
     conditions: tuple[GeoReliabConditionEvidence, ...]
     downstream_harm: tuple[DownstreamHarmEvidence, ...]
     zero_update: tuple[ZeroUpdateEvidence, ...]
+    run_mode: RunMode = RunMode.REAL
+    evidence_schema_version: str = '1.1'
 
 
 def evaluate_georeliab_gate(value: GeoReliabGateInput) -> GateDecision:
     """Apply the approved GeoReliab MVE gate without optimistic fallback."""
 
-    if value.scientific_validity is not ScientificValidity.SCIENTIFIC:
+    evidence_reason = _scientific_evidence_reason(
+        value.scientific_validity, value.run_mode, value.evidence_schema_version
+    )
+    if evidence_reason is not None:
         return GateDecision(
             lane="georeliab",
             status=GateStatus.BLOCKED,
-            reason_codes=("NON_SCIENTIFIC_FIXTURE",),
+            reason_codes=(evidence_reason,),
             details={},
             scientific_validity=value.scientific_validity,
         )
@@ -575,6 +612,26 @@ def select_track(
             georeliab_status=georeliab.status,
             scientific_validity=ScientificValidity.NON_SCIENTIFIC_FIXTURE,
         )
+    if not geometry.status.is_terminal or not georeliab.status.is_terminal:
+        pending_georeliab = (
+            geometry.status is GateStatus.BLOCKED
+            and georeliab.status is GateStatus.PASS
+        )
+        return SelectionDecision(
+            selected_track=(
+                SelectedTrack.BLOCKED_PENDING_GEOMETRY
+                if pending_georeliab
+                else SelectedTrack.BLOCKED
+            ),
+            reason=(
+                'GEORELIAB_PASS_PENDING_GEOMETRY'
+                if pending_georeliab
+                else 'required scientific evidence is non-terminal'
+            ),
+            geometry_status=geometry.status,
+            georeliab_status=georeliab.status,
+            scientific_validity=ScientificValidity.SCIENTIFIC,
+        )
     if geometry.status is GateStatus.PASS:
         return SelectionDecision(
             selected_track=SelectedTrack.GEOMETRY,
@@ -589,17 +646,6 @@ def select_track(
         return SelectionDecision(
             selected_track=SelectedTrack.GEORELIAB,
             reason="Geometry did not pass and GeoReliab passed",
-            geometry_status=geometry.status,
-            georeliab_status=georeliab.status,
-            scientific_validity=ScientificValidity.SCIENTIFIC,
-        )
-    if (
-        geometry.status is GateStatus.BLOCKED
-        or georeliab.status is GateStatus.BLOCKED
-    ):
-        return SelectionDecision(
-            selected_track=SelectedTrack.BLOCKED,
-            reason="required scientific evidence is missing",
             geometry_status=geometry.status,
             georeliab_status=georeliab.status,
             scientific_validity=ScientificValidity.SCIENTIFIC,

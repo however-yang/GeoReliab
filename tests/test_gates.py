@@ -294,7 +294,11 @@ def decision(lane, status, validity=SCIENTIFIC):
         (GateStatus.PASS, GateStatus.PASS, SelectedTrack.GEOMETRY),
         (GateStatus.PASS, GateStatus.FAIL, SelectedTrack.GEOMETRY),
         (GateStatus.FAIL, GateStatus.PASS, SelectedTrack.GEORELIAB),
-        (GateStatus.BLOCKED, GateStatus.PASS, SelectedTrack.GEORELIAB),
+        (
+            GateStatus.BLOCKED,
+            GateStatus.PASS,
+            SelectedTrack.BLOCKED_PENDING_GEOMETRY,
+        ),
         (GateStatus.FAIL, GateStatus.FAIL, SelectedTrack.STOP),
         (GateStatus.BLOCKED, GateStatus.FAIL, SelectedTrack.BLOCKED),
     ),
