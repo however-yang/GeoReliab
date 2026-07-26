@@ -7,6 +7,10 @@ vggt_source = '/home/smli/workspace/vggt'
 mast3r_source = '/home/smli/workspace/external/mast3r'
 vggt_env = '/home/smli/miniforge3/envs/vggt_env'
 mast3r_env = '/home/smli/miniforge3/envs/surg_mast3r'
+vggt_python = '3.10.20'
+vggt_torch = '2.3.1+cu121'
+mast3r_python = '3.10.20'
+mast3r_torch = '2.5.1+cu121'
 
 [resources]
 dtu_sampleset_url = 'https://roboimagedata2.compute.dtu.dk/data/MVS/SampleSet.zip'
@@ -28,8 +32,13 @@ mast3r_checkpoint = '/home/smli/models/mast3r/MASt3R_ViTLarge_BaseDecoder_512_ca
 mast3r_config = '/home/smli/models/mast3r/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric/config.json'
 mast3r_config_sha256 = '718eb93dc4f9e4332b60cc0041af962d712cbd346d7770ce35c5b22cff68eae4'
 dtu_rectified_etag = '1e2c5f05c7-5652dcf644cb3'
-tartanair_hf_commit = '0d2d145e973832742a2aaa04b7d2ebffc8d82817'
+tartanair_image_url = 'https://huggingface.co/datasets/theairlabcmu/tartanair2/resolve/0d2d145e973832742a2aaa04b7d2ebffc8d82817/GreatMarsh/Data_easy/image_lcam_front.zip'
+tartanair_image_bytes = 35240547705
+tartanair_image_etag = '6f8cc2fb7da51f89202db8b6e742f50c929181b27cc8e7063f30d255ec773dd6'
+tartanair_depth_url = 'https://huggingface.co/datasets/theairlabcmu/tartanair2/resolve/0d2d145e973832742a2aaa04b7d2ebffc8d82817/GreatMarsh/Data_easy/depth_lcam_front.zip'
 tartanair_depth_bytes = 21045555462
+tartanair_depth_etag = '7f9e53935c7f96a868d647a15ddf2381953022a302cecec8382ef58f23acd834'
+tartanair_hf_commit = '0d2d145e973832742a2aaa04b7d2ebffc8d82817'
 tartanair_environment = 'GreatMarsh'
 tartanair_difficulty = 'easy'
 tartanair_trajectory = 'P000'

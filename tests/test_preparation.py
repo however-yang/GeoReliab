@@ -95,16 +95,16 @@ def test_seed_and_corruptions_are_deterministic_and_preserve_gt_digest():
     depth = np.linspace(1.0, 3.0, image.shape[0] * image.shape[1]).reshape(image.shape[:2])
     params = calibrate_corruptions([depth], [image])
     assert seed_for_sample('calibration/scan2', 4) == seed_for_sample('calibration/scan2', 4)
-    fog1, fog_meta = fog_render(image, depth, params, severity=2, gt_digest='gt')
-    fog2, _ = fog_render(image, depth, params, severity=2, gt_digest='gt')
-    low1, low_meta = low_light_noise_render(image, 'calibration/scan2', 4, severity=2, gt_digest='gt')
-    low2, _ = low_light_noise_render(image, 'calibration/scan2', 4, severity=2, gt_digest='gt')
-    defocus1, defocus_meta = render_defocus(image, depth, params, severity=2, gt_digest='gt')
-    defocus2, _ = render_defocus(image, depth, params, severity=2, gt_digest='gt')
+    fog1, fog_meta = fog_render(image, depth, params, severity=2, gt_digest=hashlib.sha256(depth.tobytes()).hexdigest(), raw_source_sha256=hashlib.sha256(image.tobytes()).hexdigest())
+    fog2, _ = fog_render(image, depth, params, severity=2, gt_digest=hashlib.sha256(depth.tobytes()).hexdigest(), raw_source_sha256=hashlib.sha256(image.tobytes()).hexdigest())
+    low1, low_meta = low_light_noise_render(image, 'calibration/scan2', 4, severity=2, gt_digest=hashlib.sha256(depth.tobytes()).hexdigest(), raw_source_sha256=hashlib.sha256(image.tobytes()).hexdigest())
+    low2, _ = low_light_noise_render(image, 'calibration/scan2', 4, severity=2, gt_digest=hashlib.sha256(depth.tobytes()).hexdigest(), raw_source_sha256=hashlib.sha256(image.tobytes()).hexdigest())
+    defocus1, defocus_meta = render_defocus(image, depth, params, severity=2, gt_digest=hashlib.sha256(depth.tobytes()).hexdigest(), raw_source_sha256=hashlib.sha256(image.tobytes()).hexdigest())
+    defocus2, _ = render_defocus(image, depth, params, severity=2, gt_digest=hashlib.sha256(depth.tobytes()).hexdigest(), raw_source_sha256=hashlib.sha256(image.tobytes()).hexdigest())
     assert np.array_equal(fog1, fog2)
     assert np.array_equal(low1, low2)
     assert np.array_equal(defocus1, defocus2)
-    assert {fog_meta['gt_digest'], low_meta['gt_digest'], defocus_meta['gt_digest']} == {'gt'}
+    assert {fog_meta['gt_digest'], low_meta['gt_digest'], defocus_meta['gt_digest']} == {hashlib.sha256(depth.tobytes()).hexdigest()}
     assert deterministic_png(fog1) == deterministic_png(fog2)
 
 
@@ -119,9 +119,9 @@ def test_calibration_monotonicity_and_cross_view_parameters():
     coc = []
     edge = []
     for severity in (1, 2, 3):
-        rendered_fog, fog_meta = fog_render(image, depth, params, severity=severity, gt_digest='fixed')
-        rendered_low, low_meta = low_light_noise_render(image, 'key', 0, severity=severity, gt_digest='fixed')
-        rendered_defocus, defocus_meta = render_defocus(image, depth, params, severity=severity, gt_digest='fixed')
+        rendered_fog, fog_meta = fog_render(image, depth, params, severity=severity, gt_digest=hashlib.sha256(depth.tobytes()).hexdigest(), raw_source_sha256=hashlib.sha256(image.tobytes()).hexdigest())
+        rendered_low, low_meta = low_light_noise_render(image, 'key', 0, severity=severity, gt_digest=hashlib.sha256(depth.tobytes()).hexdigest(), raw_source_sha256=hashlib.sha256(image.tobytes()).hexdigest())
+        rendered_defocus, defocus_meta = render_defocus(image, depth, params, severity=severity, gt_digest=hashlib.sha256(depth.tobytes()).hexdigest(), raw_source_sha256=hashlib.sha256(image.tobytes()).hexdigest())
         fog_trans.append(fog_meta['realized_transmittance'])
         brightness.append(rendered_low.mean())
         noise.append(low_meta['measured_noise'])

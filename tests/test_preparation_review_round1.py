@@ -36,7 +36,7 @@ def test_manifest_refuses_missing_any_frozen_scene_inventory():
 
 def test_low_light_metadata_contains_raw_and_png_digests():
     image = np.full((8, 8, 3), 0.5)
-    _, metadata = low_light_noise_render(image, 's', 1, severity=1, gt_digest='g')
+    _, metadata = low_light_noise_render(image, 's', 1, severity=1, gt_digest=hashlib.sha256(image.tobytes()).hexdigest(), raw_source_sha256=hashlib.sha256(image.tobytes()).hexdigest())
     assert metadata['raw_source_sha256'] == hashlib.sha256(image.tobytes()).hexdigest()
     assert len(metadata['rendered_png_sha256']) == 64
     assert len(metadata['parameter_manifest_sha256']) == 64
@@ -47,7 +47,7 @@ def test_defocus_reports_measured_not_manufactured_edge_energy():
     image[:, 55:] = 1.0
     depth = np.tile(np.linspace(0.5, 4.0, 64), (32, 1))
     calibration = calibrate_corruptions([depth], [image])
-    rendered, metadata = render_defocus(image, depth, calibration, severity=3, gt_digest='g')
+    rendered, metadata = render_defocus(image, depth, calibration, severity=3, gt_digest=hashlib.sha256(depth.tobytes()).hexdigest(), raw_source_sha256=hashlib.sha256(image.tobytes()).hexdigest())
     measured = float(np.mean(np.abs(np.diff(rendered, axis=0))) + np.mean(np.abs(np.diff(rendered, axis=1))))
     assert metadata['edge_energy'] == pytest.approx(measured)
     assert metadata['edge_energy_loss'] > 0

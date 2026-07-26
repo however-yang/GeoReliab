@@ -566,10 +566,11 @@ def acquire_tartanair_p000(destination: Path, *, dry_run: bool = False) -> Path:
 
 # Review-round implementations keep the public API stable while making official
 # DTU source naming, render provenance, and manifest completeness fail closed.
-from .preparation_round1 import (  # noqa: E402
-    build_split_view_manifest, fog_render, low_light_noise_render,
-    parse_dtu_inventory, render_defocus, verify_dtu_scene,
-)
 from .overlay_round1 import A100Overlay  # noqa: E402
 from .archive_round1 import download_archive, verify_archive  # noqa: E402
 from .inventory_round1 import parse_dtu_inventory  # noqa: E402
+# Round 2 provides the single public rendering and QA implementation.
+from .preparation_round2 import (  # noqa: E402
+    CALIBRATION_SCENES, atomic_json, build_split_view_manifest, calibration_qa, fog_render,
+    load_prepared_records, low_light_noise_render, render_defocus, verify_dtu_scene,
+)

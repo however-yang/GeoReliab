@@ -39,6 +39,10 @@ def parse_dtu_inventory(root: Path) -> tuple[_base.DtuScene, ...]:
         cloud, mask = points / f'stl{scene:03d}_total.ply', masks / f'ObsMask{scene}_10.mat'
         if cloud.is_file() and mask.is_file():
             result.append(_base.DtuScene(scene, names, dict(centers), str(cloud), str(mask)))
-    if not result:
-        raise _base.PreparationError('verified DTU inventory contains no complete official scenes')
+    expected = set(range(1, 78)) | set(range(82, 129))
+    found = {scene.scene_id for scene in result}
+    if found != expected:
+        missing = sorted(expected - found)
+        unexpected = sorted(found - expected)
+        raise _base.PreparationError(f'verified DTU inventory must contain official scans 1..77,82..128; missing={missing}, unexpected={unexpected}')
     return tuple(result)
