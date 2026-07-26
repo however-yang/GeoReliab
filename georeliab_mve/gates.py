@@ -48,6 +48,7 @@ class SelectedTrack(str, Enum):
     BLOCKED = "BLOCKED_MISSING_EVIDENCE"
     BLOCKED_PENDING_GEOMETRY = 'BLOCKED_PENDING_GEOMETRY'
     NON_SCIENTIFIC = "BLOCKED_NON_SCIENTIFIC_FIXTURE"
+    NON_SCIENTIFIC_SMOKE = 'BLOCKED_NON_SCIENTIFIC_SMOKE'
 
 
 @dataclass(frozen=True, slots=True)
@@ -614,7 +615,11 @@ def select_track(
             else ScientificValidity.NON_SCIENTIFIC_FIXTURE
         )
         return SelectionDecision(
-            selected_track=SelectedTrack.NON_SCIENTIFIC,
+            selected_track=(
+                SelectedTrack.NON_SCIENTIFIC_SMOKE
+                if validity is ScientificValidity.NON_SCIENTIFIC_SMOKE
+                else SelectedTrack.NON_SCIENTIFIC
+            ),
             reason=(
                 'smoke evidence cannot select a scientific track'
                 if validity is ScientificValidity.NON_SCIENTIFIC_SMOKE

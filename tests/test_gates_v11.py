@@ -68,3 +68,4 @@ def test_smoke_selection_preserves_smoke_validity_and_reason():
     )
     assert selected.scientific_validity is smoke
     assert 'smoke' in selected.reason.lower()
+    assert selected.to_dict()['selected_track'] == 'BLOCKED_NON_SCIENTIFIC_SMOKE'

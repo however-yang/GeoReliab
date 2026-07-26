@@ -318,4 +318,5 @@ def test_fixture_evidence_can_never_select_a_track():
         decision('georeliab', GateStatus.BLOCKED, fixture),
     )
     assert selected.selected_track is SelectedTrack.NON_SCIENTIFIC
+    assert selected.to_dict()['selected_track'] == 'BLOCKED_NON_SCIENTIFIC_FIXTURE'
 
