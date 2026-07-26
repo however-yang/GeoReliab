@@ -70,3 +70,11 @@ Status: `REQUEST_CHANGES`, all three blocking findings addressed in `7157c9c`.
 - Fixed P1: repeat contexts now pass the root policy only for the two frozen preflight namespaces; regression tests exercise the actual policy instead of replacing it with a no-op.
 - Fixed resume hygiene: all generated runtime roots are anchored in `.gitignore`, with `git check-ignore` regression coverage.
 - Fixed P5 fail-closed semantics: relevant committed bundles can no longer be skipped on stage/linkage/digest errors, invalid subsets persist an immutable terminal FAIL record, and both tamper and normal 480-subset aggregate paths are tested.
+
+## Independent review round 2
+
+Status: `APPROVE`; zero critical/high/medium blockers. Task 6 deployment may begin.
+
+- Reviewer confirmed the exact-root/repeat namespace policy, runtime ignore coverage, exact 480-item P5 schedule, tamper/linkage hard failure, invalid-subset terminal evidence, and machine-readable `run_stage` FAIL branches.
+- Non-blocking note: terminal artifact creation and loading are directly tested, while the thin `run_stage()` exception-to-summary wrapper is code-reviewed rather than asserted separately. Preserve this as a future low-priority coverage addition.
+- Remaining risks are remote-only: real A100 adapters/checkpoints, official data paths/hashes, measured budget, and detached-worktree/scheduler behavior.
