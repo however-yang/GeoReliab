@@ -350,6 +350,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] in {'preflight-real', 'run-georeliab'}:
+        from .runner import cli_main as runner_cli_main
+
+        return runner_cli_main(raw_argv)
     args = build_parser().parse_args(argv)
     try:
         if args.command == 'dry-run':
