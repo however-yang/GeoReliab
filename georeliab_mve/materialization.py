@@ -186,6 +186,7 @@ def validate_tartanair_indexes(
             for name in entries
             if "GreatMarsh/Data_easy/P000/" in name
             and f"/{modality}_lcam_front/" in name
+            and not name.endswith("/")
         ]
         if len(candidates) != TARTANAIR_P000_COUNT:
             raise PreparationError(

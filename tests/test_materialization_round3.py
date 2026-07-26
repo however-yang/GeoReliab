@@ -74,14 +74,18 @@ def _tartan_names(modality: str) -> list[str]:
     ]
 
 
+def _tartan_directory_entry(modality: str) -> str:
+    return f"GreatMarsh/Data_easy/P000/{modality}_lcam_front/"
+
+
 def test_remote_inventory_validators_require_exact_official_members():
     _, rectified = _zip_index(_rectified_names())
     by_scene = validate_rectified_index(rectified)
     assert set(by_scene) == set(DTU_SCAN_IDS)
     assert all(len(members) == 49 for members in by_scene.values())
 
-    _, image = _zip_index(_tartan_names("image"))
-    _, depth = _zip_index(_tartan_names("depth"))
+    _, image = _zip_index(_tartan_names("image") + [_tartan_directory_entry("image")])
+    _, depth = _zip_index(_tartan_names("depth") + [_tartan_directory_entry("depth")])
     frames, selected_image, selected_depth = validate_tartanair_indexes(image, depth)
     assert len(frames) == len(selected_image) == len(selected_depth) == 100
     assert frames[0] == "000000"
@@ -94,12 +98,31 @@ def test_remote_inventory_rejects_missing_extra_and_misnamed_members():
     with pytest.raises(PreparationError, match="6076"):
         validate_rectified_index(bad_rectified)
 
-    image_names = _tartan_names("image")
-    image_names[-1] = image_names[-1].replace("003536", "999999")
-    _, bad_image = _zip_index(image_names)
     _, depth = _zip_index(_tartan_names("depth"))
+
+    missing_image_names = _tartan_names("image")[:-1]
+    _, missing_image = _zip_index(missing_image_names)
+    with pytest.raises(PreparationError, match="exactly 3537"):
+        validate_tartanair_indexes(missing_image, depth)
+
+    extra_image_names = _tartan_names("image") + [
+        "GreatMarsh/Data_easy/P000/image_lcam_front/999999_lcam_front.png"
+    ]
+    _, extra_image = _zip_index(extra_image_names)
+    with pytest.raises(PreparationError, match="exactly 3537"):
+        validate_tartanair_indexes(extra_image, depth)
+
+    misnamed_image_names = _tartan_names("image")
+    misnamed_image_names[-1] = misnamed_image_names[-1].replace(".png", ".jpg")
+    _, misnamed_image = _zip_index(misnamed_image_names)
+    with pytest.raises(PreparationError, match="misnamed P000 member"):
+        validate_tartanair_indexes(misnamed_image, depth)
+
+    wrong_range_image_names = _tartan_names("image")
+    wrong_range_image_names[-1] = wrong_range_image_names[-1].replace("003536", "999999")
+    _, wrong_range_image = _zip_index(wrong_range_image_names)
     with pytest.raises(PreparationError, match="000000..003536"):
-        validate_tartanair_indexes(bad_image, depth)
+        validate_tartanair_indexes(wrong_range_image, depth)
 
 
 def test_range_materialization_is_atomic_reusable_and_tamper_closed(monkeypatch, tmp_path):
