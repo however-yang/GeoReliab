@@ -227,7 +227,7 @@ def test_gate_json_parser_requires_current_real_evidence_metadata():
     assert _georeliab_input(georeliab).run_mode is RunMode.REAL
 
 
-def test_cli_returns_success_when_georeliab_is_selected(tmp_path):
+def test_cli_rejects_hand_authored_georeliab_selection_input(tmp_path):
     scenes = [f's{i:02d}' for i in range(20)]
     geometry = {
         'scientific_validity': 'SCIENTIFIC',
@@ -309,6 +309,5 @@ def test_cli_returns_success_when_georeliab_is_selected(tmp_path):
             str(output_path),
         ]
     )
-    assert exit_code == 0
-    decision = json.loads(output_path.read_text(encoding='utf-8'))
-    assert decision['selection']['selected_track'] == 'GEORELIAB'
+    assert exit_code == 2
+    assert not output_path.exists()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import platform
@@ -61,6 +62,14 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f'{path} must contain a JSON object')
     return payload
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _require_bool(payload: Mapping[str, Any], key: str) -> bool:
@@ -358,9 +367,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if report.ready else 2
         if args.command == 'evaluate-gates':
             geometry = evaluate_geometry_gate(_geometry_input(_load_json(args.geometry)))
-            georeliab = evaluate_georeliab_gate(
-                _georeliab_input(_load_json(args.georeliab))
-            )
+            georeliab_payload = _load_json(args.georeliab)
+            stage_path_value = georeliab_payload.get('stage_evidence_path')
+            stage_sha_value = georeliab_payload.get('stage_evidence_sha256')
+            if not isinstance(stage_path_value, str) or not isinstance(stage_sha_value, str):
+                raise ValueError('evaluate-gates requires GeoReliab stage audit output with stage_evidence_path/sha256')
+            stage_path = Path(stage_path_value)
+            if _sha256_file(stage_path) != stage_sha_value:
+                raise ValueError('GeoReliab stage evidence digest mismatch')
+            georeliab_evidence = load_stage_evidence_manifest(stage_path)
+            georeliab = evaluate_georeliab_gate(georeliab_evidence.to_gate_input())
             selection = select_track(geometry, georeliab)
             payload = {
                 'geometry': geometry.to_dict(),
@@ -405,6 +421,8 @@ def main(argv: list[str] | None = None) -> int:
                 gate_input = evidence.to_gate_input()
                 georeliab = evaluate_georeliab_gate(gate_input)
                 payload = {
+                    'stage_evidence_path': str(args.stage_evidence),
+                    'stage_evidence_sha256': _sha256_file(args.stage_evidence),
                     'gate_input': evidence.to_dict(),
                     'georeliab_gate': georeliab.to_dict(),
                     'p5_skip_reason': evidence.p5_skip_reason,
@@ -437,19 +455,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(json.dumps(payload, indent=2, sort_keys=True))
                 return 0
-            if args.input is None or args.output is None:
-                raise ValueError('aggregated evidence audit requires --input and --output')
-            evidence = load_georeliab_evidence_input(args.input)
-            gate_input = evidence.to_gate_input()
-            georeliab = evaluate_georeliab_gate(gate_input)
-            payload = {
-                'gate_input': evidence.to_dict(),
-                'georeliab_gate': georeliab.to_dict(),
-                'p5_skip_reason': evidence.p5_skip_reason,
-            }
-            _write_json(args.output, payload)
-            print(json.dumps(payload, indent=2, sort_keys=True))
-            return 0
+            if args.input is not None:
+                raise ValueError('scientific GeoReliab audit requires --stage-evidence; aggregate --input is disabled')
+            raise ValueError('GeoReliab audit requires --stage-evidence or bundle audit arguments')
     except (KeyError, TypeError, ValueError, AuditError, OSError, json.JSONDecodeError) as exc:
         print(f'ERROR: {exc}', file=sys.stderr)
         return 2

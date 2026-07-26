@@ -311,7 +311,7 @@ def test_georeliab_evidence_rejects_incomplete_p3_before_p4():
     assert gate.reason_codes == ('P3_SCHEDULE_COUNTS_INVALID',)
 
 
-def test_audit_cli_rejects_smoke_and_writes_test_evidence(tmp_path: Path):
+def test_audit_cli_rejects_unbound_aggregate_evidence(tmp_path: Path):
     evidence = {
         'run_mode': 'smoke',
         'split': 'test',
@@ -325,12 +325,8 @@ def test_audit_cli_rejects_smoke_and_writes_test_evidence(tmp_path: Path):
     assert main(['audit-georeliab', '--input', str(source), '--output', str(tmp_path / 'out.json')]) == 2
     evidence['run_mode'] = 'real'
     source.write_text(json.dumps(evidence), encoding='utf-8')
-    assert main(['audit-georeliab', '--input', str(source), '--output', str(tmp_path / 'out.json')]) == 0
-    written = json.loads((tmp_path / 'out.json').read_text(encoding='utf-8'))
-    assert written['gate_input']['run_mode'] == 'real'
-    assert written['gate_input']['evidence_schema_version'] == '1.1'
-    assert written['p5_skip_reason'] is None
-    assert written['georeliab_gate']['reason_codes'] == ['P3_SCHEDULE_COUNTS_INVALID']
+    assert main(['audit-georeliab', '--input', str(source), '--output', str(tmp_path / 'out.json')]) == 2
+    assert not (tmp_path / 'out.json').exists()
 
 
 def test_audit_cli_bundle_mode_writes_dense_npz_and_validated_audit(tmp_path: Path):

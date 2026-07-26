@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import asdict
 from pathlib import Path
 import zlib
 
@@ -11,10 +12,13 @@ import scipy.io
 
 from georeliab_mve.audit import (
     AuditError,
+    build_condition_evidence,
+    build_georeliab_evidence,
     dtu_observability_mask_for_points,
     model_risk_from_confidence,
     load_official_dtu_evidence,
 )
+import georeliab_mve.audit as audit_module
 from georeliab_mve.cli import main
 from georeliab_mve.contracts import (
     AuditRecord,
@@ -35,7 +39,31 @@ from georeliab_mve.gates import (
     ZeroUpdateEvidence,
     evaluate_georeliab_gate,
 )
-from georeliab_mve.preparation import TEST_SCENES
+from georeliab_mve.preparation import PreparationError, TEST_SCENES
+from georeliab_mve.preparation_round2 import PreparedBatch
+from georeliab_mve.prepared_inputs import implementation_evidence
+
+
+@pytest.fixture(autouse=True)
+def _use_task2_prepared_contract(monkeypatch):
+    def load_prepared(path: Path):
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        assert payload['producer'] == implementation_evidence()
+        return PreparedBatch(
+            stage='test',
+            split='test',
+            split_view_manifest_sha256=payload['split_view_manifest_sha256'],
+            materialization_sha256=payload['materialization_sha256'],
+            records=tuple(() for _ in payload['records']),
+        )
+
+    def load_tartan(path: Path):
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        assert payload['producer'] == implementation_evidence()
+        return [(str(index), np.empty((0,)), np.empty((0,))) for index in range(len(payload['records']))]
+
+    monkeypatch.setattr(audit_module, '_load_verified_prepared_batch', load_prepared)
+    monkeypatch.setattr(audit_module, '_load_verified_tartanair_pairs', load_tartan)
 
 
 def _sha256(path: Path) -> str:
@@ -46,17 +74,27 @@ def _manifest(model: str = 'VGGT', *, invalid=False) -> tuple[RunManifest, Predi
     raise RuntimeError('test helper must be monkeypatched per tmp_path')
 
 
-def _provenance(*, split_sha: str = 'f' * 64) -> ScientificProvenance:
+def _provenance(*, split_sha: str = 'f' * 64, parameter_sha: str = 'e' * 64) -> ScientificProvenance:
     return ScientificProvenance(
         project_commit='a' * 40,
         project_tree='b' * 40,
         model_source_commit='c' * 40,
         environment_lock_sha256='d' * 64,
-        corruption_manifest_sha256='e' * 64,
+        corruption_manifest_sha256=parameter_sha,
         split_view_manifest_sha256=split_sha,
         dust3r_source_commit='1' * 40,
         croco_source_commit='2' * 40,
     )
+
+
+def _canonical_render_digest(views: list[dict]) -> str:
+    digest = hashlib.sha256()
+    for view in views:
+        digest.update(str(int(view['view_id'])).encode('ascii'))
+        digest.update(b'\0')
+        digest.update(str(view['sha256']).encode('ascii'))
+        digest.update(b'\0')
+    return digest.hexdigest()
 
 
 def _condition(model: str, corruption: str) -> GeoReliabConditionEvidence:
@@ -229,6 +267,8 @@ def test_invalid_bundle_writes_contract_valid_empty_dense(tmp_path: Path):
     validate_artifact_bundle(manifest, prediction, audit)
     dense = np.load(out / 'dense_audit.npz')
     assert dense['voxel_points'].shape == (0, 3)
+    assert audit.metadata['gt_points_uri'] == gt_points.resolve().as_uri()
+    assert audit.metadata['gt_points_sha256'] == _sha256(gt_points)
     assert audit.failure_label is True
     assert audit.accepted is False
     assert audit.downstream_outcome == 0.0
@@ -244,18 +284,38 @@ def _write_stage_bundle_grid(tmp_path: Path) -> tuple[Path, list[dict]]:
     root = tmp_path / 'stage'
     root.mkdir(parents=True)
     split_manifest = tmp_path / 'split_view_manifest.json'
-    split_manifest.write_text(json.dumps({'schema_version': 'dtu-preparation-v1', 'splits': {'test': list(TEST_SCENES)}}), encoding='utf-8')
+    frozen_views = {f'scan{scene}': list(range(8)) for scene in TEST_SCENES}
+    split_manifest.write_text(json.dumps({'schema_version': 'dtu-preparation-v1', 'splits': {'test': list(TEST_SCENES)}, 'views': frozen_views}), encoding='utf-8')
     split_sha = _sha256(split_manifest)
+    materialization = tmp_path / 'frozen_materialization.json'
+    materialization.write_text(json.dumps({'schema_version': 'frozen-materialization-v1', 'split_view_manifest_path': str(split_manifest)}), encoding='utf-8')
     corruption_qa = tmp_path / 'corruption_calibration_qa.json'
+    prepared_input = tmp_path / 'render_inputs_test.json'
+    tartan_prepared = tmp_path / 'tartanair_p000_pairs.json'
+    render_index = tmp_path / 'test_render_index.json'
     render_lock = tmp_path / 'test_render_lock.json'
     tartan_sanity = tmp_path / 'tartanair_native_fog_sanity.json'
     stage_scenes = [f'scan{scene}' for scene in TEST_SCENES]
     parameter_sha = '9' * 64
-    materialization_sha = '8' * 64
+    materialization_sha = _sha256(materialization)
+    prepared_records = [
+        {'sample_key': f'dtu/test/{scene}/view{view_id}/clean/0/0', 'scene_id': int(scene[4:]), 'view_id': view_id}
+        for scene in stage_scenes
+        for view_id in range(8)
+    ]
+    prepared_input.write_text(json.dumps({'schema_version': 'prepared-input-v2', 'stage': 'test', 'split': 'test', 'producer': implementation_evidence(), 'split_view_manifest_path': str(split_manifest), 'split_view_manifest_sha256': split_sha, 'materialization_path': str(materialization), 'materialization_sha256': materialization_sha, 'record_count': 160, 'records': prepared_records}), encoding='utf-8')
+    prepared_sha = _sha256(prepared_input)
+    tartan_prepared.write_text(json.dumps({'schema_version': 'tartanair-prepared-v2', 'producer': implementation_evidence(), 'materialization_path': str(materialization), 'materialization_sha256': materialization_sha, 'environment': 'GreatMarsh/Data_easy/P000/lcam_front', 'record_count': 100, 'records': [{'frame_id': f'{index:06d}'} for index in range(100)]}), encoding='utf-8')
+    tartan_prepared_sha = _sha256(tartan_prepared)
     corruption_qa.write_text(json.dumps({'schema_version': 'calibration-qa-v1', 'passed': True, 'checks': {'fog': True, 'synthetic_fog': True, 'low_light': True, 'defocus': True, 'gt': True, 'cross_view': True}, 'parameter_manifest_sha256': parameter_sha, 'split_view_manifest_sha256': split_sha, 'materialization_sha256': materialization_sha}), encoding='utf-8')
     qa_sha = _sha256(corruption_qa)
-    render_lock.write_text(json.dumps({'schema_version': 'test-render-lock-v1', 'stage': 'test', 'split': 'test', 'split_view_manifest_sha256': split_sha, 'materialization_sha256': materialization_sha, 'parameter_manifest_sha256': parameter_sha, 'calibration_qa_sha256': qa_sha, 'prepared_input_sha256': '7' * 64}), encoding='utf-8')
-    tartan_sanity.write_text(json.dumps({'reason_code': 'TARTANAIR_NATIVE_FOG_SANITY', 'passed': True, 'negative_frames': 80, 'evaluated_frames': 100, 'correlations': ([-0.1] * 80 + [0.0] * 20), 'prepared_input_sha256': '6' * 64, 'calibration_qa_sha256': qa_sha}), encoding='utf-8')
+    render_lock.write_text(json.dumps({'schema_version': 'test-render-lock-v1', 'stage': 'test', 'split': 'test', 'split_view_manifest_sha256': split_sha, 'materialization_sha256': materialization_sha, 'parameter_manifest_sha256': parameter_sha, 'calibration_qa_sha256': qa_sha, 'prepared_input_sha256': prepared_sha}), encoding='utf-8')
+    tartan_sanity.write_text(json.dumps({'reason_code': 'TARTANAIR_NATIVE_FOG_SANITY', 'passed': True, 'negative_frames': 80, 'evaluated_frames': 100, 'correlations': ([-0.1] * 80 + [0.0] * 20), 'prepared_input_sha256': tartan_prepared_sha, 'calibration_qa_sha256': qa_sha}), encoding='utf-8')
+    render_files = []
+    for view_id in range(8):
+        png = root / f'render_view_{view_id}.png'
+        png.write_bytes(b'PNG' + bytes([view_id]))
+        render_files.append({'view_id': view_id, 'path': str(png), 'sha256': _sha256(png)})
     entries = []
     risk = np.array([0.0, 1.0, 2.0, 3.0])
     errors = {
@@ -280,12 +340,16 @@ def _write_stage_bundle_grid(tmp_path: Path) -> tuple[Path, list[dict]]:
     np.savez(confidence, raw_confidence=np.array([1.1, 1.2, 1.3, 1.4]))
     np.savez(valid, valid_mask=np.ones(4, dtype=bool))
     payload_digests = {'geometry_prediction_uri': _sha256(geometry), 'native_confidence_uri': _sha256(confidence), 'valid_mask_uri': _sha256(valid)}
+    severity2_run_ids: dict[tuple[str, str], str] = {}
     for model in ('VGGT', 'MASt3R'):
         for scene in stage_scenes:
             for condition, severity in [('clean', '0'), ('fog', '1'), ('fog', '2'), ('fog', '3'), ('low-light-noise', '1'), ('low-light-noise', '2'), ('low-light-noise', '3'), ('defocus', '1'), ('defocus', '2'), ('defocus', '3')]:
                 sample_key = f'dtu/test/{scene}/views-0001/{condition}/{severity}/0'
                 stem = f'{model}_{scene}_{condition}_{severity}'.replace('-', '_')
-                manifest = RunManifest(run_id=f'RUN{len(entries):04d}', mode=RunMode.REAL, scientific_validity=ScientificValidity.SCIENTIFIC, model=model, checkpoint_hash='1' * 64, dataset='dtu', split='test', seed=0, intervention_version='none', corruption_version='clean', environment={'python': '3.10.20'}, rgb_digest='rgb', prompt_digest='prompt', decoder_digest='decoder', provenance=_provenance(split_sha=split_sha))
+                rgb_digest = _canonical_render_digest(render_files)
+                manifest = RunManifest(run_id=f'RUN{len(entries):04d}', mode=RunMode.REAL, scientific_validity=ScientificValidity.SCIENTIFIC, model=model, checkpoint_hash='1' * 64, dataset='dtu', split='test', seed=0, intervention_version='none', corruption_version='clean', environment={'python': '3.10.20'}, rgb_digest=rgb_digest, prompt_digest='prompt', decoder_digest='decoder', provenance=_provenance(split_sha=split_sha, parameter_sha=parameter_sha))
+                if severity == '2' and condition in ('fog', 'low-light-noise', 'defocus'):
+                    severity2_run_ids[(model, sample_key)] = manifest.run_id
                 prediction = PredictionArtifact(run_id=manifest.run_id, sample_key=sample_key, geometry_prediction_uri=geometry.as_uri(), native_confidence_uri=confidence.as_uri(), valid_mask_uri=valid.as_uri(), hook_location=None, runtime_seconds=1.0, peak_memory_mb=10.0, payload_digests=payload_digests)
                 dense_path = root / f'{stem}_dense.npz'
                 gt_path = root / f'{stem}_gt.npz'
@@ -327,12 +391,7 @@ def _write_stage_bundle_grid(tmp_path: Path) -> tuple[Path, list[dict]]:
             for corruption in ('fog', 'low-light-noise', 'defocus'):
                 condition = f'{corruption}-s2'
                 if row_type == 'downstream':
-                    gt_inputs = {}
-                    for scene in stage_scenes:
-                        source_stem = f'{model}_{scene}_{corruption}_2'.replace('-', '_')
-                        path = root / f'{source_stem}_gt.npz'
-                        gt_inputs[scene] = {'input_path': str(path), 'input_sha256': _sha256(path)}
-                    payload = {'schema_version': 'downstream-harm-v1', 'model': model, 'condition': condition, 'coverage': [0.9, 0.7, 0.5, 0.3], 'random_mask_count': 100, 'n_resamples': 10000, 'gt_inputs': gt_inputs, 'source_sample_keys': severity2_keys[(model, condition)]}
+                    payload = {'schema_version': 'downstream-harm-v1', 'model': model, 'condition': condition, 'coverage': [0.9, 0.7, 0.5, 0.3], 'random_mask_count': 100, 'n_resamples': 10000, 'source_sample_keys': severity2_keys[(model, condition)]}
                 else:
                     subset_artifacts = {}
                     for scene in stage_scenes:
@@ -346,12 +405,24 @@ def _write_stage_bundle_grid(tmp_path: Path) -> tuple[Path, list[dict]]:
                             else:
                                 subset_points[:, 2] += np.array([0.0, 1.0, 2.0, 3.0])
                             parent_sample = f'dtu/test/{scene}/views-0001/{corruption}/2/0'
-                            np.savez(artifact, points=subset_points, camera_centers=c2w[view_ids, :3, 3], view_ids=view_ids, parent_model=np.asarray(model), parent_sample_key=np.asarray(parent_sample), parent_project_commit=np.asarray('a' * 40))
+                            parent_run = severity2_run_ids[(model, parent_sample)]
+                            np.savez(artifact, points=subset_points, camera_centers=c2w[view_ids, :3, 3], view_ids=view_ids, parent_model=np.asarray(model), parent_sample_key=np.asarray(parent_sample), parent_project_commit=np.asarray('a' * 40), parent_run_id=np.asarray(parent_run))
                             subset_artifacts[scene].append({'artifact_path': str(artifact), 'artifact_sha256': _sha256(artifact)})
                     payload = {'schema_version': 'zero-update-v1', 'model': model, 'condition': condition, 'n_resamples': 10000, 'omitted_view_pairs': [[0, 4], [1, 5], [2, 6], [3, 7]], 'subset_artifacts': subset_artifacts, 'source_sample_keys': severity2_keys[(model, condition)]}
                 path = root / f'{row_type}_{model}_{condition}.json'.replace('-', '_')
                 path.write_text(json.dumps(payload), encoding='utf-8')
                 stage_payload[f'{row_type}_index'].append({'evidence_path': str(path), 'evidence_sha256': _sha256(path)})
+    render_records = []
+    for scene in stage_scenes:
+        for condition, severity in [('clean', '0'), ('fog', '1'), ('fog', '2'), ('fog', '3'), ('low-light-noise', '1'), ('low-light-noise', '2'), ('low-light-noise', '3'), ('defocus', '1'), ('defocus', '2'), ('defocus', '3')]:
+            render_records.append({'sample_key': f'dtu/test/{scene}/views-0001/{condition}/{severity}/0', 'scene': scene, 'condition': condition, 'severity': severity, 'views': render_files})
+    render_index.write_text(json.dumps({'schema_version': 'test-render-index-v1', 'stage': 'test', 'split': 'test', 'prepared_input_sha256': prepared_sha, 'parameter_manifest_sha256': parameter_sha, 'records': render_records}), encoding='utf-8')
+    stage_payload['test_prepared_input_path'] = str(prepared_input)
+    stage_payload['test_prepared_input_sha256'] = prepared_sha
+    stage_payload['tartanair_prepared_input_path'] = str(tartan_prepared)
+    stage_payload['tartanair_prepared_input_sha256'] = tartan_prepared_sha
+    stage_payload['test_render_index_path'] = str(render_index)
+    stage_payload['test_render_index_sha256'] = _sha256(render_index)
     stage_path = tmp_path / 'stage_evidence.json'
     stage_path.write_text(json.dumps(stage_payload), encoding='utf-8')
     return stage_path, entries
@@ -362,9 +433,125 @@ def test_stage_manifest_derives_gate_from_400_validated_bundles(tmp_path: Path):
     output = tmp_path / 'out.json'
     assert main(['audit-georeliab', '--stage-evidence', str(stage), '--output', str(output)]) == 0
     written = json.loads(output.read_text(encoding='utf-8'))
+    assert written['stage_evidence_path'] == str(stage)
+    assert written['stage_evidence_sha256'] == _sha256(stage)
     assert written['georeliab_gate']['status'] == 'PASS'
     assert written['gate_input']['schedule_counts'] == {'scheduled': 400, 'completed': 400, 'missing': 0, 'invalid': 0}
     assert len(written['gate_input']['conditions']) == 6
+
+
+def test_stage_manifest_requires_task2_raw_byte_verification(monkeypatch, tmp_path: Path):
+    stage, _ = _write_stage_bundle_grid(tmp_path)
+
+    def reject_prepared(*_args, **_kwargs):
+        raise PreparationError('prepared official bytes are tampered')
+
+    monkeypatch.setattr(audit_module, '_load_verified_prepared_batch', reject_prepared)
+    assert main(['audit-georeliab', '--stage-evidence', str(stage), '--output', str(tmp_path / 'out.json')]) == 2
+
+
+def test_audit_and_evaluate_gates_reject_aggregate_bypass(tmp_path: Path):
+    stage, _ = _write_stage_bundle_grid(tmp_path)
+    aggregate = tmp_path / 'aggregate.json'
+    gate_input = _gate_input()
+    aggregate.write_text(json.dumps({
+        'scientific_validity': gate_input.scientific_validity.value,
+        'run_mode': gate_input.run_mode.value,
+        'evidence_schema_version': gate_input.evidence_schema_version,
+        'required_models_ready': list(gate_input.required_models_ready),
+        'required_datasets_ready': gate_input.required_datasets_ready,
+        'tartanair_native_fog_sanity': gate_input.tartanair_native_fog_sanity,
+        'conditions': [item.to_dict() for item in gate_input.conditions],
+        'downstream_harm': [asdict(item) for item in gate_input.downstream_harm],
+        'zero_update': [asdict(item) for item in gate_input.zero_update],
+        'schedule_counts': gate_input.schedule_counts,
+        'downstream_schedule_counts': gate_input.downstream_schedule_counts,
+    }), encoding='utf-8')
+    assert main(['audit-georeliab', '--input', str(aggregate), '--output', str(tmp_path / 'aggregate_out.json')]) == 2
+
+    stage_out = tmp_path / 'stage_out.json'
+    assert main(['audit-georeliab', '--stage-evidence', str(stage), '--output', str(stage_out)]) == 0
+    tampered = json.loads(stage_out.read_text(encoding='utf-8'))
+    tampered['gate_input']['conditions'] = []
+    stage_out.write_text(json.dumps(tampered), encoding='utf-8')
+    geometry = tmp_path / 'geometry.json'
+    geometry.write_text(json.dumps({'scientific_validity': 'SCIENTIFIC', 'run_mode': 'real', 'evidence_schema_version': '1.1', 'reproducible_checkpoints': [], 'hookable_models': [], 'required_datasets_ready': False, 'zeroing_effective': False, 'fixed_inputs_verified': True, 'matched_intervention_effective': True, 'evidence': []}), encoding='utf-8')
+    decision = tmp_path / 'decision.json'
+    assert main(['evaluate-gates', '--geometry', str(geometry), '--georeliab', str(stage_out), '--output', str(decision)]) == 2
+    payload = json.loads(decision.read_text(encoding='utf-8'))
+    assert payload['georeliab']['status'] == 'PASS'
+    assert payload['selection']['selected_track'] == 'BLOCKED_PENDING_GEOMETRY'
+    assert payload['selection']['reason'] == 'GEORELIAB_PASS_PENDING_GEOMETRY'
+
+
+def test_stage_manifest_rejects_render_rgb_and_tartan_tamper(tmp_path: Path):
+    stage, entries = _write_stage_bundle_grid(tmp_path)
+    payload = json.loads(stage.read_text(encoding='utf-8'))
+
+    manifest_path = Path(entries[0]['manifest_path'])
+    manifest_payload = json.loads(manifest_path.read_text(encoding='utf-8'))
+    manifest_payload['rgb_digest'] = 'bad-rgb'
+    manifest_path.write_text(json.dumps(manifest_payload), encoding='utf-8')
+    rgb_entries = [dict(item) for item in entries]
+    rgb_entries[0]['manifest_sha256'] = _sha256(manifest_path)
+    rgb_tamper = tmp_path / 'rgb_tamper.json'
+    rgb_tamper.write_text(json.dumps({**payload, 'bundle_index': rgb_entries}), encoding='utf-8')
+    assert main(['audit-georeliab', '--stage-evidence', str(rgb_tamper), '--output', str(tmp_path / 'rgb_out.json')]) == 2
+
+    stage2, _ = _write_stage_bundle_grid(tmp_path / 'tartan')
+    payload2 = json.loads(stage2.read_text(encoding='utf-8'))
+    tartan = Path(payload2['tartanair_native_fog_sanity_path'])
+    tartan_payload = json.loads(tartan.read_text(encoding='utf-8'))
+    tartan_payload['correlations'][-1] = 'NaN'
+    tartan.write_text(json.dumps(tartan_payload), encoding='utf-8')
+    tartan_tamper = tmp_path / 'tartan_tamper.json'
+    tartan_tamper.write_text(json.dumps({**payload2, 'tartanair_native_fog_sanity_sha256': _sha256(tartan)}), encoding='utf-8')
+    assert main(['audit-georeliab', '--stage-evidence', str(tartan_tamper), '--output', str(tmp_path / 'tartan_out.json')]) == 2
+
+
+def test_auroc_only_branch_gets_holm_supported_evidence():
+    scenes = [f's{i:02d}' for i in range(20)]
+    condition_records = {}
+    for condition in ('clean', '1', '2', '3'):
+        condition_records[condition] = {}
+        for scene in scenes:
+            condition_records[condition][scene] = {
+                'risk': [0.0, 1.0, 2.0, 3.0],
+                'error': [0.0, 1.0, 2.0, 3.0] if condition == 'clean' else [0.0, 1.0, 2.0, 3.0],
+                'failure': [True, True, False, False] if condition == '3' else [False, False, True, True],
+            }
+    item = build_condition_evidence(
+        model='VGGT',
+        corruption='fog',
+        scene_condition_records=condition_records,
+        corruption_qa=True,
+        cross_view_consistent=True,
+        gt_geometry_invariant=True,
+        expected_scene_count=20,
+        n_resamples=10_000,
+        seed=5,
+    )
+    assert item.relative_decline_ci_lower == pytest.approx(0.0)
+    assert item.failure_auroc <= 0.65
+    assert item.failure_auroc_raw_p is not None
+    conditions = (item,) + tuple(_condition(model, corruption) for model in ('VGGT', 'MASt3R') for corruption in ('fog', 'low-light-noise', 'defocus') if not (model == 'VGGT' and corruption == 'fog'))
+    base = _gate_input(conditions=conditions)
+    payload = build_georeliab_evidence(
+        condition_evidence=conditions,
+        downstream_harm=base.downstream_harm,
+        zero_update=base.zero_update,
+        required_models_ready=base.required_models_ready,
+        required_datasets_ready=True,
+        tartanair_native_fog_sanity=True,
+        run_mode='real',
+        split='test',
+        schedule_counts=base.schedule_counts,
+        statistics={'downstream_schedule_counts': base.downstream_schedule_counts},
+    )
+    evidence = evaluate_georeliab_gate(payload.to_gate_input()).to_dict()
+    vg = next(row for row in payload.conditions if row.model == 'VGGT' and row.corruption == 'fog')
+    assert vg.failure_auroc_raw_p is not None
+    assert evidence['status'] == 'PASS'
 
 
 def test_stage_manifest_rejects_missing_duplicate_crosslink_and_aggregate_bypass(tmp_path: Path):

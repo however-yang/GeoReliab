@@ -61,6 +61,7 @@ class SceneAUROCBranch:
     effect: float | None
     ci_lower: float | None
     ci_upper: float | None
+    raw_p: float | None
     n_eligible_scenes: int
     n_resamples: int
     reason_codes: tuple[str, ...]
@@ -450,22 +451,27 @@ def scene_auroc_branch(
             effect=None,
             ci_lower=None,
             ci_upper=None,
+            raw_p=None,
             n_eligible_scenes=len(aurocs),
             n_resamples=n_resamples,
             reason_codes=('AUROC_ELIGIBLE_SCENES_LT_16',),
         )
-    baseline = {scene: 0.65 for scene in aurocs}
-    result = paired_scene_bootstrap(
-        baseline,
-        aurocs,
-        n_resamples=n_resamples,
-        seed=seed,
-    )
+    scenes = tuple(sorted(aurocs))
+    diffs = {scene: aurocs[scene] - GEORELIAB_FAILURE_AUROC_THRESHOLD for scene in scenes}
+    rng = random.Random(seed)
+    estimates = []
+    for _ in range(n_resamples):
+        estimates.append(fmean(diffs[rng.choice(scenes)] for _ in scenes))
+    ordered = sorted(estimates)
+    lower_index = int(0.025 * (n_resamples - 1))
+    upper_index = int(0.975 * (n_resamples - 1))
+    raw_p = sum(value >= 0.0 for value in estimates) / n_resamples
     return SceneAUROCBranch(
         eligible=True,
-        effect=result.effect + 0.65,
-        ci_lower=result.ci_lower + 0.65,
-        ci_upper=result.ci_upper + 0.65,
+        effect=fmean(aurocs.values()),
+        ci_lower=ordered[lower_index] + GEORELIAB_FAILURE_AUROC_THRESHOLD,
+        ci_upper=ordered[upper_index] + GEORELIAB_FAILURE_AUROC_THRESHOLD,
+        raw_p=raw_p,
         n_eligible_scenes=len(aurocs),
         n_resamples=n_resamples,
         reason_codes=(),
@@ -533,7 +539,7 @@ def build_condition_evidence(
         scene_count=len(first_scenes),
         n_resamples=n_resamples,
         relative_decline_raw_p=relative_raw_p,
-        failure_auroc_raw_p=None,
+        failure_auroc_raw_p=auroc.raw_p,
     )
 
 
@@ -968,6 +974,9 @@ def load_stage_evidence_manifest(path: Path) -> GeoReliabEvidencePayload:
     if split_test_scenes != tuple(TEST_SCENES):
         raise AuditError('stage split manifest test scenes do not match the frozen DTU TEST_SCENES')
     frozen_test_scenes = tuple(f'scan{scene}' for scene in TEST_SCENES)
+    render_digests = _load_stage_render_digests(
+        payload, split_payload=split_payload, frozen_test_scenes=frozen_test_scenes,
+    )
     qa = _load_stage_qa_manifests(payload, frozen_test_scenes=frozen_test_scenes)
     bundle_index = payload.get('bundle_index')
     if not isinstance(bundle_index, list) or not bundle_index:
@@ -976,6 +985,8 @@ def load_stage_evidence_manifest(path: Path) -> GeoReliabEvidencePayload:
         bundle_index,
         frozen_test_scenes=frozen_test_scenes,
         split_manifest_sha256=_file_sha256(split_manifest_path),
+        parameter_manifest_sha256=str(payload.get('parameter_manifest_sha256')),
+        render_digests=render_digests,
     )
     condition_evidence = _derive_stage_conditions(
         bundle_records, frozen_test_scenes=frozen_test_scenes, qa=qa,
@@ -1036,6 +1047,136 @@ def _stage_top_path(payload: Mapping[str, Any], name: str) -> Path:
     return path
 
 
+def canonical_ordered_png_bundle_digest(views: Sequence[Mapping[str, Any]]) -> str:
+    if len(views) != 8:
+        raise AuditError('render index samples must bind exactly eight PNG views')
+    digest = hashlib.sha256()
+    seen: set[int] = set()
+    for view in views:
+        if not isinstance(view, Mapping):
+            raise AuditError('render index views must be objects')
+        try:
+            view_id = int(view['view_id'])
+            path = Path(str(view['path']))
+            supplied_sha = str(view['sha256'])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AuditError('render index view is missing id/path/sha256') from exc
+        if view_id in seen:
+            raise AuditError('render index sample has duplicate view_id')
+        seen.add(view_id)
+        if path.suffix.lower() != '.png':
+            raise AuditError('render index view paths must point to PNG files')
+        if _file_sha256(path) != supplied_sha:
+            raise AuditError('render index PNG digest mismatch')
+        digest.update(str(view_id).encode('ascii'))
+        digest.update(b'\0')
+        digest.update(supplied_sha.encode('ascii'))
+        digest.update(b'\0')
+    return digest.hexdigest()
+
+
+def _split_scene_views(split_payload: Mapping[str, Any], scene: str) -> tuple[int, ...]:
+    views = split_payload.get('views')
+    if not isinstance(views, Mapping):
+        raise AuditError('split/view manifest must include frozen per-scene views')
+    raw = views.get(scene)
+    if raw is None and scene.startswith('scan'):
+        raw = views.get(scene[4:])
+    if raw is None:
+        raise AuditError('split/view manifest is missing a frozen view set for a test scene')
+    try:
+        frozen = tuple(int(value) for value in raw)
+    except (TypeError, ValueError) as exc:
+        raise AuditError('split/view manifest views must be integer camera ids') from exc
+    if len(frozen) != 8 or len(set(frozen)) != 8:
+        raise AuditError('split/view manifest must freeze exactly eight unique views per test scene')
+    return frozen
+
+
+def _load_verified_prepared_batch(path: Path):
+    from .preparation_round2 import load_prepared_batch
+
+    return load_prepared_batch(path, expected_stage='test')
+
+
+def _load_verified_tartanair_pairs(path: Path):
+    from .preparation_round2 import load_tartanair_prepared_pairs
+
+    return load_tartanair_prepared_pairs(path)
+
+
+def _load_stage_render_digests(
+    payload: Mapping[str, Any],
+    *,
+    split_payload: Mapping[str, Any],
+    frozen_test_scenes: Sequence[str],
+) -> dict[str, str]:
+    prepared_path = _stage_top_path(payload, 'test_prepared_input')
+    tartan_prepared_path = _stage_top_path(payload, 'tartanair_prepared_input')
+    render_index_path = _stage_top_path(payload, 'test_render_index')
+    prepared = json.loads(prepared_path.read_text(encoding='utf-8'))
+    tartan_prepared = json.loads(tartan_prepared_path.read_text(encoding='utf-8'))
+    render_index = json.loads(render_index_path.read_text(encoding='utf-8'))
+    prepared_batch = _load_verified_prepared_batch(prepared_path)
+    tartan_pairs = _load_verified_tartanair_pairs(tartan_prepared_path)
+    if prepared.get('schema_version') != 'prepared-input-v2' or prepared.get('stage') != 'test' or prepared.get('split') != 'test':
+        raise AuditError('test prepared input must use prepared-input-v2 for the test split')
+    if prepared.get('split_view_manifest_sha256') != payload.get('split_view_manifest_sha256') or prepared.get('materialization_sha256') != payload.get('materialization_sha256'):
+        raise AuditError('test prepared input is not bound to stage split/materialization')
+    if (
+        prepared_batch.split_view_manifest_sha256 != payload.get('split_view_manifest_sha256')
+        or prepared_batch.materialization_sha256 != payload.get('materialization_sha256')
+        or len(prepared_batch.records) != 160
+        or prepared.get('record_count') != 160
+        or not isinstance(prepared.get('records'), list)
+        or len(prepared['records']) != 160
+    ):
+        raise AuditError('test prepared input must contain exactly 160 records')
+    if (
+        tartan_prepared.get('schema_version') != 'tartanair-prepared-v2'
+        or len(tartan_pairs) != 100
+        or tartan_prepared.get('record_count') != 100
+        or not isinstance(tartan_prepared.get('records'), list)
+        or len(tartan_prepared['records']) != 100
+    ):
+        raise AuditError('TartanAir prepared input must use tartanair-prepared-v2 with exactly 100 records')
+    if render_index.get('schema_version') != 'test-render-index-v1' or render_index.get('stage') != 'test' or render_index.get('split') != 'test':
+        raise AuditError('test render index manifest schema/stage/split mismatch')
+    if render_index.get('prepared_input_sha256') != payload.get('test_prepared_input_sha256'):
+        raise AuditError('test render index is not bound to prepared test input')
+    if render_index.get('parameter_manifest_sha256') != payload.get('parameter_manifest_sha256'):
+        raise AuditError('test render index is not bound to corruption parameter manifest')
+    expected: set[tuple[str, str, str, str]] = set()
+    for scene in frozen_test_scenes:
+        expected.add((scene, 'clean', '0', f'dtu/test/{scene}/views-0001/clean/0/0'))
+        for corruption in ('fog', 'low-light-noise', 'defocus'):
+            for severity in ('1', '2', '3'):
+                expected.add((scene, corruption, severity, f'dtu/test/{scene}/views-0001/{corruption}/{severity}/0'))
+    rows = render_index.get('records')
+    if not isinstance(rows, list) or len(rows) != 200:
+        raise AuditError('test render index must cover exactly 20 scenes x 10 samples')
+    observed: set[tuple[str, str, str, str]] = set()
+    digests: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise AuditError('test render index records must be objects')
+        scene = str(row.get('scene'))
+        condition = str(row.get('condition'))
+        severity = str(row.get('severity'))
+        sample_key = str(row.get('sample_key'))
+        observed.add((scene, condition, severity, sample_key))
+        views = row.get('views')
+        if not isinstance(views, list):
+            raise AuditError('test render index records must bind PNG views')
+        ordered_ids = tuple(int(view['view_id']) for view in views)
+        if ordered_ids != _split_scene_views(split_payload, scene):
+            raise AuditError('render index view order does not match frozen split/view manifest')
+        digests[sample_key] = canonical_ordered_png_bundle_digest(views)
+    if observed != expected or set(digests) != {item[3] for item in expected}:
+        raise AuditError('test render index sample grid does not match frozen 20x10 test grid')
+    return digests
+
+
 def _load_stage_qa_manifests(
     payload: Mapping[str, Any], *, frozen_test_scenes: Sequence[str]
 ) -> dict[str, Any]:
@@ -1063,11 +1204,21 @@ def _load_stage_qa_manifests(
             raise AuditError(f'test render lock is not bound to stage {key}')
     if render.get('calibration_qa_sha256') != payload.get('corruption_calibration_qa_sha256'):
         raise AuditError('test render lock is not bound to calibration QA digest')
+    if render.get('prepared_input_sha256') != payload.get('test_prepared_input_sha256'):
+        raise AuditError('test render lock is not bound to prepared test input')
     if tartan.get('calibration_qa_sha256') != payload.get('corruption_calibration_qa_sha256'):
         raise AuditError('TartanAir sanity is not bound to calibration QA digest')
+    if tartan.get('prepared_input_sha256') != payload.get('tartanair_prepared_input_sha256'):
+        raise AuditError('TartanAir sanity is not bound to TartanAir prepared input')
     correlations = tartan.get('correlations', [])
-    negative_count = sum(float(value) < 0 for value in correlations)
-    if tartan.get('reason_code') != 'TARTANAIR_NATIVE_FOG_SANITY' or not bool(tartan.get('passed')) or int(tartan.get('evaluated_frames', 0)) != 100 or len(correlations) != 100 or int(tartan.get('negative_frames', -1)) != negative_count or negative_count < 80:
+    try:
+        corr_values = [float(value) for value in correlations]
+    except (TypeError, ValueError) as exc:
+        raise AuditError('TartanAir sanity correlations must be finite numbers') from exc
+    if any(not math.isfinite(value) for value in corr_values):
+        raise AuditError('TartanAir sanity correlations must be finite numbers')
+    negative_count = sum(value < 0 for value in corr_values)
+    if tartan.get('reason_code') != 'TARTANAIR_NATIVE_FOG_SANITY' or not bool(tartan.get('passed')) or int(tartan.get('evaluated_frames', 0)) != 100 or len(corr_values) != 100 or int(tartan.get('negative_frames', -1)) != negative_count or negative_count < 80:
         raise AuditError('TartanAir sanity manifest does not satisfy the frozen native fog check')
     return {
         'corruption_pass': {
@@ -1086,13 +1237,15 @@ def _load_stage_bundle_records(
     *,
     frozen_test_scenes: Sequence[str],
     split_manifest_sha256: str,
+    parameter_manifest_sha256: str,
+    render_digests: Mapping[str, str],
 ) -> list[dict[str, Any]]:
     if len(bundle_index) != 400:
         raise AuditError('stage evidence requires exactly 400 P3 bundle entries')
     records: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     shared_project: tuple[str, str, str, str] | None = None
-    model_freeze: dict[str, tuple[str, str, str]] = {}
+    model_freeze: dict[str, tuple[str, str, str, str | None, str | None]] = {}
     for item in bundle_index:
         if not isinstance(item, Mapping):
             raise AuditError('stage bundle_index entries must be objects')
@@ -1126,6 +1279,11 @@ def _load_stage_bundle_records(
             raise AuditError('stage REAL bundles require scientific provenance')
         if provenance.split_view_manifest_sha256 != split_manifest_sha256:
             raise AuditError('stage bundle provenance is not bound to the stage split manifest')
+        if provenance.corruption_manifest_sha256 != parameter_manifest_sha256:
+            raise AuditError('stage bundle corruption provenance is not bound to the parameter manifest')
+        expected_rgb = render_digests.get(prediction.sample_key)
+        if expected_rgb is None or manifest.rgb_digest != expected_rgb:
+            raise AuditError('stage bundle RGB digest is not bound to the frozen render index')
         project_tuple = (
             provenance.project_commit,
             provenance.project_tree,
@@ -1140,7 +1298,11 @@ def _load_stage_bundle_records(
             manifest.checkpoint_hash,
             provenance.model_source_commit,
             provenance.environment_lock_sha256,
+            provenance.dust3r_source_commit if manifest.model == 'MASt3R' else None,
+            provenance.croco_source_commit if manifest.model == 'MASt3R' else None,
         )
+        if manifest.model == 'MASt3R' and (not provenance.dust3r_source_commit or not provenance.croco_source_commit):
+            raise AuditError('MASt3R stage bundles must freeze DUSt3R and CroCo source commits')
         if manifest.model in model_freeze and model_freeze[manifest.model] != model_tuple:
             raise AuditError('stage evidence mixes model checkpoint/source/environment provenance')
         model_freeze.setdefault(manifest.model, model_tuple)
@@ -1299,16 +1461,13 @@ def _derive_bound_downstream_rows(
         if row_type == 'downstream':
             if evidence_payload.get('schema_version') != 'downstream-harm-v1' or evidence_payload.get('coverage') != [0.9, 0.7, 0.5, 0.3] or evidence_payload.get('random_mask_count') != 100 or evidence_payload.get('n_resamples') != 10_000:
                 raise AuditError('downstream evidence does not match frozen schema/coverage/random/bootstrap protocol')
-            gt_inputs = _load_stage_scene_npz_inputs(
-                evidence_payload.get('gt_inputs'), scene_ids, row_type='downstream'
-            )
             harm = native_vs_random_harm(
                 {
                     scene: (
                         severity2_records[(model, condition, scene)]['dense']['gt_error'],
                         severity2_records[(model, condition, scene)]['dense']['risk'],
                         severity2_records[(model, condition, scene)]['dense']['voxel_points'],
-                        gt_inputs[scene]['gt_points'],
+                        _load_gt_points_from_audit_metadata(severity2_records[(model, condition, scene)]['audit']),
                     )
                     for scene in scene_ids
                 },
@@ -1316,10 +1475,6 @@ def _derive_bound_downstream_rows(
                 n_resamples=10_000,
                 seed=23,
             )
-            for scene in scene_ids:
-                expected_gt = severity2_records[(model, condition, scene)]['audit'].metadata.get('gt_points_sha256')
-                if not expected_gt or gt_inputs[scene].get('__sha256') != expected_gt:
-                    raise AuditError('downstream GT input is not bound to the severity-2 audit metadata')
             rows.append(DownstreamHarmEvidence(
                 model=model,
                 condition=condition,
@@ -1344,8 +1499,9 @@ def _derive_bound_downstream_rows(
                         parent_model = str(np.asarray(subset_payload['parent_model']).item())
                         parent_sample_key = str(np.asarray(subset_payload['parent_sample_key']).item())
                         parent_project = str(np.asarray(subset_payload['parent_project_commit']).item())
+                        parent_run_id = str(np.asarray(subset_payload['parent_run_id']).item())
                         expected_project = full_record['manifest'].provenance.project_commit
-                        if parent_model != model or parent_sample_key != full_record['prediction'].sample_key or parent_project != expected_project:
+                        if parent_model != model or parent_sample_key != full_record['prediction'].sample_key or parent_project != expected_project or parent_run_id != full_record['manifest'].run_id:
                             raise AuditError('zero-update subset artifact is not bound to the parent full prediction')
                         subset_predictions.append({
                             'points': subset_payload['points'],
@@ -1376,26 +1532,6 @@ def _derive_bound_downstream_rows(
                 ci_lower=gain.ci_lower,
             ))
     return tuple(rows)
-
-
-def _load_stage_scene_npz_inputs(
-    index: Any,
-    scene_ids: Sequence[str],
-    *,
-    row_type: str,
-) -> dict[str, dict[str, np.ndarray]]:
-    if not isinstance(index, Mapping) or set(index) != set(scene_ids):
-        raise AuditError(f'{row_type} evidence must bind per-scene NPZ inputs for the frozen scenes')
-    result = {}
-    for scene in scene_ids:
-        item = index[scene]
-        if not isinstance(item, Mapping):
-            raise AuditError(f'{row_type} scene input must bind path and sha256')
-        path = _stage_path(item, 'input')
-        with np.load(path, allow_pickle=False) as payload:
-            result[scene] = {name: payload[name] for name in payload.files}
-        result[scene]['__sha256'] = item[f'{"input"}_sha256']
-    return result
 
 
 def load_georeliab_evidence_payload(payload: Mapping[str, Any]) -> GeoReliabEvidencePayload:
@@ -1443,6 +1579,35 @@ def _load_npz_uri(uri: str) -> dict[str, np.ndarray]:
         path_text = path_text[1:]
     with np.load(Path(path_text), allow_pickle=False) as payload:
         return {name: payload[name] for name in payload.files}
+
+
+def _local_file_uri_path(uri: str) -> Path:
+    from urllib.parse import unquote, urlparse
+
+    parsed = urlparse(uri)
+    if parsed.scheme != 'file':
+        raise AuditError('stage-bound dense/GT payloads must use local file URIs')
+    path_text = unquote(parsed.path)
+    if len(path_text) >= 3 and path_text[0] == '/' and path_text[2] == ':':
+        path_text = path_text[1:]
+    return Path(path_text)
+
+
+def _load_gt_points_from_audit_metadata(audit: AuditRecord) -> np.ndarray:
+    uri = audit.metadata.get('gt_points_uri')
+    digest = audit.metadata.get('gt_points_sha256')
+    if not isinstance(uri, str) or not isinstance(digest, str):
+        raise AuditError('downstream evidence requires GT URI/SHA from audit metadata')
+    path = _local_file_uri_path(uri)
+    if _file_sha256(path) != digest:
+        raise AuditError('audit metadata GT digest mismatch')
+    loaded = np.load(path, allow_pickle=False)
+    if isinstance(loaded, np.lib.npyio.NpzFile):
+        with loaded as payload:
+            if 'gt_points' not in payload.files:
+                raise AuditError('GT NPZ metadata payload must contain gt_points')
+            return _points_array(payload['gt_points'], 'gt_points')
+    return _points_array(loaded, 'gt_points')
 
 
 def write_dense_audit_bundle(
@@ -1523,6 +1688,8 @@ def write_dense_audit_bundle(
         metadata={
             'dense_audit_uri': dense_path.resolve().as_uri(),
             'dense_audit_sha256': _file_sha256(dense_path),
+            'gt_points_uri': gt_points_path.resolve().as_uri(),
+            'gt_points_sha256': _file_sha256(gt_points_path),
         },
     )
     audit_path = output_dir / 'audit_record.json'
@@ -1535,6 +1702,7 @@ def write_dense_audit_bundle(
         'sample_key': prediction.sample_key,
         'audit_sha256': _file_sha256(audit_path),
         'dense_audit_uri': dense_path.resolve().as_uri(),
+        'gt_points_uri': gt_points_path.resolve().as_uri(),
         'audit_record': str(audit_path),
         'summary': result.summary,
         'corruption_severity_monotonic': False,
