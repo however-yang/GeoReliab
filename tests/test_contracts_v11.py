@@ -242,3 +242,112 @@ def test_bundle_validator_rejects_payload_and_linkage_failures(tmp_path):
     )
     with pytest.raises(ContractError, match='sample_key'):
         validate_artifact_bundle(manifest, prediction, audit)
+
+def test_bundle_validator_allows_invalid_prediction_evidence_with_finite_valid_mask(tmp_path):
+    geometry = tmp_path / 'invalid_geometry.npz'
+    confidence = tmp_path / 'invalid_confidence.npz'
+    valid_mask = tmp_path / 'invalid_valid_mask.npz'
+    dense_audit = tmp_path / 'invalid_dense_audit.npz'
+    np.savez(
+        geometry,
+        points_world=np.array([[np.nan, 0.0, 1.0], [1.0, 2.0, 3.0]]),
+        camera_c2w=np.full((1, 4, 4), np.nan),
+        intrinsics=np.zeros((1, 3, 3)),
+        pixel_xy=np.array([[1.0, 2.0], [3.0, 4.0]]),
+        view_id=np.array([20, 20]),
+    )
+    np.savez(confidence, raw_confidence=np.array([np.inf, 0.4]))
+    np.savez(valid_mask, valid_mask=np.array([False, True]))
+    np.savez(
+        dense_audit,
+        voxel_points=np.empty((0, 3)),
+        raw_confidence=np.empty((0,)),
+        risk=np.empty((0,)),
+        gt_error=np.empty((0,)),
+        failure_label=np.empty((0,), dtype=bool),
+        provenance_count=np.empty((0,), dtype=int),
+    )
+    manifest = fixture_manifest()
+    key = 'fixture/test/s1/v1/fog/3/0'
+    prediction = PredictionArtifact(
+        run_id=manifest.run_id,
+        sample_key=key,
+        geometry_prediction_uri=geometry.as_uri(),
+        native_confidence_uri=confidence.as_uri(),
+        valid_mask_uri=valid_mask.as_uri(),
+        hook_location=None,
+        runtime_seconds=0.0,
+        peak_memory_mb=0.0,
+        invalid_prediction=True,
+    )
+    audit = AuditRecord(
+        run_id=manifest.run_id,
+        sample_key=key,
+        gt_error=None,
+        failure_label=True,
+        selection_score=0.0,
+        coverage=0.0,
+        accepted=False,
+        downstream_outcome=0.0,
+        invalid_prediction=True,
+        metadata={'dense_audit_uri': dense_audit.as_uri()},
+    )
+    validate_artifact_bundle(manifest, prediction, audit)
+
+    np.savez(valid_mask, valid_mask=np.array([True, True]))
+    with pytest.raises(ContractError, match='valid mask marks non-finite'):
+        validate_artifact_bundle(manifest, prediction, audit)
+
+
+def test_bundle_validator_accepts_noncontiguous_frozen_view_ids_for_valid_prediction(tmp_path):
+    geometry = tmp_path / 'noncontig_geometry.npz'
+    confidence = tmp_path / 'noncontig_confidence.npz'
+    valid_mask = tmp_path / 'noncontig_valid_mask.npz'
+    dense_audit = tmp_path / 'noncontig_dense_audit.npz'
+    np.savez(
+        geometry,
+        points_world=np.ones((4, 3)),
+        camera_c2w=np.repeat(np.eye(4)[None], 2, axis=0),
+        intrinsics=np.repeat(np.eye(3)[None], 2, axis=0),
+        pixel_xy=np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]),
+        view_id=np.array([20, 20, 27, 27]),
+    )
+    np.savez(confidence, raw_confidence=np.array([0.2, 0.4, 0.6, 0.8]))
+    np.savez(valid_mask, valid_mask=np.array([True, True, True, True]))
+    np.savez(
+        dense_audit,
+        voxel_points=np.ones((4, 3)),
+        raw_confidence=np.array([0.2, 0.4, 0.6, 0.8]),
+        risk=np.array([1.0, 2.0, 3.0, 4.0]),
+        gt_error=np.array([1.0, 3.0, 1.0, 3.0]),
+        failure_label=np.array([False, True, False, True]),
+        provenance_count=np.array([1, 1, 1, 1]),
+    )
+    manifest = fixture_manifest()
+    key = 'fixture/test/s1/v1/fog/3/0'
+    prediction = PredictionArtifact(
+        run_id=manifest.run_id,
+        sample_key=key,
+        geometry_prediction_uri=geometry.as_uri(),
+        native_confidence_uri=confidence.as_uri(),
+        valid_mask_uri=valid_mask.as_uri(),
+        hook_location=None,
+        runtime_seconds=0.0,
+        peak_memory_mb=0.0,
+    )
+    audit = AuditRecord(
+        run_id=manifest.run_id,
+        sample_key=key,
+        gt_error=3.0,
+        failure_label=True,
+        selection_score=0.0,
+        coverage=1.0,
+        accepted=False,
+        downstream_outcome=0.0,
+        metadata={'dense_audit_uri': dense_audit.as_uri()},
+    )
+    validate_artifact_bundle(manifest, prediction, audit)
+
+    np.savez(geometry, points_world=np.ones((4, 3)), camera_c2w=np.eye(4)[None], intrinsics=np.eye(3)[None], pixel_xy=np.ones((4, 2)), view_id=np.array([20, 20, 27, 27]), metadata=json.dumps({'view_ids': [20, 27]}))
+    with pytest.raises(ContractError, match='one frozen view_id group per camera row'):
+        validate_artifact_bundle(manifest, prediction, audit)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 import sys
 import types
@@ -11,6 +12,7 @@ import pytest
 
 from georeliab_mve.adapters import (
     AdapterError,
+    AdapterOutput,
     FrozenRuntime,
     MASt3RAdapter,
     RealMASt3RUpstream,
@@ -19,11 +21,12 @@ from georeliab_mve.adapters import (
     RenderedView,
     VGGTAdapter,
     mast3r_risk_from_confidence,
+    serialize_prediction_output,
     source_pixel_grid,
     verify_frozen_runtime,
     vggt_risk_from_depth_conf,
 )
-from georeliab_mve.contracts import RunManifest, RunMode, ScientificProvenance, ScientificValidity
+from georeliab_mve.contracts import RunManifest, RunMode, SampleKey, ScientificProvenance, ScientificValidity
 from georeliab_mve.contracts import _file_uri_path
 
 GIT = 'a' * 40
@@ -351,3 +354,134 @@ def test_adapter_rejects_manifest_provenance_not_bound_to_runtime(tmp_path):
     geom = np.load(_file_uri_path(pred.geometry_prediction_uri, 'geometry'))
     metadata = json.loads(str(geom['metadata']))
     assert 'checkpoint_hash does not match' in metadata['failure_message']
+
+class BadTensorLike:
+    def detach(self):
+        raise RuntimeError('cannot detach numeric trace')
+
+
+class FakeVGGTInvalid(FakeVGGT):
+    def infer(self, images):
+        result = dict(super().infer(images))
+        result['depth'] = result['depth'].copy()
+        result['depth'][0, 0, 0, 0] = np.nan
+        result['depth_conf'] = result['depth_conf'].copy()
+        result['depth_conf'][0, 1, 0, 0] = np.inf
+        result['intrinsics'] = result['intrinsics'].copy()
+        result['intrinsics'][0] = 0.0
+        return result
+
+
+class FakeMASt3RInvalid(FakeMASt3R):
+    def infer(self, paths, images):
+        result = dict(super().infer(paths, images))
+        pts = np.asarray([item.value for item in result['pts3d']])
+        conf = np.asarray([item.value for item in result['conf']])
+        pts[0, 0, 0, 0] = np.nan
+        conf[1, 0, 0] = np.inf
+        camera = result['camera_c2w'].copy()
+        camera[0, :3, :3] = 0.0
+        result['pts3d'] = [TensorLike(item) for item in pts]
+        result['conf'] = [TensorLike(item) for item in conf]
+        result['camera_c2w'] = camera
+        return result
+
+
+def test_vggt_nonfinite_and_singular_intrinsics_fail_closed_without_emptying_arrays(tmp_path):
+    runtime = _runtime(tmp_path)
+    adapter = VGGTAdapter(runtime, output_root=tmp_path / 'out-vggt-invalid', device='cpu', upstream=FakeVGGTInvalid(), git_probe=_git, env_probe=_env)
+    pred = adapter.predict_sample(_manifest('VGGT', runtime), SampleKey.parse('dtu/test/scan001/views-0001/clean/0/0'), _views(tmp_path))
+    assert pred.invalid_prediction
+    geom = np.load(_file_uri_path(pred.geometry_prediction_uri, 'geometry'))
+    conf = np.load(_file_uri_path(pred.native_confidence_uri, 'confidence'))
+    mask = np.load(_file_uri_path(pred.valid_mask_uri, 'mask'))
+    metadata = json.loads(str(geom['metadata']))
+    assert geom['points_world'].shape == (32, 3)
+    assert conf['raw_confidence'].shape == (32,)
+    assert not mask['valid_mask'].all()
+    assert 'non-finite' in metadata['failure_message']
+    assert 'singular' in metadata['failure_message']
+
+
+def test_mast3r_nonfinite_and_degenerate_camera_fail_closed_without_emptying_arrays(tmp_path):
+    runtime = _runtime(tmp_path, mast3r=True)
+    adapter = MASt3RAdapter(runtime, output_root=tmp_path / 'out-mast3r-invalid', device='cpu', upstream=FakeMASt3RInvalid(), git_probe=_git, env_probe=_env)
+    pred = adapter.predict_sample(_manifest('MASt3R', runtime, mast3r=True), SampleKey.parse('dtu/test/scan001/views-0001/clean/0/0'), _views(tmp_path))
+    assert pred.invalid_prediction
+    geom = np.load(_file_uri_path(pred.geometry_prediction_uri, 'geometry'))
+    conf = np.load(_file_uri_path(pred.native_confidence_uri, 'confidence'))
+    mask = np.load(_file_uri_path(pred.valid_mask_uri, 'mask'))
+    metadata = json.loads(str(geom['metadata']))
+    assert geom['points_world'].shape == (32, 3)
+    assert conf['raw_confidence'].shape == (32,)
+    assert not mask['valid_mask'].all()
+    assert 'non-finite' in metadata['failure_message']
+    assert 'degenerate' in metadata['failure_message']
+
+
+def test_mast3r_preflight_requires_dust3r_and_croco_sources_before_inference(tmp_path):
+    full_runtime = _runtime(tmp_path, mast3r=True)
+    runtime = replace(full_runtime, dust3r_source=None, dust3r_source_commit=None)
+    adapter = MASt3RAdapter(runtime, output_root=tmp_path / 'out-preflight', device='cpu', upstream=FakeMASt3R(), git_probe=_git, env_probe=_env)
+    pred = adapter.predict_sample(_manifest('MASt3R', full_runtime, mast3r=True), SampleKey.parse('dtu/test/scan001/views-0001/clean/0/0'), _views(tmp_path))
+    assert pred.invalid_prediction
+    assert not adapter.upstream.calls
+    geom = np.load(_file_uri_path(pred.geometry_prediction_uri, 'geometry'))
+    metadata = json.loads(str(geom['metadata']))
+    assert 'requires frozen DUSt3R and CroCo' in metadata['failure_message']
+
+
+def test_mast3r_pairwise_numeric_trace_failure_marks_invalid_but_preserves_output(tmp_path):
+    class FakePairwiseFailure(FakeMASt3R):
+        def infer(self, paths, images):
+            result = dict(super().infer(paths, images))
+            result['pairwise_pts3d'] = BadTensorLike()
+            return result
+
+    runtime = _runtime(tmp_path, mast3r=True)
+    adapter = MASt3RAdapter(runtime, output_root=tmp_path / 'out-pairwise-fail', device='cpu', upstream=FakePairwiseFailure(), git_probe=_git, env_probe=_env)
+    pred = adapter.predict_sample(_manifest('MASt3R', runtime, mast3r=True), SampleKey.parse('dtu/test/scan001/views-0001/clean/0/0'), _views(tmp_path))
+    assert pred.invalid_prediction
+    geom = np.load(_file_uri_path(pred.geometry_prediction_uri, 'geometry'))
+    metadata = json.loads(str(geom['metadata']))
+    assert geom['points_world'].shape == (32, 3)
+    assert metadata['failure_type'] == 'AdapterPairwiseTraceError'
+    assert metadata['raw_pairwise_trace_status'] == 'numeric-trace-conversion-failed'
+
+
+def test_mast3r_raw_pairwise_nonnumeric_key_is_recorded_as_skipped(tmp_path):
+    class FakeRawSkip(FakeMASt3R):
+        def infer(self, paths, images):
+            result = dict(super().infer(paths, images))
+            result['raw_pairwise'] = {'bad': object()}
+            return result
+
+    runtime = _runtime(tmp_path, mast3r=True)
+    adapter = MASt3RAdapter(runtime, output_root=tmp_path / 'out-raw-skip', device='cpu', upstream=FakeRawSkip(), git_probe=_git, env_probe=_env)
+    pred = adapter.predict_sample(_manifest('MASt3R', runtime, mast3r=True), SampleKey.parse('dtu/test/scan001/views-0001/clean/0/0'), _views(tmp_path))
+    assert not pred.invalid_prediction
+    geom = np.load(_file_uri_path(pred.geometry_prediction_uri, 'geometry'))
+    metadata = json.loads(str(geom['metadata']))
+    assert metadata['raw_pairwise_skipped'] == [{'exception_type': 'ObjectDTypeUnsupported', 'key': 'bad'}]
+
+
+def test_v11_payload_npz_bytes_are_deterministic_across_dirs_and_prefixes(tmp_path):
+    runtime = _runtime(tmp_path)
+    manifest = _manifest('VGGT', runtime)
+    sample_key = SampleKey.parse('dtu/test/scan001/views-0001/clean/0/0')
+    output = AdapterOutput(
+        points_world=np.arange(6, dtype=float).reshape(2, 3),
+        camera_c2w=np.eye(4)[None],
+        intrinsics=np.eye(3)[None],
+        pixel_xy=np.array([[0.5, 1.5], [2.5, 3.5]]),
+        view_id=np.array([20, 20]),
+        raw_confidence=np.array([2.0, 3.0]),
+        valid_mask=np.array([True, True]),
+        metadata={'b': 2, 'a': 1},
+    )
+    first = serialize_prediction_output(manifest=manifest, sample_key=sample_key, output=output, output_dir=tmp_path / 'a', prefix='first', runtime_seconds=1.0, peak_memory_mb=2.0, invalid_prediction=False, write_prediction_json=False)
+    second = serialize_prediction_output(manifest=manifest, sample_key=sample_key, output=output, output_dir=tmp_path / 'b', prefix='second', runtime_seconds=9.0, peak_memory_mb=8.0, invalid_prediction=False, write_prediction_json=False)
+    assert first.payload_digests == second.payload_digests
+    assert Path(_file_uri_path(first.geometry_prediction_uri, 'geometry')).read_bytes() == Path(_file_uri_path(second.geometry_prediction_uri, 'geometry')).read_bytes()
+    assert Path(_file_uri_path(first.native_confidence_uri, 'confidence')).read_bytes() == Path(_file_uri_path(second.native_confidence_uri, 'confidence')).read_bytes()
+    assert Path(_file_uri_path(first.valid_mask_uri, 'mask')).read_bytes() == Path(_file_uri_path(second.valid_mask_uri, 'mask')).read_bytes()

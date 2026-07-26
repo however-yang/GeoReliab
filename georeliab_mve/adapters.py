@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+import io
 from dataclasses import asdict, dataclass, field
 import hashlib
 import importlib
@@ -12,6 +13,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import zipfile
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
@@ -81,9 +83,14 @@ class FrozenRuntime:
             if self.config_sha256 is None:
                 raise AdapterError('config_sha256 is required when config is set')
             require_sha256(self.config_sha256, 'config digest')
-        for label, value in (('dust3r_source_commit', self.dust3r_source_commit), ('croco_source_commit', self.croco_source_commit)):
-            if value is not None:
-                require_git_commit(value, label)
+        for path_label, commit_label, path_value, commit_value in ((
+            ('dust3r_source', 'dust3r_source_commit', self.dust3r_source, self.dust3r_source_commit),
+            ('croco_source', 'croco_source_commit', self.croco_source, self.croco_source_commit),
+        )):
+            if (path_value is None) != (commit_value is None):
+                raise AdapterError(f'{path_label} and {commit_label} must be provided together')
+            if commit_value is not None:
+                require_git_commit(commit_value, commit_label)
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +212,8 @@ def verify_frozen_runtime(model: str, runtime: FrozenRuntime, *, git_probe: GitP
         raise AdapterError(f'{model} environment mismatch: Python {python}/Torch {torch} != Python {runtime.python_version}/Torch {runtime.torch_version}')
     dust3r_commit = None
     croco_commit = None
+    if model == 'MASt3R' and (runtime.dust3r_source is None or runtime.dust3r_source_commit is None or runtime.croco_source is None or runtime.croco_source_commit is None):
+        raise AdapterError('MASt3R preflight requires frozen DUSt3R and CroCo source paths and commits')
     if runtime.dust3r_source is not None:
         dust3r_commit = git_probe(runtime.dust3r_source).lower()
         if dust3r_commit != runtime.dust3r_source_commit:
@@ -326,8 +335,8 @@ def _depth_to_points_world(depth: np.ndarray, camera_c2w: np.ndarray, intrinsics
         pixel_h = np.stack([xx, yy, np.ones_like(xx)], axis=-1).reshape(-1, 3).astype(np.float64)
         try:
             rays = pixel_h @ np.linalg.inv(intrinsics[local_view]).T
-        except np.linalg.LinAlgError as exc:
-            raise AdapterError('predicted intrinsics are singular') from exc
+        except np.linalg.LinAlgError:
+            rays = np.full((height * width, 3), np.nan, dtype=np.float64)
         camera_points = rays * depth_map.reshape(-1, 1)
         homogeneous = np.concatenate([camera_points, np.ones((len(camera_points), 1))], axis=1)
         world = homogeneous @ camera_c2w[local_view].T
@@ -340,6 +349,49 @@ def _depth_to_points_world(depth: np.ndarray, camera_c2w: np.ndarray, intrinsics
 def _valid_output_mask(points: np.ndarray, confidence: np.ndarray) -> np.ndarray:
     return np.isfinite(points).all(axis=1) & np.isfinite(confidence)
 
+
+def _has_singular_intrinsics(intrinsics: np.ndarray) -> bool:
+    if intrinsics.size == 0 or not np.isfinite(intrinsics).all():
+        return True
+    for matrix in intrinsics:
+        try:
+            if np.linalg.matrix_rank(matrix) < 3 or abs(float(np.linalg.det(matrix))) <= 1e-12:
+                return True
+        except np.linalg.LinAlgError:
+            return True
+    return False
+
+
+def _has_degenerate_camera(camera_c2w: np.ndarray) -> bool:
+    if camera_c2w.size == 0 or not np.isfinite(camera_c2w).all():
+        return True
+    for matrix in camera_c2w:
+        linear = matrix[:3, :3]
+        try:
+            if np.linalg.matrix_rank(linear) < 3 or abs(float(np.linalg.det(linear))) <= 1e-12:
+                return True
+        except np.linalg.LinAlgError:
+            return True
+    return False
+
+
+def _output_validation_failures(model: str, output: AdapterOutput) -> list[str]:
+    failures: list[str] = []
+    if output.points_world.size == 0:
+        failures.append(f'{model} produced empty geometry')
+    if output.raw_confidence.size == 0:
+        failures.append(f'{model} produced empty native confidence')
+    if output.points_world.shape[0] != output.raw_confidence.shape[0] or output.points_world.shape[0] != output.valid_mask.shape[0]:
+        failures.append(f'{model} output point/confidence/mask lengths do not match')
+    if output.points_world.size and not np.isfinite(output.points_world).all():
+        failures.append(f'{model} produced non-finite geometry')
+    if output.raw_confidence.size and not np.isfinite(output.raw_confidence).all():
+        failures.append(f'{model} produced non-finite native confidence')
+    if _has_singular_intrinsics(output.intrinsics):
+        failures.append(f'{model} produced singular or non-finite intrinsics')
+    if _has_degenerate_camera(output.camera_c2w):
+        failures.append(f'{model} produced degenerate or non-finite cameras')
+    return failures
 
 def _empty_output(metadata: Mapping[str, Any]) -> AdapterOutput:
     return AdapterOutput(np.empty((0, 3)), np.empty((0, 4, 4)), np.empty((0, 3, 3)), np.empty((0, 2)), np.empty((0,), dtype=np.int64), np.empty((0,)), np.empty((0,), dtype=bool), dict(metadata))
@@ -490,8 +542,9 @@ def collect_mast3r_cache_trace(cache_dir: Path) -> tuple[dict[str, str], ...]:
             rows.append({'relative_path': relative, 'uri': child.as_uri(), 'path': str(child), 'sha256': _file_digest(child), 'format': 'mast3r-sparse-ga-torch-pth'})
     return tuple(rows)
 
-def _write_pairwise_trace(result: Mapping[str, Any], output_dir: Path, prefix: str) -> tuple[str, str] | None:
+def _write_pairwise_trace(result: Mapping[str, Any], output_dir: Path, prefix: str) -> tuple[str, str, list[dict[str, str]]] | None:
     arrays: dict[str, np.ndarray] = {}
+    skipped: list[dict[str, str]] = []
     if 'pairwise_pts3d' in result:
         arrays['pairwise_pts3d'] = _to_numpy(result['pairwise_pts3d'])
     if 'pairwise_conf' in result:
@@ -501,27 +554,42 @@ def _write_pairwise_trace(result: Mapping[str, Any], output_dir: Path, prefix: s
         for key, value in raw.items():
             try:
                 array = _to_numpy(value)
-            except Exception:
+            except Exception as exc:
+                skipped.append({'key': str(key), 'exception_type': type(exc).__name__})
                 continue
-            if array.dtype != object:
-                arrays[f'raw_pairwise_{key}'] = array
+            if array.dtype == object:
+                skipped.append({'key': str(key), 'exception_type': 'ObjectDTypeUnsupported'})
+                continue
+            arrays[f'raw_pairwise_{key}'] = array
     if not arrays:
+        if skipped:
+            return '', '', skipped
         return None
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f'{prefix}_raw_pairwise_trace.npz'
-    np.savez(path, **arrays)
-    return path.as_uri(), _file_digest(path)
+    _write_deterministic_npz(path, arrays)
+    return path.as_uri(), _file_digest(path), skipped
+def _write_deterministic_npz(path: Path, arrays: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(str(path), mode='w', compression=zipfile.ZIP_STORED) as archive:
+        for name in sorted(arrays):
+            buffer = io.BytesIO()
+            np.save(buffer, np.asarray(arrays[name]), allow_pickle=False)
+            info = zipfile.ZipInfo(f'{name}.npy', date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_STORED
+            info.external_attr = 0o600 << 16
+            archive.writestr(info, buffer.getvalue())
+
 
 def _write_output_payloads(output: AdapterOutput, output_dir: Path, prefix: str) -> tuple[Path, Path, Path, Mapping[str, str]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     geometry_path = output_dir / f'{prefix}_geometry.npz'
     confidence_path = output_dir / f'{prefix}_confidence.npz'
     valid_path = output_dir / f'{prefix}_valid_mask.npz'
-    np.savez(geometry_path, points_world=output.points_world, camera_c2w=output.camera_c2w, intrinsics=output.intrinsics, pixel_xy=output.pixel_xy, view_id=output.view_id, metadata=json.dumps(dict(output.metadata), sort_keys=True))
-    np.savez(confidence_path, raw_confidence=output.raw_confidence)
-    np.savez(valid_path, valid_mask=output.valid_mask.astype(bool, copy=False))
+    _write_deterministic_npz(geometry_path, {'camera_c2w': output.camera_c2w, 'intrinsics': output.intrinsics, 'metadata': json.dumps(dict(output.metadata), sort_keys=True), 'pixel_xy': output.pixel_xy, 'points_world': output.points_world, 'view_id': output.view_id})
+    _write_deterministic_npz(confidence_path, {'raw_confidence': output.raw_confidence})
+    _write_deterministic_npz(valid_path, {'valid_mask': output.valid_mask.astype(bool, copy=False)})
     return geometry_path, confidence_path, valid_path, {'geometry_prediction_uri': _file_digest(geometry_path), 'native_confidence_uri': _file_digest(confidence_path), 'valid_mask_uri': _file_digest(valid_path)}
-
 
 def serialize_prediction_output(*, manifest: RunManifest, sample_key: SampleKey, output: AdapterOutput, output_dir: Path, prefix: str, runtime_seconds: float, peak_memory_mb: float, invalid_prediction: bool, write_prediction_json: bool = True) -> PredictionArtifact:
     geometry_path, confidence_path, valid_path, digests = _write_output_payloads(output, output_dir, prefix)
@@ -598,9 +666,13 @@ class VGGTAdapter:
             confidence = _squeeze_model_volume(predictions['depth_conf'], 'VGGT depth_conf').astype(np.float64, copy=False)
             raw_conf = confidence.reshape(-1)
             valid = _valid_output_mask(points, raw_conf)
-            if points.size == 0 or camera_c2w.size == 0:
-                raise AdapterError('VGGT produced empty geometry')
             output = AdapterOutput(points, camera_c2w, intrinsics, pixels, view_id, raw_conf, valid, metadata)
+            failures = _output_validation_failures(self.model_name, output)
+            if failures:
+                invalid = True
+                metadata['failure_type'] = 'AdapterOutputValidationError'
+                metadata['failure_message'] = '; '.join(failures)
+                metadata['validation_failures'] = failures
         except Exception as exc:
             invalid = True
             metadata['failure_type'] = type(exc).__name__
@@ -661,19 +733,33 @@ class MASt3RAdapter:
             points = pts_by_view.reshape(-1, 3)
             raw_conf = conf_by_view.reshape(-1)
             valid = _valid_output_mask(points, raw_conf)
-            if points.size == 0 or camera_c2w.size == 0:
-                raise AdapterError('MASt3R produced empty geometry')
+            output = AdapterOutput(points, camera_c2w, intrinsics, pixels, view_id, raw_conf, valid, metadata)
+            failures = _output_validation_failures(self.model_name, output)
+            if failures:
+                invalid = True
+                metadata['failure_type'] = 'AdapterOutputValidationError'
+                metadata['failure_message'] = '; '.join(failures)
+                metadata['validation_failures'] = failures
             cache_trace = result.get('raw_pairwise_cache_files', ())
             if cache_trace:
                 metadata['raw_pairwise_cache_files'] = list(cache_trace)
-            trace = _write_pairwise_trace(result, self.output_root, prefix)
-            if trace is not None:
-                metadata['raw_pairwise_trace_uri'] = trace[0]
-                metadata['raw_pairwise_trace_sha256'] = trace[1]
-            elif result.get('raw_pairwise') is not None:
-                metadata['raw_pairwise_present'] = True
-                metadata['raw_pairwise_trace_status'] = 'metadata-only-no-numeric-pts3d-conf-exposed'
-            output = AdapterOutput(points, camera_c2w, intrinsics, pixels, view_id, raw_conf, valid, metadata)
+            try:
+                trace = _write_pairwise_trace(result, self.output_root, prefix)
+            except Exception as exc:
+                invalid = True
+                metadata['failure_type'] = 'AdapterPairwiseTraceError'
+                metadata['failure_message'] = f'failed to serialize numeric MASt3R pairwise trace: {type(exc).__name__}: {exc}'
+                metadata['raw_pairwise_trace_status'] = 'numeric-trace-conversion-failed'
+            else:
+                if trace is not None:
+                    if trace[0]:
+                        metadata['raw_pairwise_trace_uri'] = trace[0]
+                        metadata['raw_pairwise_trace_sha256'] = trace[1]
+                    if trace[2]:
+                        metadata['raw_pairwise_skipped'] = trace[2]
+                elif result.get('raw_pairwise') is not None:
+                    metadata['raw_pairwise_present'] = True
+                    metadata['raw_pairwise_trace_status'] = 'metadata-only-no-numeric-pts3d-conf-exposed'
         except Exception as exc:
             invalid = True
             metadata['failure_type'] = type(exc).__name__

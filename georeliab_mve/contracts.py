@@ -543,23 +543,40 @@ def validate_artifact_bundle(
         raise ContractError('camera_c2w must have shape (V, 4, 4)')
     if intrinsics.shape != (camera_c2w.shape[0], 3, 3):
         raise ContractError('intrinsics must have shape (V, 3, 3) matching camera_c2w')
-    for value, name in (
-        (points, 'points_world'),
-        (pixels, 'pixel_xy'),
-        (camera_c2w, 'camera_c2w'),
-        (intrinsics, 'intrinsics'),
-    ):
-        _require_finite_array(value, name)
-    if not np.issubdtype(view_id.dtype, np.integer) or np.any(view_id < 0) or np.any(view_id >= len(camera_c2w)):
-        raise ContractError('view_id must contain valid integer camera indexes')
+    _require_finite_array(pixels, 'pixel_xy')
+    if not np.issubdtype(view_id.dtype, np.integer) or np.any(view_id < 0):
+        raise ContractError('view_id must contain non-negative integer frozen camera IDs')
     raw_confidence = confidence['raw_confidence']
     valid_mask = mask_payload['valid_mask']
     if raw_confidence.shape != (len(points),) or valid_mask.shape != (len(points),):
         raise ContractError('native confidence and valid mask shapes must match points_world')
     if valid_mask.dtype != np.bool_:
         raise ContractError('valid_mask must be boolean')
-    if not np.all(np.isfinite(raw_confidence[valid_mask])):
-        raise ContractError('valid mask marks non-finite raw confidence as valid')
+    if prediction.invalid_prediction:
+        if not np.all(np.isfinite(points[valid_mask])):
+            raise ContractError('valid mask marks non-finite points as valid')
+        if not np.all(np.isfinite(raw_confidence[valid_mask])):
+            raise ContractError('valid mask marks non-finite raw confidence as valid')
+    else:
+        for value, name in (
+            (points, 'points_world'),
+            (camera_c2w, 'camera_c2w'),
+            (intrinsics, 'intrinsics'),
+            (raw_confidence, 'raw_confidence'),
+        ):
+            _require_finite_array(value, name)
+        metadata = {}
+        if 'metadata' in geometry:
+            try:
+                metadata = json.loads(str(geometry['metadata']))
+            except (TypeError, ValueError):
+                metadata = {}
+        frozen_view_ids = metadata.get('view_ids') if isinstance(metadata, Mapping) else None
+        if frozen_view_ids is not None:
+            if len(frozen_view_ids) != len(camera_c2w):
+                raise ContractError('valid predictions require one frozen view_id group per camera row')
+            if not set(np.unique(view_id).tolist()).issubset(set(int(item) for item in frozen_view_ids)):
+                raise ContractError('view_id contains IDs outside frozen metadata view_ids')
     if 'dense_audit_uri' not in audit.metadata:
         raise ContractError('AuditRecord metadata requires dense_audit_uri')
     dense = _load_npz(audit.metadata['dense_audit_uri'], 'dense_audit_uri')
@@ -626,4 +643,3 @@ def validate_artifact_bundle(
     _validate_payload_digest(
         audit.metadata['dense_audit_uri'], dense_digest, 'dense_audit_uri'
     )
-
