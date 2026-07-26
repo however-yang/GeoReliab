@@ -17,6 +17,7 @@ from georeliab_mve.contracts import (
     validate_artifact_bundle,
     write_json_artifact,
 )
+from georeliab_mve.contracts import _file_uri_path
 
 
 SHA256 = 'a' * 64
@@ -145,6 +146,10 @@ def test_v1_0_smoke_manifest_cannot_bypass_provenance():
     )
     with pytest.raises(ContractError, match='v1.0'):
         RunManifest.from_dict(payload)
+
+
+def test_file_uri_preserves_posix_root_path():
+    assert _file_uri_path('file:///tmp/georeliab.npz', 'payload') == '/tmp/georeliab.npz'
 
 
 def _bundle_records(tmp_path, *, digest=''):

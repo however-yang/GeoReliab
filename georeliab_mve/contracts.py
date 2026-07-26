@@ -464,14 +464,18 @@ def validate_artifact_linkage(
         )
 
 
-def _local_payload_path(uri: str, field_name: str) -> Path:
+def _file_uri_path(uri: str, field_name: str) -> str:
     parsed = urlparse(uri)
     if parsed.scheme != 'file' or parsed.netloc not in ('', 'localhost'):
         raise ContractError(f'{field_name} must be a local file URI for validation')
     payload_path = unquote(parsed.path)
     if re.match(r'^/[A-Za-z]:/', payload_path):
         payload_path = payload_path[1:]
-    return Path(payload_path)
+    return payload_path
+
+
+def _local_payload_path(uri: str, field_name: str) -> Path:
+    return Path(_file_uri_path(uri, field_name))
 
 
 def _load_npz(uri: str, field_name: str) -> dict[str, np.ndarray]:
