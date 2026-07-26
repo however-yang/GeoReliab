@@ -404,8 +404,8 @@ class GeoReliabConditionEvidence:
         return self.severity_rhos[-1]
 
     def rho_ramp_monotonic(self) -> bool:
-        magnitudes = (abs(self.clean_rho), *(abs(item) for item in self.severity_rhos))
-        return all(left >= right for left, right in zip(magnitudes, magnitudes[1:]))
+        directional = (self.clean_rho, *self.severity_rhos)
+        return all(left >= right for left, right in zip(directional, directional[1:]))
 
     def verification_passed(self) -> bool:
         return (
@@ -416,10 +416,10 @@ class GeoReliabConditionEvidence:
         )
 
     def confidence_gate_hit(self) -> bool:
-        clean_magnitude = abs(self.clean_rho)
+        clean_rho = self.clean_rho
         relative_decline = (
-            (clean_magnitude - abs(self.severity3_rho)) / clean_magnitude
-            if clean_magnitude >= 0.2
+            (clean_rho - self.severity3_rho) / clean_rho
+            if clean_rho >= 0.2
             else float("-inf")
         )
         relative_supported = (
@@ -572,6 +572,18 @@ def evaluate_georeliab_gate(value: GeoReliabGateInput) -> GateDecision:
         reason_codes.append("TARTANAIR_SANITY_GATE_NOT_MET")
     if not confidence_pass:
         reason_codes.append("CONFIDENCE_FAILURE_GATE_NOT_MET")
+        return GateDecision(
+            lane="georeliab",
+            status=GateStatus.FAIL,
+            reason_codes=tuple(reason_codes),
+            details={
+                "confidence_models": sorted(confidence_models),
+                "verified_condition_count": len(verified_conditions),
+                "tartanair_native_fog_sanity": value.tartanair_native_fog_sanity,
+                "p5_skip_reason": "P4_CONFIDENCE_PHENOMENON_GATE_FAILED",
+            },
+            scientific_validity=value.scientific_validity,
+        )
     if not harm_pass:
         reason_codes.append("DOWNSTREAM_HARM_GATE_NOT_MET")
     if not zero_update_pass:

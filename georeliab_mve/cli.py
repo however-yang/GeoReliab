@@ -37,6 +37,7 @@ from .readiness import assess_readiness
 from .prepare_cli import PREPARE_OPERATIONS, run_prepare_operation
 from .splits import validate_scene_disjoint
 from .statistics import holm_adjust, paired_scene_bootstrap, tost_equivalence
+from .audit import AuditError, load_georeliab_evidence_input, write_dense_audit_bundle
 
 
 DEFAULT_PROTOCOL = Path('configs/dual_mve_protocol.toml')
@@ -315,6 +316,18 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument('--stage', choices=('smoke', 'test'))
     prepare.add_argument('--dry-run', action='store_true')
 
+    audit = subparsers.add_parser('audit-georeliab')
+    audit.add_argument('--input', type=Path)
+    audit.add_argument('--output', type=Path)
+    audit.add_argument('--manifest', type=Path)
+    audit.add_argument('--prediction', type=Path)
+    audit.add_argument('--gt-points', type=Path)
+    audit.add_argument('--gt-cameras', type=Path)
+    audit.add_argument('--obs-mask', type=Path)
+    audit.add_argument('--obs-bb')
+    audit.add_argument('--obs-res', type=float)
+    audit.add_argument('--output-dir', type=Path)
+
     return parser
 
 
@@ -375,7 +388,46 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(json.dumps(payload, indent=2, sort_keys=True))
             return 0
-    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
+        if args.command == 'audit-georeliab':
+            if args.manifest is not None:
+                required = (
+                    args.prediction,
+                    args.gt_points,
+                    args.gt_cameras,
+                    args.obs_mask,
+                    args.obs_bb,
+                    args.obs_res,
+                    args.output_dir,
+                )
+                if any(item is None for item in required):
+                    raise ValueError('bundle audit requires prediction, GT, ObsMask, and output-dir arguments')
+                obs_bb = [float(item) for item in args.obs_bb.split(',')]
+                payload = write_dense_audit_bundle(
+                    manifest_path=args.manifest,
+                    prediction_path=args.prediction,
+                    gt_points_path=args.gt_points,
+                    gt_cameras_path=args.gt_cameras,
+                    obs_mask_path=args.obs_mask,
+                    obs_bb=obs_bb,
+                    obs_res=args.obs_res,
+                    output_dir=args.output_dir,
+                )
+                print(json.dumps(payload, indent=2, sort_keys=True))
+                return 0
+            if args.input is None or args.output is None:
+                raise ValueError('aggregated evidence audit requires --input and --output')
+            evidence = load_georeliab_evidence_input(args.input)
+            gate_input = evidence.to_gate_input()
+            georeliab = evaluate_georeliab_gate(gate_input)
+            payload = {
+                'gate_input': evidence.to_dict(),
+                'georeliab_gate': georeliab.to_dict(),
+                'p5_skip_reason': evidence.p5_skip_reason,
+            }
+            _write_json(args.output, payload)
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+    except (KeyError, TypeError, ValueError, AuditError, OSError, json.JSONDecodeError) as exc:
         print(f'ERROR: {exc}', file=sys.stderr)
         return 2
     raise AssertionError('unreachable command')

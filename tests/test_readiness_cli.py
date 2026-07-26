@@ -244,8 +244,8 @@ def test_cli_returns_success_when_georeliab_is_selected(tmp_path):
         {
             'model': model,
             'corruption': corruption,
-            'clean_rho': -0.8,
-            'severity_rhos': [-0.6, -0.4, -0.2],
+            'clean_rho': 0.8,
+            'severity_rhos': [0.6, 0.4, 0.2],
             'failure_auroc': 0.7,
             'relative_decline_ci_lower': 0.6,
             'corruption_severity_monotonic': True,

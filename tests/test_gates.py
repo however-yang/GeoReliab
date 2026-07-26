@@ -88,8 +88,8 @@ def georeliab_input(**overrides):
         GeoReliabConditionEvidence(
             model=model,
             corruption=corruption,
-            clean_rho=-0.8,
-            severity_rhos=(-0.6, -0.4, -0.2),
+            clean_rho=0.8,
+            severity_rhos=(0.6, 0.4, 0.2),
             failure_auroc=0.70,
             corruption_severity_monotonic=True,
             cross_view_consistent=True,

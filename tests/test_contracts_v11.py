@@ -172,7 +172,7 @@ def _bundle_records(tmp_path, *, digest=''):
         voxel_points=np.ones((2, 3)),
         raw_confidence=np.array([0.2, 0.4]),
         risk=np.array([1.0, 2.0]),
-        gt_error=np.array([0.001, 0.003]),
+        gt_error=np.array([1.0, 3.0]),
         failure_label=np.array([False, True]),
         provenance_count=np.array([1, 1]),
     )
@@ -196,7 +196,7 @@ def _bundle_records(tmp_path, *, digest=''):
     audit = AuditRecord(
         run_id=manifest.run_id,
         sample_key=key,
-        gt_error=0.003,
+        gt_error=3.0,
         failure_label=True,
         selection_score=0.0,
         coverage=1.0,
@@ -217,7 +217,7 @@ def test_bundle_validator_rejects_payload_and_linkage_failures(tmp_path):
     manifest, prediction, audit = _bundle_records(tmp_path)
     mask = prediction.valid_mask_uri.removeprefix('file:///')
     np.savez(mask, valid_mask=np.array([True, False]))
-    with pytest.raises(ContractError, match='filtering drift'):
+    with pytest.raises(ContractError, match='provenance_count exceeds'):
         validate_artifact_bundle(manifest, prediction, audit)
 
     manifest, prediction, audit = _bundle_records(tmp_path, digest=SHA256)

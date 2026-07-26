@@ -575,24 +575,24 @@ def validate_artifact_bundle(
         ),
         'dense_audit_uri',
     )
-    expected_count = int(np.count_nonzero(valid_mask))
     voxel_points = dense['voxel_points']
-    if voxel_points.shape != (expected_count, 3):
-        raise ContractError('invalid-mask/confidence filtering drift in dense voxel points')
+    if voxel_points.ndim != 2 or voxel_points.shape[1] != 3:
+        raise ContractError('dense voxel_points must have shape (N, 3)')
+    voxel_count = len(voxel_points)
     for key in ('raw_confidence', 'risk', 'gt_error', 'provenance_count', 'failure_label'):
-        if dense[key].shape != (expected_count,):
+        if dense[key].shape != (voxel_count,):
             raise ContractError(f'invalid-mask/confidence filtering drift in dense {key}')
     for key in ('voxel_points', 'raw_confidence', 'risk', 'gt_error'):
         _require_finite_array(dense[key], f'dense_audit_uri:{key}')
-    if not np.array_equal(dense['raw_confidence'], raw_confidence[valid_mask]):
-        raise ContractError('invalid-mask/confidence filtering drift in dense raw confidence')
     if dense['failure_label'].dtype != np.bool_:
         raise ContractError('dense failure_label must be boolean')
     if not np.issubdtype(dense['provenance_count'].dtype, np.integer) or np.any(
         dense['provenance_count'] < 1
     ):
         raise ContractError('dense provenance_count must contain positive integers')
-    if not np.array_equal(dense['failure_label'], dense['gt_error'] > 0.002):
+    if int(np.sum(dense['provenance_count'])) > int(np.count_nonzero(valid_mask)):
+        raise ContractError('dense provenance_count exceeds model-valid inputs')
+    if not np.array_equal(dense['failure_label'], dense['gt_error'] > 2.0):
         raise ContractError('dense failure_label must be the 2 mm GT-error label')
     for field_name in (
         'geometry_prediction_uri',
