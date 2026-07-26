@@ -24,7 +24,7 @@ def _overlay(path: Path) -> Path:
         "[runtime]\nroot = '/srv/private/smli/GeoReliab'\n"
         "vggt_source = '/home/smli/vggt'\nmast3r_source = '/home/smli/mast3r'\n"
         "dust3r_source = '/home/smli/mast3r/dust3r'\ncroco_source = '/home/smli/mast3r/dust3r/croco'\n"
-        "vggt_env = '/home/smli/env-vggt'\nmast3r_env = '/home/smli/env-mast3r'\nvggt_python = '3.10.20'\nvggt_torch = '2.3.1+cu121'\nmast3r_python = '3.10.20'\nmast3r_torch = '2.5.1+cu121'\n"
+        "vggt_env = '/home/smli/env-vggt'\nmast3r_env = '/home/smli/env-mast3r'\nvggt_python = '3.10.20'\nvggt_torch = '2.3.1+cu121'\nmast3r_python = '3.10.20'\nmast3r_torch = '2.5.1+cu121'\ntyping_extensions_site = '/home/smli/miniforge3/pkgs/typing_extensions-4.15.0-pyhcf101f3_0/site-packages'\n"
         "[resources]\n"
         "dtu_sampleset_url = 'https://example.test/SampleSet.zip'\n"
         "dtu_sampleset_bytes = 1\ndtu_sampleset_sha256 = '" + "0" * 64 + "'\n"
@@ -43,7 +43,7 @@ def _overlay(path: Path) -> Path:
         "mast3r_config = '/home/smli/config.json'\nmast3r_config_sha256 = '" + "4" * 64 + "'\n"
         "mast3r_source_commit = 'f5209afc300cec36239a7ac992263f36847bbba0'\n"
         "dust3r_source_commit = '3cc8c88c413bb9e34c41db0e0eef99c2ee010b12'\n"
-        "croco_source_commit = 'd7de0705845239092414480bd829228723bf20de'\n"
+        "croco_source_commit = 'd7de0705845239092414480bd829228723bf20de'\ntyping_extensions_version = '4.15.0'\ntyping_extensions_sha256 = '433d11d170d3a24d2eb065ebc1bfe848cea7e3d7ce68567ab52bea2d4c2f7ed8'\n"
         "[execution]\ndevice = 'cuda:0'\n",
         encoding='utf-8',
     )
@@ -156,6 +156,14 @@ def test_overlay_requires_every_frozen_identity(tmp_path):
     overlay.write_text(text, encoding='utf-8')
     with pytest.raises(PreparationError, match='missing required frozen identities'):
         run_prepare_operation(operation='download', data_root=tmp_path / 'data', state_path=tmp_path / 's.json', dry_run=False, overlay_path=overlay)
+
+
+def test_overlay_requires_frozen_typing_extensions_identity(tmp_path):
+    overlay = _overlay(tmp_path / 'overlay.toml')
+    text = overlay.read_text(encoding='utf-8').replace("typing_extensions_sha256 = '433d11d170d3a24d2eb065ebc1bfe848cea7e3d7ce68567ab52bea2d4c2f7ed8'\n", '')
+    overlay.write_text(text, encoding='utf-8')
+    with pytest.raises(PreparationError, match='typing_extensions_sha256'):
+        run_prepare_operation(operation='verify', data_root=tmp_path / 'data', state_path=tmp_path / 's.json', dry_run=False, overlay_path=overlay)
 
 
 def test_non_dry_download_verify_index_and_manifests_have_success_paths(monkeypatch, tmp_path):

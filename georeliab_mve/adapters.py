@@ -19,7 +19,14 @@ from typing import Any, Protocol, runtime_checkable
 import numpy as np
 
 from .contracts import PredictionArtifact, RunManifest, SampleKey, write_json_artifact
-from .materialization import require_git_commit, require_sha256, sha256_file
+from .materialization import (
+    FROZEN_TYPING_EXTENSIONS_SHA256,
+    FROZEN_TYPING_EXTENSIONS_SITE,
+    FROZEN_TYPING_EXTENSIONS_VERSION,
+    require_git_commit,
+    require_sha256,
+    sha256_file,
+)
 
 
 class AdapterError(RuntimeError):
@@ -75,10 +82,18 @@ class FrozenRuntime:
     dust3r_source_commit: str | None = None
     croco_source: Path | None = None
     croco_source_commit: str | None = None
+    typing_extensions_site: Path = FROZEN_TYPING_EXTENSIONS_SITE
+    typing_extensions_sha256: str = FROZEN_TYPING_EXTENSIONS_SHA256
+    typing_extensions_version: str = FROZEN_TYPING_EXTENSIONS_VERSION
 
     def __post_init__(self) -> None:
         require_git_commit(self.source_commit, 'source commit')
         require_sha256(self.checkpoint_sha256, 'checkpoint digest')
+        require_sha256(self.typing_extensions_sha256, 'typing_extensions.py digest')
+        if self.typing_extensions_version != FROZEN_TYPING_EXTENSIONS_VERSION:
+            raise AdapterError(
+                f'typing_extensions version mismatch: {self.typing_extensions_version} != {FROZEN_TYPING_EXTENSIONS_VERSION}'
+            )
         if self.config is not None:
             if self.config_sha256 is None:
                 raise AdapterError('config_sha256 is required when config is set')
@@ -151,7 +166,7 @@ class AdapterOutput:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
-EnvProbe = Callable[[Path], tuple[str, str]]
+EnvProbe = Callable[[Path, Path, str], tuple[str, str, str, str]]
 GitProbe = Callable[[Path], str]
 
 
@@ -178,17 +193,36 @@ def _env_python(env_path: Path) -> Path:
     raise AdapterError(f'frozen environment has no Python executable: {env_path}')
 
 
-def _probe_python_torch(env_path: Path) -> tuple[str, str]:
+def _probe_python_torch(env_path: Path, typing_site: Path, typing_sha256: str) -> tuple[str, str, str, str]:
     env = dict(os.environ)
     env['PYTHONDONTWRITEBYTECODE'] = '1'
+    env['PYTHONNOUSERSITE'] = '1'
+    code = (
+        'import hashlib, platform, sys\n'
+        'from pathlib import Path\n'
+        'site = Path(sys.argv[1])\n'
+        'expected_sha = sys.argv[2]\n'
+        'sys.path.insert(0, str(site))\n'
+        'import typing_extensions\n'
+        'from importlib import metadata\n'
+        'actual_file = Path(typing_extensions.__file__).resolve()\n'
+        'expected_file = (site / "typing_extensions.py").resolve()\n'
+        'assert actual_file == expected_file, f"typing_extensions import escaped frozen site: {actual_file}"\n'
+        'assert hashlib.sha256(actual_file.read_bytes()).hexdigest() == expected_sha\n'
+        'import torch\n'
+        'print(platform.python_version())\n'
+        'print(torch.__version__)\n'
+        'print(metadata.version("typing_extensions"))\n'
+        'print(str(actual_file))\n'
+    )
     try:
-        result = subprocess.run([str(_env_python(env_path)), '-I', '-B', '-c', 'import platform, torch; print(platform.python_version()); print(torch.__version__)'], check=True, capture_output=True, text=True, timeout=60, env=env)
+        result = subprocess.run([str(_env_python(env_path)), '-I', '-B', '-c', code, str(typing_site), typing_sha256], check=True, capture_output=True, text=True, timeout=60, env=env)
     except (OSError, subprocess.SubprocessError) as exc:
-        raise AdapterError(f'cannot verify Python/Torch versions in {env_path}') from exc
+        raise AdapterError(f'cannot verify Python/Torch/typing_extensions versions in {env_path}') from exc
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if len(lines) != 2:
+    if len(lines) != 4:
         raise AdapterError(f'frozen environment emitted invalid version evidence: {env_path}')
-    return lines[0], lines[1]
+    return lines[0], lines[1], lines[2], lines[3]
 
 
 def verify_frozen_runtime(model: str, runtime: FrozenRuntime, *, git_probe: GitProbe = _git_head, env_probe: EnvProbe = _probe_python_torch) -> AdapterPreflight:
@@ -207,9 +241,23 @@ def verify_frozen_runtime(model: str, runtime: FrozenRuntime, *, git_probe: GitP
         actual_config = sha256_file(runtime.config)
         if actual_config != runtime.config_sha256:
             raise AdapterError(f'{model} config SHA-256 mismatch: {actual_config} != {runtime.config_sha256}')
-    python, torch = env_probe(runtime.environment)
+    typing_path = runtime.typing_extensions_site / 'typing_extensions.py'
+    if not typing_path.is_file():
+        raise AdapterError(f'{model} frozen typing_extensions.py is missing: {typing_path}')
+    actual_typing_sha = sha256_file(typing_path)
+    if actual_typing_sha != runtime.typing_extensions_sha256:
+        raise AdapterError(
+            f'{model} typing_extensions.py SHA-256 mismatch: {actual_typing_sha} != {runtime.typing_extensions_sha256}'
+        )
+    python, torch, typing_version, typing_file = env_probe(
+        runtime.environment, runtime.typing_extensions_site, runtime.typing_extensions_sha256
+    )
     if python != runtime.python_version or torch != runtime.torch_version:
         raise AdapterError(f'{model} environment mismatch: Python {python}/Torch {torch} != Python {runtime.python_version}/Torch {runtime.torch_version}')
+    if typing_version != runtime.typing_extensions_version:
+        raise AdapterError(
+            f'{model} typing_extensions mismatch: {typing_version} != {runtime.typing_extensions_version}'
+        )
     dust3r_commit = None
     croco_commit = None
     if model == 'MASt3R' and (runtime.dust3r_source is None or runtime.dust3r_source_commit is None or runtime.croco_source is None or runtime.croco_source_commit is None):
@@ -222,7 +270,15 @@ def verify_frozen_runtime(model: str, runtime: FrozenRuntime, *, git_probe: GitP
         croco_commit = git_probe(runtime.croco_source).lower()
         if croco_commit != runtime.croco_source_commit:
             raise AdapterError('MASt3R CroCo source commit mismatch')
-    return AdapterPreflight(model, actual_source, actual_checkpoint, {'path': str(runtime.environment), 'python': python, 'torch': torch}, actual_config, dust3r_commit, croco_commit)
+    return AdapterPreflight(model, actual_source, actual_checkpoint, {
+        'path': str(runtime.environment),
+        'python': python,
+        'torch': torch,
+        'typing_extensions_site': str(runtime.typing_extensions_site),
+        'typing_extensions_file': typing_file,
+        'typing_extensions_version': typing_version,
+        'typing_extensions_sha256': runtime.typing_extensions_sha256,
+    }, actual_config, dust3r_commit, croco_commit)
 
 
 def _stable_digest(value: Any) -> str:

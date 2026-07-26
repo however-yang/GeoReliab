@@ -43,6 +43,13 @@ def _runtime(tmp_path: Path, *, mast3r: bool = False) -> FrozenRuntime:
     cfg = tmp_path / 'config.json'
     if mast3r:
         cfg.write_text('{}', encoding='utf-8')
+    typing_site = tmp_path / 'typing-site'
+    typing_site.mkdir(exist_ok=True)
+    typing_file = typing_site / 'typing_extensions.py'
+    typing_file.write_text('# no module __version__ on the frozen source\n', encoding='utf-8')
+    dist = typing_site / 'typing_extensions-4.15.0.dist-info'
+    dist.mkdir(exist_ok=True)
+    (dist / 'METADATA').write_text('Name: typing_extensions\nVersion: 4.15.0\n', encoding='utf-8')
     return FrozenRuntime(
         source=tmp_path / ('mast3r' if mast3r else 'vggt'),
         source_commit='1' * 40,
@@ -57,6 +64,9 @@ def _runtime(tmp_path: Path, *, mast3r: bool = False) -> FrozenRuntime:
         dust3r_source_commit='2' * 40 if mast3r else None,
         croco_source=tmp_path / 'croco' if mast3r else None,
         croco_source_commit='3' * 40 if mast3r else None,
+        typing_extensions_site=typing_site,
+        typing_extensions_sha256=_sha(typing_file),
+        typing_extensions_version='4.15.0',
     )
 
 
@@ -107,8 +117,8 @@ def _git(path: Path) -> str:
     return '1' * 40
 
 
-def _env(path: Path) -> tuple[str, str]:
-    return '3.10.20', '2.5.1+cu121' if 'mast3r' in str(path).lower() else '2.3.1+cu121'
+def _env(path: Path, typing_site: Path, typing_sha: str) -> tuple[str, str, str, str]:
+    return '3.10.20', '2.5.1+cu121' if 'mast3r' in str(path).lower() else '2.3.1+cu121', '4.15.0', str(typing_site / 'typing_extensions.py')
 
 
 def test_lazy_import_reports_missing_upstream_without_importing_at_module_import(tmp_path):
@@ -128,6 +138,32 @@ def test_frozen_runtime_verifies_commit_checkpoint_config_environment(tmp_path):
     bad = replace(runtime, source_commit='9' * 40)
     with pytest.raises(AdapterError, match='source commit mismatch'):
         verify_frozen_runtime('MASt3R', bad, git_probe=_git, env_probe=_env)
+
+
+def test_frozen_runtime_probe_carries_typing_extensions_identity(tmp_path):
+    runtime = _runtime(tmp_path)
+    seen = {}
+
+    def probe(env_path: Path, typing_site: Path, typing_sha: str) -> tuple[str, str, str, str]:
+        seen['typing_site'] = typing_site
+        seen['typing_sha'] = typing_sha
+        return '3.10.20', '2.3.1+cu121', '4.15.0', str(typing_site / 'typing_extensions.py')
+
+    evidence = verify_frozen_runtime('VGGT', runtime, git_probe=_git, env_probe=probe)
+    assert seen == {'typing_site': runtime.typing_extensions_site, 'typing_sha': runtime.typing_extensions_sha256}
+    assert evidence.environment['typing_extensions_version'] == '4.15.0'
+    assert evidence.environment['typing_extensions_sha256'] == runtime.typing_extensions_sha256
+
+
+def test_frozen_runtime_rejects_typing_extensions_hash_mismatch_before_probe(tmp_path):
+    runtime = _runtime(tmp_path)
+
+    def forbidden_probe(*_args):
+        raise AssertionError('env probe should not run after dependency hash mismatch')
+
+    bad = replace(runtime, typing_extensions_sha256='0' * 64)
+    with pytest.raises(AdapterError, match='typing_extensions.py SHA-256 mismatch'):
+        verify_frozen_runtime('VGGT', bad, git_probe=_git, env_probe=forbidden_probe)
 
 
 def test_rendered_png_digest_is_ordered_and_verifies_exact_bytes(tmp_path):

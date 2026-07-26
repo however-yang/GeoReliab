@@ -29,6 +29,7 @@ vggt_python = '3.10.20'
 vggt_torch = '2.3.1+cu121'
 mast3r_python = '3.10.20'
 mast3r_torch = '2.5.1+cu121'
+typing_extensions_site = '/home/smli/miniforge3/pkgs/typing_extensions-4.15.0-pyhcf101f3_0/site-packages'
 
 [resources]
 dtu_sampleset_url = 'https://roboimagedata2.compute.dtu.dk/data/MVS/SampleSet.zip'
@@ -52,6 +53,8 @@ mast3r_config_sha256 = '718eb93dc4f9e4332b60cc0041af962d712cbd346d7770ce35c5b22c
 mast3r_source_commit = 'f5209afc300cec36239a7ac992263f36847bbba0'
 dust3r_source_commit = '3cc8c88c413bb9e34c41db0e0eef99c2ee010b12'
 croco_source_commit = 'd7de0705845239092414480bd829228723bf20de'
+typing_extensions_version = '4.15.0'
+typing_extensions_sha256 = '433d11d170d3a24d2eb065ebc1bfe848cea7e3d7ce68567ab52bea2d4c2f7ed8'
 
 tartanair_image_url = 'https://huggingface.co/datasets/theairlabcmu/tartanair2/resolve/0d2d145e973832742a2aaa04b7d2ebffc8d82817/GreatMarsh/Data_easy/image_lcam_front.zip'
 tartanair_image_bytes = 35240547705

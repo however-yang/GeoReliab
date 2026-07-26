@@ -14,13 +14,51 @@ python_bin() {
   else die 'python3 or python is required'; fi
 }
 
+shell_toml_value() {
+  local overlay=$1 section_key=$2 section key
+  section=${section_key%%.*}
+  key=${section_key#*.}
+  awk -v section="$section" -v key="$key" '
+    $0 ~ "^[[:space:]]*\\[" section "\\][[:space:]]*$" { in_section=1; next }
+    $0 ~ "^[[:space:]]*\\[" { in_section=0 }
+    in_section && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      value=$0
+      sub("^[^=]*=[[:space:]]*", "", value)
+      sub(/[[:space:]]*(#.*)?$/, "", value)
+      gsub(/^'\''|'\''$/, "", value)
+      gsub(/^\"|\"$/, "", value)
+      print value
+      exit
+    }
+  ' "$overlay"
+}
+
+validate_typing_extensions_runtime() {
+  local overlay=$1 typing_site typing_file expected_sha expected_version actual_sha
+  typing_site=$(shell_toml_value "$overlay" runtime.typing_extensions_site)
+  expected_sha=$(shell_toml_value "$overlay" resources.typing_extensions_sha256)
+  expected_version=$(shell_toml_value "$overlay" resources.typing_extensions_version)
+  [ -n "$typing_site" ] || die 'runtime.typing_extensions_site is required'
+  [ -n "$expected_sha" ] || die 'resources.typing_extensions_sha256 is required'
+  [ "$expected_version" = '4.15.0' ] || die "typing_extensions frozen version mismatch: $expected_version"
+  typing_site=$(CDPATH= cd -- "$typing_site" 2>/dev/null && pwd -P) || die "cannot resolve typing_extensions site: $typing_site"
+  case "$typing_site" in /home/smli/*) ;; *) die "typing_extensions site must remain under /home/smli: $typing_site" ;; esac
+  case "$typing_site" in /home/smli/.local|/home/smli/.local/*) die "typing_extensions site must not expose /home/smli/.local: $typing_site" ;; esac
+  typing_file="$typing_site/typing_extensions.py"
+  [ -r "$typing_file" ] || die "missing frozen typing_extensions.py: $typing_file"
+  actual_sha=$(sha256sum "$typing_file" | awk '{print $1}')
+  [ "$actual_sha" = "$expected_sha" ] || die "typing_extensions.py sha256 mismatch: $actual_sha != $expected_sha"
+  printf '%s\n' "$typing_site"
+}
+
 overlay_value() {
-  local overlay=$1 dotted=$2
-  PYTHONPATH="$GEORELIAB_PROJECT_ROOT/georeliab_mve${PYTHONPATH:+:$PYTHONPATH}" \
+  local overlay=$1 dotted=$2 typing_site
+  typing_site=$(validate_typing_extensions_runtime "$overlay")
+  PYTHONNOUSERSITE=1 PYTHONPATH="$typing_site:$GEORELIAB_PROJECT_ROOT" \
     "$(python_bin)" - "$overlay" "$dotted" <<'PY'
 import sys
 from pathlib import Path
-import toml_compat as tomllib
+from georeliab_mve import toml_compat as tomllib
 payload = tomllib.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
 value = payload
 for part in sys.argv[2].split('.'):
@@ -34,7 +72,7 @@ else:
 PY
 }
 
-runtime_root() { overlay_value "$1" runtime.root; }
+runtime_root() { shell_toml_value "$1" runtime.root; }
 
 orchestrator_python() {
   local overlay=$1 env_root candidate
@@ -63,7 +101,8 @@ mkdir_under_root() {
 }
 
 export_runtime_cache_env() {
-  local overlay=$1 root cache
+  local overlay=$1 root cache typing_site
+  typing_site=$(validate_typing_extensions_runtime "$overlay")
   root=$(runtime_root "$overlay")
   cache=$(overlay_value "$overlay" runtime.cache)
   mkdir_under_root "$root" "$cache/tmp" "$cache/xdg" "$cache/hf" "$cache/hf/hub" "$cache/transformers" "$cache/torch" "$cache/torch_extensions" "$cache/cuda" "$cache/mpl" "$cache/pycache" "$cache/triton" "$cache/inductor" "$cache/cupy" "$cache/home"
@@ -83,6 +122,8 @@ export_runtime_cache_env() {
   export CUPY_CACHE_DIR="$cache/cupy"
   export MPLCONFIGDIR="$cache/mpl"
   export PYTHONPYCACHEPREFIX="$cache/pycache"
+  export PYTHONNOUSERSITE=1
+  export PYTHONPATH="$typing_site:$GEORELIAB_PROJECT_ROOT"
   export GEORELIAB_NO_HOME_WRITE=1
 }
 

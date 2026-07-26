@@ -41,6 +41,9 @@ _TARTAN_DEPTH_RE = re.compile(
     r"^GreatMarsh/Data_easy/P000/depth_lcam_front/"
     r"(?P<frame>[0-9]{6})_lcam_front_depth\.png$"
 )
+FROZEN_TYPING_EXTENSIONS_SITE = Path("/home/smli/miniforge3/pkgs/typing_extensions-4.15.0-pyhcf101f3_0/site-packages")
+FROZEN_TYPING_EXTENSIONS_VERSION = "4.15.0"
+FROZEN_TYPING_EXTENSIONS_SHA256 = "433d11d170d3a24d2eb065ebc1bfe848cea7e3d7ce68567ab52bea2d4c2f7ed8"
 
 
 def sha256_file(path: Path) -> str:
@@ -75,6 +78,45 @@ def require_git_commit(value: object, label: str) -> str:
     ):
         raise PreparationError(f"{label} must be a 40-character Git commit")
     return value.lower()
+
+
+def verify_typing_extensions_dependency(
+    *,
+    site: Path,
+    expected_sha256: str,
+    expected_version: str,
+    enforce_home_prefix: bool = True,
+) -> dict[str, Any]:
+    """Verify the frozen typing_extensions module used by isolated probes."""
+
+    if enforce_home_prefix:
+        try:
+            normalized = site.resolve().as_posix().rstrip("/")
+        except OSError as exc:
+            raise PreparationError(f"cannot resolve typing_extensions site: {site}") from exc
+        if not normalized.startswith("/home/smli/") or normalized == "/home/smli/.local" or normalized.startswith("/home/smli/.local/"):
+            raise PreparationError(
+                f"typing_extensions site must be the frozen /home/smli package cache: {site}"
+            )
+    expected_sha = require_sha256(expected_sha256, "typing_extensions.py digest")
+    if expected_version != FROZEN_TYPING_EXTENSIONS_VERSION:
+        raise PreparationError(
+            f"typing_extensions version mismatch: {expected_version} != {FROZEN_TYPING_EXTENSIONS_VERSION}"
+        )
+    path = site / "typing_extensions.py"
+    if not path.is_file():
+        raise PreparationError(f"frozen typing_extensions.py is missing: {path}")
+    actual_sha = sha256_file(path)
+    if actual_sha != expected_sha:
+        raise PreparationError(
+            f"typing_extensions.py SHA-256 mismatch: {actual_sha} != {expected_sha}"
+        )
+    return {
+        "site": str(site),
+        "path": str(path),
+        "version": expected_version,
+        "sha256": actual_sha,
+    }
 
 
 def validate_rectified_index(index: RemoteZipIndex) -> dict[int, tuple[str, ...]]:
@@ -414,6 +456,8 @@ def materialize_frozen_selection(
     resources: Mapping[str, Any],
     split_manifest_path: Path,
     dtu_inventory_provenance_path: Path,
+    typing_extensions_site: Path = FROZEN_TYPING_EXTENSIONS_SITE,
+    enforce_typing_extensions_home: bool = True,
 ) -> dict[str, Any]:
     """Materialize only the 45x8 DTU views and 100 aligned TartanAir pairs."""
 
@@ -437,6 +481,13 @@ def materialize_frozen_selection(
         )
     if len(expected_scenes) != 45:
         raise PreparationError("split/view manifest must contain exactly 45 scenes")
+
+    typing_dependency = verify_typing_extensions_dependency(
+        site=typing_extensions_site,
+        expected_sha256=str(resources.get("typing_extensions_sha256", FROZEN_TYPING_EXTENSIONS_SHA256)),
+        expected_version=str(resources.get("typing_extensions_version", FROZEN_TYPING_EXTENSIONS_VERSION)),
+        enforce_home_prefix=enforce_typing_extensions_home,
+    )
 
     _, indexes = validate_remote_indexes(resources)
     rectified = indexes["Rectified.zip"]
@@ -593,6 +644,7 @@ def materialize_frozen_selection(
         "dtu_inventory_provenance_sha256": sha256_file(
             dtu_inventory_provenance_path
         ),
+        "dependencies": {"typing_extensions": typing_dependency},
         "archives": {
             "Rectified.zip": _remote_archive_evidence(
                 "Rectified.zip",
@@ -683,7 +735,7 @@ def verify_materialized_member(
 
 
 def verify_materialization_manifest(
-    path: Path, *, split_manifest_path: Path
+    path: Path, *, split_manifest_path: Path, enforce_typing_extensions_home: bool = True
 ) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -725,6 +777,13 @@ def verify_materialization_manifest(
         raise PreparationError("canonical split/view manifest schema mismatch")
     materialized_root = path.parent.parent / "materialized"
     try:
+        dependency = payload["dependencies"]["typing_extensions"]
+        verify_typing_extensions_dependency(
+            site=Path(str(dependency["site"])),
+            expected_sha256=str(dependency["sha256"]),
+            expected_version=str(dependency["version"]),
+            enforce_home_prefix=enforce_typing_extensions_home,
+        )
         tartan = payload["tartanair"]
         source_commit = require_git_commit(
             tartan["source_commit"], "TartanAir source commit"
@@ -732,7 +791,7 @@ def verify_materialization_manifest(
         image_url = str(payload["archives"]["tartanair-image"]["url"])
         depth_url = str(payload["archives"]["tartanair-depth"]["url"])
     except (KeyError, TypeError) as exc:
-        raise PreparationError("TartanAir source provenance is incomplete") from exc
+        raise PreparationError("TartanAir source or dependency provenance is incomplete") from exc
     if any(f"/resolve/{source_commit}/" not in url for url in (image_url, depth_url)):
         raise PreparationError(
             "TartanAir archive URLs are not bound to the frozen source commit"
@@ -833,7 +892,8 @@ def _env_python(env_path: Path) -> Path:
 
 
 def _python_torch_versions(
-    env_path: Path, *, cache_root: Path
+    env_path: Path, *, cache_root: Path, typing_site: Path = FROZEN_TYPING_EXTENSIONS_SITE,
+    typing_sha256: str = FROZEN_TYPING_EXTENSIONS_SHA256,
 ) -> tuple[str, str]:
     python = _env_python(env_path)
     cache_root.mkdir(parents=True, exist_ok=True)
@@ -853,7 +913,22 @@ def _python_torch_versions(
                 "-I",
                 "-B",
                 "-c",
-                "import platform,torch; print(platform.python_version()); print(torch.__version__)",
+                (
+                    "import hashlib, platform, sys\n"
+                    "from pathlib import Path\n"
+                    "site=Path(sys.argv[1])\n"
+                    "expected_sha=sys.argv[2]\n"
+                    "sys.path.insert(0, str(site))\n"
+                    "import typing_extensions\n"
+                    "actual=Path(typing_extensions.__file__).resolve()\n"
+                    "assert actual == (site / 'typing_extensions.py').resolve()\n"
+                    "assert hashlib.sha256(actual.read_bytes()).hexdigest() == expected_sha\n"
+                    "import torch\n"
+                    "print(platform.python_version())\n"
+                    "print(torch.__version__)"
+                ),
+                str(typing_site),
+                typing_sha256,
             ],
             check=True,
             capture_output=True,
@@ -878,6 +953,7 @@ def verify_frozen_overlay_identities(
     runtime: Mapping[str, Any],
     resources: Mapping[str, Any],
     cache_root: Path,
+    enforce_typing_extensions_home: bool = True,
 ) -> dict[str, Any]:
     """Read and verify all source/checkpoint/environment identities."""
 
@@ -915,11 +991,22 @@ def verify_frozen_overlay_identities(
             )
         files[path_key] = {"path": str(path), "sha256": actual}
 
+    dependencies = {
+        "typing_extensions": verify_typing_extensions_dependency(
+            site=Path(str(runtime.get("typing_extensions_site", FROZEN_TYPING_EXTENSIONS_SITE))),
+            expected_sha256=str(resources.get("typing_extensions_sha256", FROZEN_TYPING_EXTENSIONS_SHA256)),
+            expected_version=str(resources.get("typing_extensions_version", FROZEN_TYPING_EXTENSIONS_VERSION)),
+            enforce_home_prefix=enforce_typing_extensions_home,
+        )
+    }
     environments: dict[str, Any] = {}
     for name in ("vggt", "mast3r"):
         env_path = Path(str(runtime[f"{name}_env"]))
         python, torch = _python_torch_versions(
-            env_path, cache_root=cache_root / name
+            env_path,
+            cache_root=cache_root / name,
+            typing_site=Path(str(runtime.get("typing_extensions_site", FROZEN_TYPING_EXTENSIONS_SITE))),
+            typing_sha256=str(resources.get("typing_extensions_sha256", FROZEN_TYPING_EXTENSIONS_SHA256)),
         )
         expected_python = str(runtime[f"{name}_python"])
         expected_torch = str(runtime[f"{name}_torch"])
@@ -938,5 +1025,6 @@ def verify_frozen_overlay_identities(
         "sources": sources,
         "files": files,
         "environments": environments,
+        "dependencies": dependencies,
         "verification_python": sys.version.split()[0],
     }

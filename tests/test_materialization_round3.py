@@ -172,7 +172,14 @@ def test_frozen_identity_verifier_checks_every_source_file_and_environment(monke
         env.mkdir()
         runtime[f'{name}_env'] = str(env)
         runtime[f'{name}_python'], runtime[f'{name}_torch'] = versions
+    typing_site = tmp_path / 'typing-site'
+    typing_site.mkdir()
+    typing_file = typing_site / 'typing_extensions.py'
+    typing_file.write_text('__version__ = "4.15.0"\n', encoding='utf-8')
+    runtime['typing_extensions_site'] = str(typing_site)
     resources = {f'{name}_source_commit': commit for name, commit in commits.items()}
+    resources['typing_extensions_version'] = '4.15.0'
+    resources['typing_extensions_sha256'] = hashlib.sha256(typing_file.read_bytes()).hexdigest()
     for name in ('vggt_checkpoint', 'mast3r_checkpoint', 'mast3r_config'):
         path = tmp_path / name
         path.write_bytes(name.encode())
@@ -182,17 +189,36 @@ def test_frozen_identity_verifier_checks_every_source_file_and_environment(monke
     monkeypatch.setattr(materialization, '_git_head', lambda path: by_path[str(path)])
     monkeypatch.setattr(
         materialization, '_python_torch_versions',
-        lambda path, cache_root: ('3.10.20', '2.3.1+cu121') if path.name == 'env-vggt' else ('3.10.20', '2.5.1+cu121'),
+        lambda path, cache_root, **_kwargs: ('3.10.20', '2.3.1+cu121') if path.name == 'env-vggt' else ('3.10.20', '2.5.1+cu121'),
     )
     evidence = verify_frozen_overlay_identities(
         runtime=runtime, resources=resources, cache_root=tmp_path / 'cache',
+        enforce_typing_extensions_home=False,
     )
     assert set(evidence['sources']) == set(commits)
     assert set(evidence['files']) == {'vggt_checkpoint', 'mast3r_checkpoint', 'mast3r_config'}
+    assert evidence['dependencies']['typing_extensions']['path'] == str(typing_file)
+    assert evidence['dependencies']['typing_extensions']['version'] == '4.15.0'
     resources['mast3r_config_sha256'] = '0' * 64
     with pytest.raises(PreparationError, match='mast3r_config SHA-256 mismatch'):
         verify_frozen_overlay_identities(
             runtime=runtime, resources=resources, cache_root=tmp_path / 'cache',
+            enforce_typing_extensions_home=False,
+        )
+
+
+def test_frozen_identity_verifier_fails_closed_on_typing_extensions_hash_mismatch(tmp_path):
+    from georeliab_mve.materialization import verify_typing_extensions_dependency
+
+    site = tmp_path / 'typing-site-bad'
+    site.mkdir()
+    (site / 'typing_extensions.py').write_text('__version__ = "4.15.0"\n', encoding='utf-8')
+    with pytest.raises(PreparationError, match='typing_extensions.py SHA-256 mismatch'):
+        verify_typing_extensions_dependency(
+            site=site,
+            expected_sha256='0' * 64,
+            expected_version='4.15.0',
+            enforce_home_prefix=False,
         )
 
 
@@ -232,7 +258,13 @@ def test_full_materialization_and_v2_provenance_contracts_fail_closed(monkeypatc
     split.write(split_path)
     provenance_path = tmp_path / 'manifests' / 'dtu_inventory_provenance.json'
     provenance_path.write_text(json.dumps(provenance), encoding='utf-8')
+    typing_site = tmp_path / 'typing-site-materialize'
+    typing_site.mkdir()
+    typing_file = typing_site / 'typing_extensions.py'
+    typing_file.write_text('__version__ = "4.15.0"\n', encoding='utf-8')
     resources = {
+        'typing_extensions_version': '4.15.0',
+        'typing_extensions_sha256': hashlib.sha256(typing_file.read_bytes()).hexdigest(),
         'dtu_rectified_url': 'https://fixture/rectified.zip',
         'tartanair_image_url': image_url,
         'tartanair_depth_url': depth_url,
@@ -245,13 +277,18 @@ def test_full_materialization_and_v2_provenance_contracts_fail_closed(monkeypatc
     result = materialize_frozen_selection(
         root=tmp_path, resources=resources, split_manifest_path=split_path,
         dtu_inventory_provenance_path=provenance_path,
+        typing_extensions_site=typing_site,
+        enforce_typing_extensions_home=False,
     )
     materialization_path = Path(result['materialization_path'])
     frozen = verify_materialization_manifest(
         materialization_path, split_manifest_path=split_path,
+        enforce_typing_extensions_home=False,
     )
     assert result['dtu_rgb_count'] == 360
     assert result['tartanair_pair_count'] == 100
+    assert frozen['dependencies']['typing_extensions']['path'] == str(typing_file)
+    assert frozen['dependencies']['typing_extensions']['sha256'] == resources['typing_extensions_sha256']
 
     original_materialization = materialization_path.read_text(encoding='utf-8')
     camera_swap = json.loads(original_materialization)
@@ -265,6 +302,7 @@ def test_full_materialization_and_v2_provenance_contracts_fail_closed(monkeypatc
     with pytest.raises(PreparationError, match='not exact pos_'):
         verify_materialization_manifest(
             materialization_path, split_manifest_path=split_path,
+            enforce_typing_extensions_home=False,
         )
     materialization_path.write_text(original_materialization, encoding='utf-8')
 

@@ -35,16 +35,46 @@ assert_git_commit_clean "$(overlay_value "$overlay" runtime.croco_source)" "$(ov
 sha256_check "$(overlay_value "$overlay" resources.vggt_checkpoint)" "$(overlay_value "$overlay" resources.vggt_checkpoint_sha256)"
 sha256_check "$(overlay_value "$overlay" resources.mast3r_checkpoint)" "$(overlay_value "$overlay" resources.mast3r_checkpoint_sha256)"
 sha256_check "$(overlay_value "$overlay" resources.mast3r_config)" "$(overlay_value "$overlay" resources.mast3r_config_sha256)"
+typing_site=$(overlay_value "$overlay" runtime.typing_extensions_site)
+typing_version=$(overlay_value "$overlay" resources.typing_extensions_version)
+typing_sha=$(overlay_value "$overlay" resources.typing_extensions_sha256)
+sha256_check "$typing_site/typing_extensions.py" "$typing_sha"
 
-"$(overlay_value "$overlay" runtime.vggt_env)/bin/python" - <<PY
-import platform, torch
-assert platform.python_version() == "$(overlay_value "$overlay" runtime.vggt_python)"
-assert torch.__version__ == "$(overlay_value "$overlay" runtime.vggt_torch)"
+"$(overlay_value "$overlay" runtime.vggt_env)/bin/python" -I -B - "$typing_site" "$typing_sha" "$typing_version" "$(overlay_value "$overlay" runtime.vggt_python)" "$(overlay_value "$overlay" runtime.vggt_torch)" <<'PY'
+import hashlib, platform, sys
+from pathlib import Path
+site = Path(sys.argv[1])
+expected_sha, expected_version = sys.argv[2], sys.argv[3]
+expected_python, expected_torch = sys.argv[4], sys.argv[5]
+sys.path.insert(0, str(site))
+import typing_extensions
+from importlib import metadata
+actual_file = Path(typing_extensions.__file__).resolve()
+expected_file = (site / "typing_extensions.py").resolve()
+assert actual_file == expected_file, f"typing_extensions import escaped frozen site: {actual_file}"
+assert hashlib.sha256(actual_file.read_bytes()).hexdigest() == expected_sha
+assert metadata.version("typing_extensions") == expected_version
+import torch
+assert platform.python_version() == expected_python
+assert torch.__version__ == expected_torch
 PY
-"$(overlay_value "$overlay" runtime.mast3r_env)/bin/python" - <<PY
-import platform, torch
-assert platform.python_version() == "$(overlay_value "$overlay" runtime.mast3r_python)"
-assert torch.__version__ == "$(overlay_value "$overlay" runtime.mast3r_torch)"
+"$(overlay_value "$overlay" runtime.mast3r_env)/bin/python" -I -B - "$typing_site" "$typing_sha" "$typing_version" "$(overlay_value "$overlay" runtime.mast3r_python)" "$(overlay_value "$overlay" runtime.mast3r_torch)" <<'PY'
+import hashlib, platform, sys
+from pathlib import Path
+site = Path(sys.argv[1])
+expected_sha, expected_version = sys.argv[2], sys.argv[3]
+expected_python, expected_torch = sys.argv[4], sys.argv[5]
+sys.path.insert(0, str(site))
+import typing_extensions
+from importlib import metadata
+actual_file = Path(typing_extensions.__file__).resolve()
+expected_file = (site / "typing_extensions.py").resolve()
+assert actual_file == expected_file, f"typing_extensions import escaped frozen site: {actual_file}"
+assert hashlib.sha256(actual_file.read_bytes()).hexdigest() == expected_sha
+assert metadata.version("typing_extensions") == expected_version
+import torch
+assert platform.python_version() == expected_python
+assert torch.__version__ == expected_torch
 PY
 
 gpu_count=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | awk '{print $1}')
@@ -73,6 +103,14 @@ out = {
     'gpu_query': run(['nvidia-smi', '--query-gpu=index,name,driver_version,memory.total', '--format=csv,noheader']),
     'no_home_write': True,
     'tmpdir': str(Path(payload['runtime']['cache']) / 'tmp'),
+    'dependencies': {
+        'typing_extensions': {
+            'site': payload['runtime']['typing_extensions_site'],
+            'version': payload['resources']['typing_extensions_version'],
+            'typing_extensions_file_path': str(Path(payload['runtime']['typing_extensions_site']) / 'typing_extensions.py'),
+            'typing_extensions_file_sha256': payload['resources']['typing_extensions_sha256'],
+        }
+    },
     'runtime': payload['runtime'],
     'resources': payload['resources'],
     'execution': payload['execution'],

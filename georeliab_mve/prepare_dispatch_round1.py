@@ -35,11 +35,12 @@ _REQUIRED_RESOURCES = (
     'vggt_source_commit', 'mast3r_checkpoint', 'mast3r_checkpoint_sha256',
     'mast3r_config', 'mast3r_config_sha256', 'mast3r_source_commit',
     'dust3r_source_commit', 'croco_source_commit',
+    'typing_extensions_version', 'typing_extensions_sha256',
 )
 _REQUIRED_RUNTIME = (
     'vggt_source', 'mast3r_source', 'dust3r_source', 'croco_source',
     'vggt_env', 'mast3r_env', 'vggt_python', 'vggt_torch',
-    'mast3r_python', 'mast3r_torch',
+    'mast3r_python', 'mast3r_torch', 'typing_extensions_site',
 )
 
 
@@ -354,6 +355,7 @@ def run_prepare_operation(*, operation: str, data_root: Path, state_path: Path,
             root=data_root, resources=overlay.resources,
             split_manifest_path=split_path,
             dtu_inventory_provenance_path=data_root / 'manifests' / 'dtu_inventory_provenance.json',
+            typing_extensions_site=Path(str(_runtime_values(overlay)['typing_extensions_site'])),
         )
         verify_materialization_manifest(
             Path(materialization['materialization_path']),

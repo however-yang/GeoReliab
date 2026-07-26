@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -547,6 +548,34 @@ def test_default_adapter_factory_reuses_upstream_but_isolates_outputs_and_cache(
     assert m2.cache_dir == tmp_path / "m2" / "mast3r_cache"
     assert m2.upstream.cache_dir == m2.cache_dir
     runner._UPSTREAM_CACHE.clear()
+
+
+def test_isolated_model_workers_build_frozen_typing_extensions_env(tmp_path: Path, monkeypatch):
+    root = _minimal_root(tmp_path)
+    typing_site = tmp_path / "typing-site-worker"
+    typing_site.mkdir()
+    (typing_site / "typing_extensions.py").write_text("# fixture\n", encoding="utf-8")
+    config = _overlay(root / "overlay.toml")
+    payload = config.read_text(encoding="utf-8")
+    payload = payload.replace("mast3r_torch = '2.5.1+cu121'\n", f"mast3r_torch = '2.5.1+cu121'\ntyping_extensions_site = '{typing_site.as_posix()}'\n")
+    config.write_text(payload, encoding="utf-8")
+    captured = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(kwargs["env"])
+        summary_path = Path(cmd[cmd.index("--summary-json") + 1])
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text('{"status":"OK"}', encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(runner, "_verify_output_root_policy", lambda _context: None)
+    monkeypatch.setattr(runner, "_worker_python_path", lambda _context, _model: Path(sys.executable))
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    args = runner.build_parser().parse_args(["preflight-real", "--config", str(config), "--output-root", str(root), "--device", "cuda:0"])
+    result = runner._run_isolated_model_workers(args, runner.RunnerContext(root=root, output_root=root, config_path=config, device="cuda:0"))
+    assert result["status"] == "OK"
+    assert captured and all(env["PYTHONNOUSERSITE"] == "1" for env in captured)
+    assert all(env["PYTHONPATH"].split(os.pathsep)[0] == typing_site.as_posix() for env in captured)
 
 
 def test_adapter_outputs_are_committed_inside_atomic_bundle(tmp_path: Path):

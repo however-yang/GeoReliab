@@ -11,7 +11,7 @@ Canonical operator path: use `scripts/a100/*.sh`. Manual CLI commands are includ
 - Detached worktrees: `/srv/private/smli/GeoReliab/worktrees/REPLACE_WITH_FULL_PROJECT_COMMIT`
 - Frozen overlay: `configs/a100_real_mve_overlay.toml`
 - Scientific thresholds: `configs/dual_mve_protocol.toml` only
-- Read-only reuse paths: `/home/smli/workspace`, `/home/smli/models`, `/home/smli/miniforge3/envs`
+- Read-only reuse paths: `/home/smli/workspace`, `/home/smli/models`, `/home/smli/miniforge3/envs`, `/home/smli/miniforge3/pkgs/typing_extensions-4.15.0-pyhcf101f3_0/site-packages`
 
 Do not write below `/home/smli`. Do not shrink P3/P5 schedules to fit budget. If the next frozen stage would exceed 50 GPU-hours or 1 TB, stop with `BLOCKED_RESOURCE_BUDGET`.
 
@@ -21,6 +21,7 @@ Current A100 facts to preserve during Task 7:
 - DTU `SampleSet.zip` and `Points.zip` are complete;
 - Rectified DTU and TartanAir selected members are indexed/extracted through HTTP Range paths, so stale whole-archive `.partial` files are non-authoritative and must not be deleted or resumed automatically;
 - `/srv` has about 1.7 TB free, while `/home` has about 2.1 GB free. Force caches, temporary files, logs, and outputs to `/srv/private/smli/GeoReliab`.
+- `typing_extensions.py` is a frozen read-only runtime dependency: site `/home/smli/miniforge3/pkgs/typing_extensions-4.15.0-pyhcf101f3_0/site-packages`, version `4.15.0`, SHA-256 `433d11d170d3a24d2eb065ebc1bfe848cea7e3d7ce68567ab52bea2d4c2f7ed8`. It is injected ahead of model imports under `PYTHONNOUSERSITE=1`; `/home/smli/.local` must not be exposed.
 
 ## One-time shell setup
 
@@ -205,7 +206,7 @@ $PYTHON -m georeliab_mve prepare-georeliab --operation rendering --stage test --
 $PYTHON -m georeliab_mve prepare-georeliab --operation sanity --data-root "$ROOT" --state "$ROOT/artifacts/p0_sanity.json" --overlay "$OVERLAY"
 ```
 
-P0 passes only when all required manifests/evidence files exist and the latest status has no blocker. Treat Rectified/TartanAir whole-archive `.partial` files as stale non-authoritative leftovers; the authoritative evidence is the frozen HTTP Range index plus verified selected-member extraction.
+P0 passes only when all required manifests/evidence files exist and the latest status has no blocker. Treat Rectified/TartanAir whole-archive `.partial` files as stale non-authoritative leftovers; the authoritative evidence is the frozen HTTP Range index plus verified selected-member extraction. The prior P0 Torch import failure after `HOME` redirection is resolved only when `verify_prereqs.sh`, materialization provenance, and isolated adapter probes all confirm that `typing_extensions` imports from the frozen site above with the exact SHA-256.
 
 ## P1: repeated preflight
 

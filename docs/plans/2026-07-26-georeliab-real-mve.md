@@ -45,6 +45,7 @@ Status: approved for execution on 2026-07-26.
   `718eb93dc4f9e4332b60cc0041af962d712cbd346d7770ce35c5b22cff68eae4`
 - VGGT environment: Python 3.10.20, Torch 2.3.1+cu121.
 - MASt3R environment: Python 3.10.20, Torch 2.5.1+cu121.
+- Frozen typing_extensions dependency: site `/home/smli/miniforge3/pkgs/typing_extensions-4.15.0-pyhcf101f3_0/site-packages`, file `typing_extensions.py`, version `4.15.0`, SHA-256 `433d11d170d3a24d2eb065ebc1bfe848cea7e3d7ce68567ab52bea2d4c2f7ed8`. This is an environment dependency freeze only; it does not change scientific thresholds, scenes, schedule counts, or the test grid.
 
 ## Frozen data protocol
 
@@ -178,6 +179,8 @@ Document exact schedule counts, outputs, reason codes, and recovery steps.
 Validate shell syntax and local CLI help.
 
 ### Task 7: Remote P0-P6 execution
+
+P0 readiness must fail closed unless the frozen `typing_extensions.py` source, version, and SHA-256 are present in the overlay, environment lock, materialization provenance, and isolated model-runtime probes. This restores Torch imports after runtime cache setup redirects `HOME` away from `/home/smli` while keeping `/home` read-only.
 
 Create `/srv/private/smli/GeoReliab/git/GeoReliab.git`, push the exact
 implementation commit, create a detached runtime worktree, prepare official

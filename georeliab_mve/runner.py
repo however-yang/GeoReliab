@@ -25,6 +25,11 @@ import numpy as np
 
 from . import toml_compat as tomllib
 from .adapters import RenderedView
+from .materialization import (
+    FROZEN_TYPING_EXTENSIONS_SHA256,
+    FROZEN_TYPING_EXTENSIONS_SITE,
+    FROZEN_TYPING_EXTENSIONS_VERSION,
+)
 from .contracts import (
     AuditRecord,
     ContractError,
@@ -87,6 +92,9 @@ class ModelSpec:
     python: str
     torch: str
     environment_lock_sha256: str
+    typing_extensions_site: str
+    typing_extensions_sha256: str
+    typing_extensions_version: str
     config_sha256: str | None = None
     dust3r_source_commit: str | None = None
     croco_source_commit: str | None = None
@@ -522,6 +530,9 @@ def frozen_model_spec(model: str, config_path: Path | None) -> ModelSpec:
             "source_commit": "a288dd0f14786c93483e45524328726ab7b1b4ce",
             "python": "3.10.20",
             "torch": "2.3.1+cu121",
+            "typing_extensions_site": str(FROZEN_TYPING_EXTENSIONS_SITE),
+            "typing_extensions_sha256": FROZEN_TYPING_EXTENSIONS_SHA256,
+            "typing_extensions_version": FROZEN_TYPING_EXTENSIONS_VERSION,
         },
         "MASt3R": {
             "checkpoint_sha256": "0a615eb05fa9db654050aa655945ee5696e7c6c1b7f93f1ee8c37249010f6feb",
@@ -531,6 +542,9 @@ def frozen_model_spec(model: str, config_path: Path | None) -> ModelSpec:
             "torch": "2.5.1+cu121",
             "dust3r_source_commit": "3cc8c88c413bb9e34c41db0e0eef99c2ee010b12",
             "croco_source_commit": "d7de0705845239092414480bd829228723bf20de",
+            "typing_extensions_site": str(FROZEN_TYPING_EXTENSIONS_SITE),
+            "typing_extensions_sha256": FROZEN_TYPING_EXTENSIONS_SHA256,
+            "typing_extensions_version": FROZEN_TYPING_EXTENSIONS_VERSION,
         },
     }
     if model not in defaults:
@@ -542,6 +556,9 @@ def frozen_model_spec(model: str, config_path: Path | None) -> ModelSpec:
         payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
         resources = payload.get("resources", {}) if isinstance(payload, dict) else {}
         runtime = payload.get("runtime", {}) if isinstance(payload, dict) else {}
+        values["typing_extensions_site"] = str(runtime.get("typing_extensions_site", values["typing_extensions_site"]))
+        values["typing_extensions_sha256"] = str(resources.get("typing_extensions_sha256", values["typing_extensions_sha256"]))
+        values["typing_extensions_version"] = str(resources.get("typing_extensions_version", values["typing_extensions_version"]))
         if model == "VGGT":
             values["checkpoint_sha256"] = str(resources.get("vggt_checkpoint_sha256", values["checkpoint_sha256"]))
             values["source_commit"] = str(resources.get("vggt_source_commit", values["source_commit"]))
@@ -562,6 +579,9 @@ def frozen_model_spec(model: str, config_path: Path | None) -> ModelSpec:
         python=str(values["python"]),
         torch=str(values["torch"]),
         environment_lock_sha256=overlay_digest,
+        typing_extensions_site=str(values["typing_extensions_site"]),
+        typing_extensions_sha256=str(values["typing_extensions_sha256"]),
+        typing_extensions_version=str(values["typing_extensions_version"]),
         config_sha256=values.get("config_sha256"),
         dust3r_source_commit=values.get("dust3r_source_commit"),
         croco_source_commit=values.get("croco_source_commit"),
@@ -644,7 +664,15 @@ def make_manifest(item: ScheduleItem, root: Path, model_specs: Mapping[str, Mode
         seed=int(item.sample_key.seed),
         intervention_version="none",
         corruption_version="georeliab-c-v1",
-        environment={"device": device, "python": spec.python, "torch": spec.torch, **({"config_sha256": spec.config_sha256} if spec.config_sha256 else {})},
+        environment={
+            "device": device,
+            "python": spec.python,
+            "torch": spec.torch,
+            "typing_extensions_site": spec.typing_extensions_site,
+            "typing_extensions_sha256": spec.typing_extensions_sha256,
+            "typing_extensions_version": spec.typing_extensions_version,
+            **({"config_sha256": spec.config_sha256} if spec.config_sha256 else {}),
+        },
         rgb_digest=_canonical_ordered_png_bundle_digest(
             item.rendered_views,
             expected_count=6 if item.stage == "zero-update" else 8,
@@ -705,6 +733,9 @@ def default_adapter_factory(model: str, context: RunnerContext) -> Any:
         getattr(frozen, "dust3r_source_commit", None),
         str(getattr(frozen, "croco_source", None)),
         getattr(frozen, "croco_source_commit", None),
+        str(frozen.typing_extensions_site),
+        frozen.typing_extensions_sha256,
+        frozen.typing_extensions_version,
     )
     if model == "VGGT":
         upstream = _UPSTREAM_CACHE.get(key)
@@ -773,6 +804,9 @@ def _frozen_runtime_from_config(model: str, context: RunnerContext) -> Any:
             source=Path(runtime["vggt_source"]), source_commit=resources["vggt_source_commit"],
             environment=Path(runtime["vggt_env"]), python_version=runtime["vggt_python"], torch_version=runtime["vggt_torch"],
             checkpoint=Path(resources["vggt_checkpoint"]), checkpoint_sha256=resources["vggt_checkpoint_sha256"],
+            typing_extensions_site=Path(runtime.get("typing_extensions_site", FROZEN_TYPING_EXTENSIONS_SITE)),
+            typing_extensions_sha256=resources.get("typing_extensions_sha256", FROZEN_TYPING_EXTENSIONS_SHA256),
+            typing_extensions_version=resources.get("typing_extensions_version", FROZEN_TYPING_EXTENSIONS_VERSION),
         )
     if model == "MASt3R":
         return FrozenRuntime(
@@ -782,6 +816,9 @@ def _frozen_runtime_from_config(model: str, context: RunnerContext) -> Any:
             config=Path(resources["mast3r_config"]), config_sha256=resources["mast3r_config_sha256"],
             dust3r_source=Path(runtime["dust3r_source"]), dust3r_source_commit=resources["dust3r_source_commit"],
             croco_source=Path(runtime["croco_source"]), croco_source_commit=resources["croco_source_commit"],
+            typing_extensions_site=Path(runtime.get("typing_extensions_site", FROZEN_TYPING_EXTENSIONS_SITE)),
+            typing_extensions_sha256=resources.get("typing_extensions_sha256", FROZEN_TYPING_EXTENSIONS_SHA256),
+            typing_extensions_version=resources.get("typing_extensions_version", FROZEN_TYPING_EXTENSIONS_VERSION),
         )
     raise RunnerError(f"unsupported model: {model}")
 
@@ -2066,8 +2103,20 @@ def _verify_current_worker_runtime(context: RunnerContext, model: str) -> None:
             raise RunnerError(f"{model} worker is not running inside frozen environment: {sys.executable} != {expected_python}")
     except OSError as exc:
         raise RunnerError(f"cannot verify {model} worker executable") from exc
-    spec = frozen_model_spec("VGGT" if model == "vggt" else "MASt3R", context.config_path)
     import platform
+    import hashlib
+    spec = frozen_model_spec("VGGT" if model == "vggt" else "MASt3R", context.config_path)
+    typing_file = Path(spec.typing_extensions_site) / "typing_extensions.py"
+    if not typing_file.is_file() or sha256_file(typing_file) != spec.typing_extensions_sha256:
+        raise RunnerError(f"{model} worker typing_extensions.py digest mismatch")
+    if str(Path(spec.typing_extensions_site)) not in sys.path:
+        sys.path.insert(0, spec.typing_extensions_site)
+    import typing_extensions
+    if Path(typing_extensions.__file__).resolve() != typing_file.resolve():
+        raise RunnerError(f"{model} worker typing_extensions import escaped frozen site")
+    from importlib import metadata
+    if metadata.version("typing_extensions") != spec.typing_extensions_version:
+        raise RunnerError(f"{model} worker typing_extensions version mismatch")
     import torch
 
     if platform.python_version() != spec.python or torch.__version__ != spec.torch:
@@ -2079,10 +2128,11 @@ def _run_isolated_model_workers(args: argparse.Namespace, context: RunnerContext
     payloads: list[dict[str, Any]] = []
     source_root = Path(__file__).resolve().parents[1]
     env = dict(os.environ)
-    pythonpath = str(source_root)
-    if env.get("PYTHONPATH"):
-        pythonpath = pythonpath + os.pathsep + env["PYTHONPATH"]
+    overlay_payload = _overlay_payload(context)
+    typing_site = str(overlay_payload.get("runtime", {}).get("typing_extensions_site", FROZEN_TYPING_EXTENSIONS_SITE))
+    pythonpath = os.pathsep.join([typing_site, str(source_root)])
     env["PYTHONPATH"] = pythonpath
+    env["PYTHONNOUSERSITE"] = "1"
     for model in ("vggt", "mast3r"):
         python = _worker_python_path(context, model)
         shard_token = str(getattr(args, "shard", "0/1")).replace("/", "of")

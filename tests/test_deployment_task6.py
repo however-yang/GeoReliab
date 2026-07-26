@@ -50,6 +50,9 @@ def test_a100_overlay_freezes_paths_resources_and_limits() -> None:
         assert str(runtime[key]).startswith('/srv/private/smli/GeoReliab')
     for key in ('vggt_source', 'mast3r_source', 'dust3r_source', 'croco_source', 'vggt_env', 'mast3r_env'):
         assert str(runtime[key]).startswith('/home/smli/')
+    assert runtime['typing_extensions_site'] == '/home/smli/miniforge3/pkgs/typing_extensions-4.15.0-pyhcf101f3_0/site-packages'
+    assert resources['typing_extensions_version'] == '4.15.0'
+    assert resources['typing_extensions_sha256'] == '433d11d170d3a24d2eb065ebc1bfe848cea7e3d7ce68567ab52bea2d4c2f7ed8'
     assert resources['vggt_source_commit'] == 'a288dd0f14786c93483e45524328726ab7b1b4ce'
     assert resources['mast3r_source_commit'] == 'f5209afc300cec36239a7ac992263f36847bbba0'
     assert resources['dust3r_source_commit'] == '3cc8c88c413bb9e34c41db0e0eef99c2ee010b12'
@@ -130,6 +133,11 @@ def test_scripts_pin_all_runtime_caches_off_home_and_mark_no_home_write() -> Non
     ):
         assert f'export {name}=' in common or f"{name}='" in launch
     assert 'GEORELIAB_NO_HOME_WRITE=1' in common
+    assert 'PYTHONNOUSERSITE=1' in common
+    assert 'typing_site=$(CDPATH= cd -- "$typing_site" 2>/dev/null && pwd -P)' in common
+    assert 'must not expose /home/smli/.local' in common
+    assert 'validate_typing_extensions_runtime "$overlay"' in common
+    assert 'PYTHONPATH="$typing_site:$GEORELIAB_PROJECT_ROOT"' in common
     assert 'no_home_write_marker.json' in verify
     assert 'runtime.cache' in common
 
@@ -219,3 +227,9 @@ def test_prereqs_enforce_storage_cap_device_count_and_frozen_env_orchestrator() 
     assert 'die "frozen VGGT environment Python is required' in common
     assert 'toml_compat' in common
     assert 'import tomli' not in common
+    assert '-I -B - "$typing_site" "$typing_sha" "$typing_version"' in verify
+    assert 'expected_python, expected_torch = sys.argv[4], sys.argv[5]' in verify
+    assert 'assert platform.python_version() == "$(' not in verify
+    assert 'import typing_extensions' in verify
+    assert 'typing_extensions_file_sha256' in verify
+    assert 'typing_extensions_file_path' in verify
