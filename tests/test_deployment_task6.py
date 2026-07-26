@@ -73,6 +73,19 @@ def test_a100_shell_scripts_parse(script: Path) -> None:
     assert result.returncode == 0, combined
 
 
+def test_a100_shell_scripts_are_executable_in_git() -> None:
+    for script in SCRIPTS:
+        relative = script.relative_to(ROOT).as_posix()
+        staged = subprocess.run(
+            ['git', 'ls-files', '--stage', '--', relative],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        assert staged.startswith('100755 '), f'{relative} is not executable: {staged}'
+
+
 def test_a100_scripts_fail_closed_on_paths_and_disallowed_git_operations() -> None:
     assert {path.name for path in SCRIPTS} == {
         'common.sh', 'deploy_commit.sh', 'finalize_p6.sh', 'launch_stage.sh', 'status.sh', 'verify_prereqs.sh',
