@@ -590,12 +590,15 @@ def evaluate_georeliab_gate(value: GeoReliabGateInput) -> GateDecision:
             details={'condition_count': len(value.conditions)},
             scientific_validity=value.scientific_validity,
         )
-    if sum(item.invalid_count for item in value.conditions) != value.schedule_counts.get('invalid'):
+    if value.schedule_counts.get('invalid', 0) > 0 or any(item.invalid_count > 0 for item in value.conditions):
         return GateDecision(
             lane='georeliab',
             status=GateStatus.FAIL,
-            reason_codes=('INVALID_PROVENANCE_COUNTS_UNBOUND',),
-            details={'condition_invalid': sum(item.invalid_count for item in value.conditions), 'schedule_invalid': value.schedule_counts.get('invalid')},
+            reason_codes=('INVALID_OUTPUT_IN_VERIFIED_CONDITION',),
+            details={
+                'condition_invalid': sum(item.invalid_count for item in value.conditions),
+                'schedule_invalid': value.schedule_counts.get('invalid'),
+            },
             scientific_validity=value.scientific_validity,
         )
 

@@ -13,7 +13,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from .contracts import AuditRecord, PredictionArtifact, RunManifest, RunMode, ScientificValidity, read_json_artifact, validate_artifact_bundle, write_json_artifact
+from .contracts import AuditRecord, ContractError, PredictionArtifact, RunManifest, RunMode, SampleKey, ScientificValidity, read_json_artifact, validate_artifact_bundle, write_json_artifact
 from .gates import (
     DownstreamHarmEvidence,
     GEORELIAB_FAILURE_AUROC_THRESHOLD,
@@ -955,20 +955,447 @@ def load_stage_evidence_manifest(path: Path) -> GeoReliabEvidencePayload:
     payload = json.loads(path.read_text(encoding='utf-8'))
     if not isinstance(payload, dict) or payload.get('schema_version') != 'stage-evidence-v1':
         raise AuditError('stage evidence manifest requires schema_version stage-evidence-v1')
+    if any(key in payload for key in ('conditions', 'downstream_harm', 'zero_update')):
+        raise AuditError('stage evidence must derive gate evidence from validated bundles, not aggregate fields')
+    split_manifest_path = _stage_top_path(payload, 'split_view_manifest')
+    from .preparation import TEST_SCENES
+
+    split_payload = json.loads(split_manifest_path.read_text(encoding='utf-8'))
+    try:
+        split_test_scenes = tuple(int(scene) for scene in split_payload['splits']['test'])
+    except (KeyError, TypeError) as exc:
+        raise AuditError('stage evidence requires canonical split/view manifest with test split') from exc
+    if split_test_scenes != tuple(TEST_SCENES):
+        raise AuditError('stage split manifest test scenes do not match the frozen DTU TEST_SCENES')
+    frozen_test_scenes = tuple(f'scan{scene}' for scene in TEST_SCENES)
+    qa = _load_stage_qa_manifests(payload, frozen_test_scenes=frozen_test_scenes)
     bundle_index = payload.get('bundle_index')
     if not isinstance(bundle_index, list) or not bundle_index:
         raise AuditError('stage evidence manifest requires a non-empty validated bundle_index')
+    bundle_records = _load_stage_bundle_records(
+        bundle_index,
+        frozen_test_scenes=frozen_test_scenes,
+        split_manifest_sha256=_file_sha256(split_manifest_path),
+    )
+    condition_evidence = _derive_stage_conditions(
+        bundle_records, frozen_test_scenes=frozen_test_scenes, qa=qa,
+    )
+    downstream_harm = _derive_bound_downstream_rows(
+        payload.get('downstream_index', ()), bundle_records, row_type='downstream'
+    )
+    zero_update = _derive_bound_downstream_rows(
+        payload.get('zero_update_index', ()), bundle_records, row_type='zero_update'
+    )
+    downstream_schedule_counts = {
+        'scheduled': 6,
+        'completed': len(downstream_harm) if len(zero_update) == 6 else min(len(downstream_harm), len(zero_update)),
+        'missing': max(0, 6 - min(len(downstream_harm), len(zero_update))),
+    }
+    return build_georeliab_evidence(
+        condition_evidence=condition_evidence,
+        downstream_harm=downstream_harm,
+        zero_update=zero_update,
+        required_models_ready=payload.get('required_models_ready', ('VGGT', 'MASt3R')),
+        required_datasets_ready=bool(payload.get('required_datasets_ready', True)),
+        tartanair_native_fog_sanity=qa['tartanair_native_fog_sanity'],
+        run_mode='real',
+        split='test',
+        evidence_schema_version='1.1',
+        schedule_counts={
+            'scheduled': 400,
+            'completed': len(bundle_records),
+            'missing': max(0, 400 - len(bundle_records)),
+            'invalid': sum(1 for record in bundle_records if record['prediction'].invalid_prediction),
+        },
+        invalid_counts={
+            'invalid_prediction': sum(1 for record in bundle_records if record['prediction'].invalid_prediction),
+        },
+        statistics={'downstream_schedule_counts': downstream_schedule_counts},
+    )
+
+
+def _stage_path(item: Mapping[str, Any], name: str) -> Path:
+    value = item.get(f'{name}_path')
+    digest = item.get(f'{name}_sha256')
+    if not isinstance(value, str) or not value or not isinstance(digest, str) or not digest:
+        raise AuditError(f'stage bundle entries must bind {name} path and sha256')
+    path = Path(value)
+    if _file_sha256(path) != digest:
+        raise AuditError(f'stage {name} digest mismatch')
+    return path
+
+
+def _stage_top_path(payload: Mapping[str, Any], name: str) -> Path:
+    value = payload.get(f'{name}_path')
+    digest = payload.get(f'{name}_sha256')
+    if not isinstance(value, str) or not value or not isinstance(digest, str) or not digest:
+        raise AuditError(f'stage evidence requires {name} path and sha256')
+    path = Path(value)
+    if _file_sha256(path) != digest:
+        raise AuditError(f'stage {name} digest mismatch')
+    return path
+
+
+def _load_stage_qa_manifests(
+    payload: Mapping[str, Any], *, frozen_test_scenes: Sequence[str]
+) -> dict[str, Any]:
+    corruption_path = _stage_top_path(payload, 'corruption_calibration_qa')
+    render_path = _stage_top_path(payload, 'test_render_lock')
+    tartan_path = _stage_top_path(payload, 'tartanair_native_fog_sanity')
+    corruption = json.loads(corruption_path.read_text(encoding='utf-8'))
+    render = json.loads(render_path.read_text(encoding='utf-8'))
+    tartan = json.loads(tartan_path.read_text(encoding='utf-8'))
+    if corruption.get('schema_version') != 'calibration-qa-v1' or not bool(corruption.get('passed')):
+        raise AuditError('corruption calibration QA manifest schema/pass mismatch')
+    checks = corruption.get('checks', {})
+    required_sha = {
+        'parameter_manifest_sha256': payload.get('parameter_manifest_sha256'),
+        'split_view_manifest_sha256': payload.get('split_view_manifest_sha256'),
+        'materialization_sha256': payload.get('materialization_sha256'),
+    }
+    for key, expected in required_sha.items():
+        if not isinstance(expected, str) or corruption.get(key) != expected:
+            raise AuditError(f'corruption calibration QA is not bound to stage {key}')
+    if render.get('schema_version') != 'test-render-lock-v1' or render.get('stage') != 'test' or render.get('split') != 'test':
+        raise AuditError('test render lock manifest schema/stage/split mismatch')
+    for key, expected in required_sha.items():
+        if render.get(key) != expected:
+            raise AuditError(f'test render lock is not bound to stage {key}')
+    if render.get('calibration_qa_sha256') != payload.get('corruption_calibration_qa_sha256'):
+        raise AuditError('test render lock is not bound to calibration QA digest')
+    if tartan.get('calibration_qa_sha256') != payload.get('corruption_calibration_qa_sha256'):
+        raise AuditError('TartanAir sanity is not bound to calibration QA digest')
+    correlations = tartan.get('correlations', [])
+    negative_count = sum(float(value) < 0 for value in correlations)
+    if tartan.get('reason_code') != 'TARTANAIR_NATIVE_FOG_SANITY' or not bool(tartan.get('passed')) or int(tartan.get('evaluated_frames', 0)) != 100 or len(correlations) != 100 or int(tartan.get('negative_frames', -1)) != negative_count or negative_count < 80:
+        raise AuditError('TartanAir sanity manifest does not satisfy the frozen native fog check')
+    return {
+        'corruption_pass': {
+            'fog': bool(checks.get('fog')) and bool(checks.get('synthetic_fog')),
+            'low-light-noise': bool(checks.get('low_light')),
+            'defocus': bool(checks.get('defocus')),
+        },
+        'cross_view_consistent': bool(checks.get('cross_view')),
+        'gt_geometry_invariant': bool(checks.get('gt')),
+        'tartanair_native_fog_sanity': True,
+    }
+
+
+def _load_stage_bundle_records(
+    bundle_index: Sequence[Mapping[str, Any]],
+    *,
+    frozen_test_scenes: Sequence[str],
+    split_manifest_sha256: str,
+) -> list[dict[str, Any]]:
+    if len(bundle_index) != 400:
+        raise AuditError('stage evidence requires exactly 400 P3 bundle entries')
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    shared_project: tuple[str, str, str, str] | None = None
+    model_freeze: dict[str, tuple[str, str, str]] = {}
     for item in bundle_index:
-        if not isinstance(item, dict) or not item.get('scene_summary_sha256') or not item.get('scene_summary_path'):
-            raise AuditError('bundle_index entries must bind scene_summary path and sha256')
-        scene_path = Path(item['scene_summary_path'])
-        if _file_sha256(scene_path) != item['scene_summary_sha256']:
-            raise AuditError('stage evidence scene summary digest mismatch')
-    payload = dict(payload)
-    payload.setdefault('run_mode', 'real')
-    payload.setdefault('split', 'test')
-    payload.setdefault('evidence_schema_version', '1.1')
-    return load_georeliab_evidence_payload(payload)
+        if not isinstance(item, Mapping):
+            raise AuditError('stage bundle_index entries must be objects')
+        manifest = read_json_artifact(_stage_path(item, 'manifest'), RunManifest)
+        prediction = read_json_artifact(_stage_path(item, 'prediction'), PredictionArtifact)
+        audit = read_json_artifact(_stage_path(item, 'audit'), AuditRecord)
+        scene_summary = json.loads(_stage_path(item, 'scene_summary').read_text(encoding='utf-8'))
+        if not isinstance(scene_summary, dict):
+            raise AuditError('stage scene_summary must be a JSON object')
+        if scene_summary.get('sample_key') not in (None, prediction.sample_key):
+            raise AuditError('stage scene_summary sample_key cross-link')
+        if scene_summary.get('schema_version') != 'validated-scene-summary-v1' or scene_summary.get('producer') != 'audit-georeliab':
+            raise AuditError('stage scene_summary must use the writer-owned validated schema')
+        if scene_summary.get('audit_sha256') != item.get('audit_sha256'):
+            raise AuditError('stage scene_summary is not bound to the audit artifact digest')
+        try:
+            validate_artifact_bundle(manifest, prediction, audit)
+        except ContractError as exc:
+            raise AuditError(f'stage bundle validation failed: {exc}') from exc
+        key = SampleKey.parse(prediction.sample_key)
+        if key.scene not in set(frozen_test_scenes):
+            raise AuditError('stage sample_key scene is outside the frozen test split')
+        unique = (manifest.model, prediction.sample_key)
+        if unique in seen:
+            raise AuditError('stage evidence contains duplicate model/sample_key')
+        seen.add(unique)
+        if manifest.mode is not RunMode.REAL or manifest.split != 'test' or key.split != 'test':
+            raise AuditError('stage evidence only accepts REAL test bundles')
+        provenance = manifest.provenance
+        if provenance is None:
+            raise AuditError('stage REAL bundles require scientific provenance')
+        if provenance.split_view_manifest_sha256 != split_manifest_sha256:
+            raise AuditError('stage bundle provenance is not bound to the stage split manifest')
+        project_tuple = (
+            provenance.project_commit,
+            provenance.project_tree,
+            provenance.split_view_manifest_sha256,
+            provenance.corruption_manifest_sha256,
+        )
+        if shared_project is None:
+            shared_project = project_tuple
+        elif shared_project != project_tuple:
+            raise AuditError('stage evidence mixes project tree, split, or corruption provenance')
+        model_tuple = (
+            manifest.checkpoint_hash,
+            provenance.model_source_commit,
+            provenance.environment_lock_sha256,
+        )
+        if manifest.model in model_freeze and model_freeze[manifest.model] != model_tuple:
+            raise AuditError('stage evidence mixes model checkpoint/source/environment provenance')
+        model_freeze.setdefault(manifest.model, model_tuple)
+        dense = _load_npz_uri(audit.metadata['dense_audit_uri'])
+        geometry = _load_npz_uri(prediction.geometry_prediction_uri)
+        records.append({
+            'manifest': manifest,
+            'prediction': prediction,
+            'audit': audit,
+            'key': key,
+            'scene_summary': scene_summary,
+            'dense': dense,
+            'geometry': geometry,
+        })
+    return records
+
+
+def _dense_record(record: Mapping[str, Any]) -> dict[str, Sequence[float]]:
+    prediction: PredictionArtifact = record['prediction']
+    audit: AuditRecord = record['audit']
+    if prediction.invalid_prediction:
+        return {
+            'risk': [audit.selection_score],
+            'error': [audit.gt_error if audit.gt_error is not None else 1e12],
+            'failure': [True],
+        }
+    dense = record['dense']
+    return {
+        'risk': np.asarray(dense['risk'], dtype=np.float64).tolist(),
+        'error': np.asarray(dense['gt_error'], dtype=np.float64).tolist(),
+        'failure': np.asarray(dense['failure_label'], dtype=bool).tolist(),
+    }
+
+
+def _derive_stage_conditions(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    frozen_test_scenes: Sequence[str],
+    qa: Mapping[str, Any],
+) -> tuple[GeoReliabConditionEvidence, ...]:
+    models = {'VGGT', 'MASt3R'}
+    corruptions = ('fog', 'low-light-noise', 'defocus')
+    scenes = tuple(str(scene) for scene in frozen_test_scenes)
+    if len(scenes) != 20 or set(record['key'].scene for record in records) != set(scenes):
+        raise AuditError('stage evidence requires exactly 20 test scenes')
+    expected: set[tuple[str, str, str, str]] = set()
+    for model in models:
+        for scene in scenes:
+            expected.add((model, scene, 'clean', '0'))
+            for corruption in corruptions:
+                for severity in ('1', '2', '3'):
+                    expected.add((model, scene, corruption, severity))
+    observed = [
+        (record['manifest'].model, record['key'].scene, record['key'].condition, record['key'].severity)
+        for record in records
+    ]
+    if len(observed) != 400 or set(observed) != expected or len(set(observed)) != 400:
+        raise AuditError('stage evidence P3 grid does not match 20 scenes x 10 conditions x 2 models')
+    by_key = {
+        (record['manifest'].model, record['key'].scene, record['key'].condition, record['key'].severity): record
+        for record in records
+    }
+    evidence = []
+    for model in sorted(models):
+        for corruption in corruptions:
+            invalid_count = sum(
+                1 for scene in scenes for severity in ('0', '1', '2', '3')
+                if by_key[(model, scene, 'clean' if severity == '0' else corruption, severity)]['prediction'].invalid_prediction
+            )
+            if invalid_count:
+                evidence.append(GeoReliabConditionEvidence(
+                    model=model,
+                    corruption=corruption,
+                    clean_rho=0.0,
+                    severity_rhos=(0.0, 0.0, 0.0),
+                    failure_auroc=1.0,
+                    corruption_severity_monotonic=False,
+                    cross_view_consistent=False,
+                    gt_geometry_invariant=False,
+                    scene_ids=scenes,
+                    scene_count=20,
+                    invalid_count=invalid_count,
+                    n_resamples=10_000,
+                    branch_reason_codes=('INVALID_OUTPUT_IN_VERIFIED_CONDITION',),
+                ))
+                continue
+            corruption_ok = bool(qa['corruption_pass'].get(corruption, False))
+            cross = bool(qa['cross_view_consistent'])
+            gt_ok = bool(qa['gt_geometry_invariant'])
+            condition_records = {
+                'clean': {scene: _dense_record(by_key[(model, scene, 'clean', '0')]) for scene in scenes},
+                '1': {scene: _dense_record(by_key[(model, scene, corruption, '1')]) for scene in scenes},
+                '2': {scene: _dense_record(by_key[(model, scene, corruption, '2')]) for scene in scenes},
+                '3': {scene: _dense_record(by_key[(model, scene, corruption, '3')]) for scene in scenes},
+            }
+            item = build_condition_evidence(
+                model=model,
+                corruption=corruption,
+                scene_condition_records=condition_records,
+                corruption_qa=corruption_ok,
+                cross_view_consistent=cross,
+                gt_geometry_invariant=gt_ok,
+                expected_scene_count=20,
+                n_resamples=10_000,
+                seed=17,
+            )
+            values = item.to_dict()
+            values['invalid_count'] = invalid_count
+            evidence.append(GeoReliabConditionEvidence(**values))
+    return tuple(evidence)
+
+
+def _derive_bound_downstream_rows(
+    index: Any,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    row_type: str,
+) -> tuple[DownstreamHarmEvidence | ZeroUpdateEvidence, ...]:
+    if index in (None, ()):
+        return ()
+    if not isinstance(index, list):
+        raise AuditError(f'{row_type} index must be a JSON array')
+    valid_keys = {record['prediction'].sample_key for record in records}
+    scene_ids = sorted({record['key'].scene for record in records})
+    expected_sources = {
+        (model, f'{corruption}-s2'): {
+            record['prediction'].sample_key
+            for record in records
+            if record['manifest'].model == model
+            and record['key'].condition == corruption
+            and record['key'].severity == '2'
+        }
+        for model in ('VGGT', 'MASt3R')
+        for corruption in ('fog', 'low-light-noise', 'defocus')
+    }
+    severity2_records = {
+        (record['manifest'].model, f"{record['key'].condition}-s2", record['key'].scene): record
+        for record in records
+        if record['key'].severity == '2' and record['key'].condition in ('fog', 'low-light-noise', 'defocus')
+    }
+    rows = []
+    for item in index:
+        if not isinstance(item, Mapping):
+            raise AuditError(f'{row_type} index entries must be objects')
+        evidence_path = _stage_path(item, 'evidence')
+        evidence_payload = json.loads(evidence_path.read_text(encoding='utf-8'))
+        if not isinstance(evidence_payload, dict):
+            raise AuditError(f'{row_type} evidence must be a JSON object')
+        source_keys = set(evidence_payload.get('source_sample_keys', ()))
+        if not source_keys or not source_keys <= valid_keys:
+            raise AuditError(f'{row_type} evidence source_sample_keys are not bound to validated bundles')
+        model = str(evidence_payload.get('model'))
+        condition = str(evidence_payload.get('condition'))
+        if expected_sources.get((model, condition)) != source_keys:
+            raise AuditError(f'{row_type} evidence does not bind the exact severity-2 source grid')
+        if row_type == 'downstream':
+            if evidence_payload.get('schema_version') != 'downstream-harm-v1' or evidence_payload.get('coverage') != [0.9, 0.7, 0.5, 0.3] or evidence_payload.get('random_mask_count') != 100 or evidence_payload.get('n_resamples') != 10_000:
+                raise AuditError('downstream evidence does not match frozen schema/coverage/random/bootstrap protocol')
+            gt_inputs = _load_stage_scene_npz_inputs(
+                evidence_payload.get('gt_inputs'), scene_ids, row_type='downstream'
+            )
+            harm = native_vs_random_harm(
+                {
+                    scene: (
+                        severity2_records[(model, condition, scene)]['dense']['gt_error'],
+                        severity2_records[(model, condition, scene)]['dense']['risk'],
+                        severity2_records[(model, condition, scene)]['dense']['voxel_points'],
+                        gt_inputs[scene]['gt_points'],
+                    )
+                    for scene in scene_ids
+                },
+                n_random_masks=100,
+                n_resamples=10_000,
+                seed=23,
+            )
+            for scene in scene_ids:
+                expected_gt = severity2_records[(model, condition, scene)]['audit'].metadata.get('gt_points_sha256')
+                if not expected_gt or gt_inputs[scene].get('__sha256') != expected_gt:
+                    raise AuditError('downstream GT input is not bound to the severity-2 audit metadata')
+            rows.append(DownstreamHarmEvidence(
+                model=model,
+                condition=condition,
+                effect_vs_random=harm.effect_vs_random,
+                ci_upper=harm.ci_upper,
+            ))
+        else:
+            if evidence_payload.get('schema_version') != 'zero-update-v1' or evidence_payload.get('n_resamples') != 10_000 or evidence_payload.get('omitted_view_pairs') != [[0, 4], [1, 5], [2, 6], [3, 7]]:
+                raise AuditError('zero-update evidence does not match frozen subset/bootstrap protocol')
+            subsets = evidence_payload.get('subset_artifacts', {})
+            if set(subsets) != set(scene_ids) or any(len(subsets[scene]) != 4 for scene in scene_ids):
+                raise AuditError('zero-update evidence must bind four subset artifacts for each frozen scene')
+            zero_records = {}
+            for scene in scene_ids:
+                full_record = severity2_records[(model, condition, scene)]
+                subset_predictions = []
+                for item in subsets[scene]:
+                    if not isinstance(item, Mapping):
+                        raise AuditError('zero-update subset artifacts must bind path and sha256')
+                    subset_path = _stage_path(item, 'artifact')
+                    with np.load(subset_path, allow_pickle=False) as subset_payload:
+                        parent_model = str(np.asarray(subset_payload['parent_model']).item())
+                        parent_sample_key = str(np.asarray(subset_payload['parent_sample_key']).item())
+                        parent_project = str(np.asarray(subset_payload['parent_project_commit']).item())
+                        expected_project = full_record['manifest'].provenance.project_commit
+                        if parent_model != model or parent_sample_key != full_record['prediction'].sample_key or parent_project != expected_project:
+                            raise AuditError('zero-update subset artifact is not bound to the parent full prediction')
+                        subset_predictions.append({
+                            'points': subset_payload['points'],
+                            'camera_centers': subset_payload['camera_centers'],
+                            'view_ids': subset_payload['view_ids'],
+                        })
+                geometry = full_record['geometry']
+                full_cameras = np.asarray(geometry['camera_c2w'], dtype=np.float64)[:, :3, 3]
+                zero_risk = compute_zero_update_disagreement_risk(
+                    full_points=full_record['dense']['voxel_points'],
+                    full_camera_centers=full_cameras,
+                    subset_predictions=subset_predictions,
+                )
+                zero_records[scene] = {
+                    'failure': np.asarray(full_record['dense']['failure_label'], dtype=bool).tolist(),
+                    'native_risk': full_record['dense']['risk'],
+                    'zero_update_risk': zero_risk,
+                }
+            gain = evaluate_zero_update_gain(
+                zero_records,
+                n_resamples=10_000,
+                seed=29,
+            )
+            rows.append(ZeroUpdateEvidence(
+                model=model,
+                condition=condition,
+                auroc_gain=gain.auroc_gain,
+                ci_lower=gain.ci_lower,
+            ))
+    return tuple(rows)
+
+
+def _load_stage_scene_npz_inputs(
+    index: Any,
+    scene_ids: Sequence[str],
+    *,
+    row_type: str,
+) -> dict[str, dict[str, np.ndarray]]:
+    if not isinstance(index, Mapping) or set(index) != set(scene_ids):
+        raise AuditError(f'{row_type} evidence must bind per-scene NPZ inputs for the frozen scenes')
+    result = {}
+    for scene in scene_ids:
+        item = index[scene]
+        if not isinstance(item, Mapping):
+            raise AuditError(f'{row_type} scene input must bind path and sha256')
+        path = _stage_path(item, 'input')
+        with np.load(path, allow_pickle=False) as payload:
+            result[scene] = {name: payload[name] for name in payload.files}
+        result[scene]['__sha256'] = item[f'{"input"}_sha256']
+    return result
 
 
 def load_georeliab_evidence_payload(payload: Mapping[str, Any]) -> GeoReliabEvidencePayload:
@@ -1102,11 +1529,17 @@ def write_dense_audit_bundle(
     write_json_artifact(audit_path, audit)
     validate_artifact_bundle(manifest, prediction, audit)
     summary = {
+        'schema_version': 'validated-scene-summary-v1',
+        'producer': 'audit-georeliab',
         'run_id': manifest.run_id,
         'sample_key': prediction.sample_key,
+        'audit_sha256': _file_sha256(audit_path),
         'dense_audit_uri': dense_path.resolve().as_uri(),
         'audit_record': str(audit_path),
         'summary': result.summary,
+        'corruption_severity_monotonic': False,
+        'cross_view_consistent': False,
+        'gt_geometry_invariant': False,
         'invalid_counts': {'invalid_prediction': int(prediction.invalid_prediction)},
         'schedule_counts': {'bundle': 1},
     }
@@ -1156,27 +1589,147 @@ def load_official_dtu_evidence(
     frozen_materialization: Path,
     split_manifest: Path,
 ) -> dict[str, Any]:
-    from .contracts import SampleKey
+    from .materialization import PreparationError, verify_materialization_manifest
 
     key = SampleKey.parse(sample_key)
     if key.dataset != 'dtu':
         raise AuditError('official DTU evidence requires dtu sample_key')
-    frozen = json.loads(frozen_materialization.read_text(encoding='utf-8'))
-    splits = json.loads(split_manifest.read_text(encoding='utf-8'))
-    if key.scene not in splits.get(key.split, []):
+    try:
+        frozen = verify_materialization_manifest(
+            frozen_materialization, split_manifest_path=split_manifest,
+        )
+    except PreparationError as exc:
+        raise AuditError(f'official DTU materialization verification failed: {exc}') from exc
+    split_payload = json.loads(split_manifest.read_text(encoding='utf-8'))
+    scene_id = _dtu_scene_id(key.scene)
+    if scene_id not in set(map(int, split_payload.get('splits', {}).get(key.split, ()))):
         raise AuditError('sample scene/split is not present in split manifest')
     try:
-        scene_record = frozen['scenes'][key.scene]
-        ply_path = Path(scene_record['ply_path'])
-        expected = scene_record['ply_sha256']
+        expected_views = tuple(map(int, split_payload['views'][str(scene_id)]))
     except KeyError as exc:
-        raise AuditError(f'frozen materialization missing {exc.args[0]}') from exc
-    actual = _file_sha256(ply_path)
-    if actual != expected:
-        raise AuditError('official DTU source digest mismatch')
+        raise AuditError(f'split manifest missing frozen views for scene {scene_id}') from exc
+    scene_record = next(
+        (
+            row for row in frozen.get('dtu', ())
+            if int(row.get('scene_id')) == scene_id and str(row.get('split')) == key.split
+        ),
+        None,
+    )
+    if scene_record is None:
+        raise AuditError('sample scene/split is not present in materialization manifest')
+    if tuple(map(int, scene_record['cameras'])) != expected_views:
+        raise AuditError('materialized camera views do not match frozen FPS order')
+    points_asset = scene_record['points']
+    mask_asset = scene_record['mask']
+    points_path = Path(str(points_asset['path']))
+    mask_path = Path(str(mask_asset['path']))
+    from .prepared_inputs import parse_dtu_binary_ply
+
+    try:
+        points = parse_dtu_binary_ply(points_path)
+    except Exception as exc:  # pragma: no cover - concrete parser exception is from preparation layer
+        raise AuditError(f'official DTU PLY is not the frozen binary format: {points_path}') from exc
+    camera_centers = []
+    camera_digests: dict[str, str] = {}
+    for view in expected_views:
+        asset = scene_record['cameras'][str(view)]
+        camera_path = Path(str(asset['path']))
+        camera_digests[str(view)] = str(asset['raw_sha256'])
+        camera_centers.append(_dtu_camera_center(camera_path))
+    obs_mask, bb, res = _load_dtu_obsmask_mat(mask_path)
     return {
         'scene': key.scene,
+        'scene_id': scene_id,
         'split': key.split,
-        'ply_path': str(ply_path),
-        'ply_sha256': actual,
+        'view_ids': expected_views,
+        'gt_points': points,
+        'gt_camera_centers': np.vstack(camera_centers),
+        'obs_mask': obs_mask,
+        'obs_bb': bb,
+        'obs_res': res,
+        'provenance': {
+            'materialization_path': str(frozen_materialization),
+            'materialization_sha256': _file_sha256(frozen_materialization),
+            'split_view_manifest_path': str(split_manifest),
+            'split_view_manifest_sha256': _file_sha256(split_manifest),
+            'points_sha256': str(points_asset['raw_sha256']),
+            'mask_sha256': str(mask_asset['raw_sha256']),
+            'camera_sha256': camera_digests,
+        },
     }
+
+
+def _dtu_scene_id(scene: str) -> int:
+    text = str(scene)
+    if text.startswith('scan'):
+        text = text[4:]
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise AuditError(f'invalid DTU scene id: {scene}') from exc
+
+
+def _load_ascii_ply_xyz(path: Path) -> np.ndarray:
+    try:
+        with path.open('r', encoding='ascii') as handle:
+            first = handle.readline().strip()
+            if first != 'ply':
+                raise AuditError('DTU PLY must start with ply header')
+            vertex_count = None
+            while True:
+                line = handle.readline()
+                if not line:
+                    raise AuditError('DTU PLY header is incomplete')
+                stripped = line.strip()
+                if stripped.startswith('format') and stripped != 'format ascii 1.0':
+                    raise AuditError('DTU PLY loader currently requires ascii PLY')
+                if stripped.startswith('element vertex'):
+                    vertex_count = int(stripped.split()[-1])
+                if stripped == 'end_header':
+                    break
+            if vertex_count is None:
+                raise AuditError('DTU PLY missing vertex count')
+            points = []
+            for _ in range(vertex_count):
+                values = handle.readline().split()
+                if len(values) < 3:
+                    raise AuditError('DTU PLY vertex row is incomplete')
+                points.append([float(values[0]), float(values[1]), float(values[2])])
+    except OSError as exc:
+        raise AuditError(f'cannot read DTU PLY: {path}') from exc
+    return _points_array(points, 'gt_points')
+
+
+def _dtu_camera_center(path: Path) -> np.ndarray:
+    try:
+        matrix = np.loadtxt(path, dtype=np.float64)
+    except OSError as exc:
+        raise AuditError(f'cannot read DTU camera: {path}') from exc
+    if matrix.shape != (3, 4) or not np.all(np.isfinite(matrix)):
+        raise AuditError('DTU camera must be a finite 3x4 projection matrix')
+    _, _, vh = np.linalg.svd(matrix)
+    homogeneous = vh[-1]
+    if abs(float(homogeneous[-1])) < 1e-12:
+        raise AuditError('DTU camera projection has no finite center')
+    center = homogeneous[:3] / homogeneous[-1]
+    return _points_array([center], 'gt_camera_center')[0]
+
+
+def _load_dtu_obsmask_mat(path: Path) -> tuple[np.ndarray, np.ndarray, float]:
+    try:
+        import scipy.io
+
+        payload = scipy.io.loadmat(path)
+    except Exception as exc:  # pragma: no cover - exact scipy exception varies
+        raise AuditError(f'cannot read DTU ObsMask MAT: {path}') from exc
+    try:
+        obs_mask = np.asarray(payload['ObsMask'], dtype=bool)
+        bb = np.asarray(payload['BB'], dtype=np.float64)
+        res = float(np.asarray(payload['Res']).reshape(-1)[0])
+    except (KeyError, ValueError, TypeError) as exc:
+        raise AuditError('DTU ObsMask MAT must contain ObsMask, BB, and Res') from exc
+    if bb.shape != (2, 3):
+        raise AuditError('DTU ObsMask BB must have shape (2, 3)')
+    if obs_mask.ndim != 3 or not math.isfinite(res) or res <= 0:
+        raise AuditError('DTU ObsMask payload has invalid volume or Res')
+    return obs_mask, bb, res
