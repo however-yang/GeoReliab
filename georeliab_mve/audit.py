@@ -16,6 +16,8 @@ import numpy as np
 from .contracts import AuditRecord, PredictionArtifact, RunManifest, RunMode, ScientificValidity, read_json_artifact, validate_artifact_bundle, write_json_artifact
 from .gates import (
     DownstreamHarmEvidence,
+    GEORELIAB_FAILURE_AUROC_THRESHOLD,
+    GEORELIAB_RHO_DECLINE_THRESHOLD,
     GeoReliabConditionEvidence,
     GeoReliabGateInput,
     ZeroUpdateEvidence,
@@ -145,6 +147,9 @@ class GeoReliabEvidencePayload:
             zero_update=self.zero_update,
             run_mode=self.run_mode,
             evidence_schema_version=self.evidence_schema_version,
+            split=self.split,
+            schedule_counts=dict(self.schedule_counts),
+            downstream_schedule_counts=dict(self.statistics.get('downstream_schedule_counts', {})),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -498,11 +503,12 @@ def build_condition_evidence(
     clean_mean = fmean(rhos['clean'].values())
     severity_means = tuple(fmean(rhos[str(index)].values()) for index in (1, 2, 3))
     if clean_mean >= 0.2:
-        relative_ci_lower = _relative_decline_bootstrap_ci(
+        relative_ci_lower, _, relative_raw_p = _relative_decline_bootstrap_ci(
             rhos['clean'], rhos['3'], n_resamples=n_resamples, seed=seed + 11
-        )[0]
+        )
     else:
         relative_ci_lower = None
+        relative_raw_p = None
     auroc = scene_auroc_branch(
         {
             scene: (record['failure'], record['risk'])
@@ -523,6 +529,11 @@ def build_condition_evidence(
         gt_geometry_invariant=gt_geometry_invariant,
         relative_decline_ci_lower=relative_ci_lower,
         failure_auroc_ci_upper=auroc.ci_upper,
+        scene_ids=tuple(sorted(first_scenes)),
+        scene_count=len(first_scenes),
+        n_resamples=n_resamples,
+        relative_decline_raw_p=relative_raw_p,
+        failure_auroc_raw_p=None,
     )
 
 
@@ -536,7 +547,7 @@ def _relative_decline_bootstrap_ci(
     *,
     n_resamples: int,
     seed: int,
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
     if set(clean) != set(severity3):
         raise AuditError('relative decline requires paired scene keys')
     scenes = sorted(clean)
@@ -548,7 +559,12 @@ def _relative_decline_bootstrap_ci(
         s3_mean = fmean(severity3[scene] for scene in sampled)
         estimates.append((clean_mean - s3_mean) / clean_mean if clean_mean >= 0.2 else float('-inf'))
     estimates.sort()
-    return (estimates[int(0.025 * (n_resamples - 1))], estimates[int(0.975 * (n_resamples - 1))])
+    raw_p = sum(value <= GEORELIAB_RHO_DECLINE_THRESHOLD for value in estimates) / len(estimates)
+    return (
+        estimates[int(0.025 * (n_resamples - 1))],
+        estimates[int(0.975 * (n_resamples - 1))],
+        raw_p,
+    )
 
 
 def fit_diagnostic_calibration(
@@ -798,10 +814,48 @@ def evaluate_zero_update_gain(
 
 
 def _condition_from_dict(item: Mapping[str, Any]) -> GeoReliabConditionEvidence:
-    if 'severity_rhos' in item and isinstance(item['severity_rhos'], list):
+    if any(key in item and isinstance(item[key], list) for key in ('severity_rhos', 'scene_ids', 'branch_reason_codes')):
         item = dict(item)
-        item['severity_rhos'] = tuple(item['severity_rhos'])
+        for key in ('severity_rhos', 'scene_ids', 'branch_reason_codes'):
+            if key in item and isinstance(item[key], list):
+                item[key] = tuple(item[key])
     return GeoReliabConditionEvidence(**dict(item))
+
+
+def _with_holm_metadata(
+    conditions: Sequence[GeoReliabConditionEvidence],
+) -> tuple[GeoReliabConditionEvidence, ...]:
+    p_values: dict[str, float] = {}
+    for item in conditions:
+        prefix = f'{item.model}:{item.corruption}'
+        if item.relative_decline_raw_p is not None:
+            p_values[f'{prefix}:relative_decline'] = item.relative_decline_raw_p
+        if item.failure_auroc_raw_p is not None:
+            p_values[f'{prefix}:failure_auroc'] = item.failure_auroc_raw_p
+    if not p_values:
+        return tuple(conditions)
+    adjusted = holm_primary_comparisons(p_values)
+    patched = []
+    for item in conditions:
+        values = item.to_dict()
+        rel_key = f'{item.model}:{item.corruption}:relative_decline'
+        auroc_key = f'{item.model}:{item.corruption}:failure_auroc'
+        reasons = list(item.branch_reason_codes)
+        if rel_key in adjusted:
+            values['relative_decline_adjusted_p'] = adjusted[rel_key].adjusted_p
+            values['relative_decline_holm_rejected'] = adjusted[rel_key].rejected
+            if adjusted[rel_key].rejected:
+                reasons.append('RELATIVE_DECLINE_HOLM_SUPPORTED')
+        if auroc_key in adjusted:
+            values['failure_auroc_adjusted_p'] = adjusted[auroc_key].adjusted_p
+            values['failure_auroc_holm_rejected'] = adjusted[auroc_key].rejected
+            if adjusted[auroc_key].rejected:
+                reasons.append('FAILURE_AUROC_HOLM_SUPPORTED')
+        values['branch_reason_codes'] = tuple(sorted(set(reasons)))
+        values['severity_rhos'] = tuple(values['severity_rhos'])
+        values['scene_ids'] = tuple(values['scene_ids'])
+        patched.append(GeoReliabConditionEvidence(**values))
+    return tuple(patched)
 
 
 def build_georeliab_evidence(
@@ -822,6 +876,7 @@ def build_georeliab_evidence(
     mode = RunMode(run_mode)
     if mode is not RunMode.REAL or split != 'test' or evidence_schema_version != '1.1':
         raise AuditError('GeoReliab gate evidence must be schema-v1.1 REAL test evidence')
+    condition_evidence = _with_holm_metadata(tuple(condition_evidence))
     provisional = GeoReliabGateInput(
         scientific_validity=ScientificValidity.SCIENTIFIC,
         required_models_ready=tuple(required_models_ready),
@@ -832,6 +887,9 @@ def build_georeliab_evidence(
         zero_update=(),
         run_mode=mode,
         evidence_schema_version=evidence_schema_version,
+        split=split,
+        schedule_counts=dict(schedule_counts or {}),
+        downstream_schedule_counts={},
     )
     from .gates import evaluate_georeliab_gate
 
@@ -893,6 +951,52 @@ def load_georeliab_evidence_input(path: Path) -> GeoReliabEvidencePayload:
     )
 
 
+def load_stage_evidence_manifest(path: Path) -> GeoReliabEvidencePayload:
+    payload = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(payload, dict) or payload.get('schema_version') != 'stage-evidence-v1':
+        raise AuditError('stage evidence manifest requires schema_version stage-evidence-v1')
+    bundle_index = payload.get('bundle_index')
+    if not isinstance(bundle_index, list) or not bundle_index:
+        raise AuditError('stage evidence manifest requires a non-empty validated bundle_index')
+    for item in bundle_index:
+        if not isinstance(item, dict) or not item.get('scene_summary_sha256') or not item.get('scene_summary_path'):
+            raise AuditError('bundle_index entries must bind scene_summary path and sha256')
+        scene_path = Path(item['scene_summary_path'])
+        if _file_sha256(scene_path) != item['scene_summary_sha256']:
+            raise AuditError('stage evidence scene summary digest mismatch')
+    payload = dict(payload)
+    payload.setdefault('run_mode', 'real')
+    payload.setdefault('split', 'test')
+    payload.setdefault('evidence_schema_version', '1.1')
+    return load_georeliab_evidence_payload(payload)
+
+
+def load_georeliab_evidence_payload(payload: Mapping[str, Any]) -> GeoReliabEvidencePayload:
+    mode = RunMode(payload.get('run_mode'))
+    split = payload.get('split')
+    schema = payload.get('evidence_schema_version', '1.1')
+    conditions = tuple(_condition_from_dict(item) for item in payload.get('conditions', ()))
+    harm = tuple(DownstreamHarmEvidence(**item) for item in payload.get('downstream_harm', ()))
+    zero = tuple(ZeroUpdateEvidence(**item) for item in payload.get('zero_update', ()))
+    return build_georeliab_evidence(
+        condition_evidence=conditions,
+        downstream_harm=harm,
+        zero_update=zero,
+        required_models_ready=payload.get('required_models_ready', ('VGGT', 'MASt3R')),
+        required_datasets_ready=bool(payload.get('required_datasets_ready', True)),
+        tartanair_native_fog_sanity=bool(payload.get('tartanair_native_fog_sanity', True)),
+        run_mode=mode,
+        split=split,
+        evidence_schema_version=schema,
+        schedule_counts=payload.get('schedule_counts', {}),
+        invalid_counts=payload.get('invalid_counts', {}),
+        statistics={
+            **dict(payload.get('statistics', {})),
+            'downstream_schedule_counts': dict(payload.get('downstream_schedule_counts', {})),
+        },
+    )
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open('rb') as handle:
@@ -941,35 +1045,50 @@ def write_dense_audit_bundle(
     bb_values = np.asarray(list(obs_bb), dtype=np.float64)
     if bb_values.shape != (6,):
         raise AuditError('obs-bb must provide six comma-separated values')
-    result = audit_prediction_arrays(
-        points_world=geometry['points_world'],
-        pred_camera_centers=camera_centers,
-        gt_camera_centers=gt_cameras,
-        raw_confidence=confidence['raw_confidence'],
-        risk=-np.log(np.maximum(np.asarray(confidence['raw_confidence'], dtype=np.float64), 1e-12)),
-        valid_mask=mask['valid_mask'],
-        gt_points=gt_points,
-        observability_mask=obs_mask,
-        observability_bb=bb_values.reshape(2, 3),
-        observability_res=obs_res,
-    )
+    if prediction.invalid_prediction:
+        result = audit_prediction_arrays(
+            points_world=np.empty((0, 3)),
+            pred_camera_centers=np.empty((0, 3)),
+            gt_camera_centers=np.empty((0, 3)),
+            raw_confidence=np.empty((0,)),
+            risk=np.empty((0,)),
+            valid_mask=np.empty((0,), dtype=bool),
+            gt_points=np.empty((0, 3)),
+            observability_mask=np.empty((0,), dtype=bool),
+            invalid_prediction=True,
+        )
+    else:
+        result = audit_prediction_arrays(
+            points_world=geometry['points_world'],
+            pred_camera_centers=camera_centers,
+            gt_camera_centers=gt_cameras,
+            raw_confidence=confidence['raw_confidence'],
+            risk=model_risk_from_confidence(manifest.model, confidence['raw_confidence']),
+            valid_mask=mask['valid_mask'],
+            gt_points=gt_points,
+            observability_mask=obs_mask,
+            observability_bb=bb_values.reshape(2, 3),
+            observability_res=obs_res,
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     dense_path = output_dir / 'dense_audit.npz'
+    dense_gt_error = result.gt_error if not prediction.invalid_prediction else np.empty((0,), dtype=np.float64)
+    dense_failure = result.failure_label if not prediction.invalid_prediction else np.empty((0,), dtype=bool)
     np.savez(
         dense_path,
         voxel_points=result.voxel_points,
         raw_confidence=result.raw_confidence,
         risk=result.risk,
-        gt_error=result.gt_error,
-        failure_label=result.failure_label,
+        gt_error=dense_gt_error,
+        failure_label=dense_failure,
         provenance_count=result.provenance_count,
     )
     audit = AuditRecord(
         run_id=manifest.run_id,
         sample_key=prediction.sample_key,
-        gt_error=float(np.median(result.gt_error)) if len(result.gt_error) else None,
+        gt_error=1e12 if prediction.invalid_prediction else float(np.median(result.gt_error)),
         failure_label=bool(np.any(result.failure_label)) if len(result.failure_label) else True,
-        selection_score=float(np.median(result.risk)) if len(result.risk) else float('inf'),
+        selection_score=float(np.median(result.risk)) if len(result.risk) else 1e12,
         coverage=1.0,
         accepted=not prediction.invalid_prediction,
         downstream_outcome=result.summary['fscore_2mm'],
@@ -1011,7 +1130,8 @@ def dtu_observability_mask_for_points(
         raise AuditError('DTU BB must have shape (2, 3)')
     if not math.isfinite(float(res)) or float(res) <= 0:
         raise AuditError('DTU Res must be finite and positive')
-    indices = np.rint((values - bounds[0]) / float(res)).astype(np.int64)
+    xyz_indices = np.rint((values - bounds[0]) / float(res)).astype(np.int64)
+    indices = xyz_indices[:, [1, 0, 2]]
     inside = np.all((indices >= 0) & (indices < np.asarray(volume.shape)), axis=1)
     result = np.zeros(len(values), dtype=bool)
     valid_indices = indices[inside]
@@ -1019,3 +1139,44 @@ def dtu_observability_mask_for_points(
         valid_indices[:, 0], valid_indices[:, 1], valid_indices[:, 2]
     ]
     return result
+
+
+def model_risk_from_confidence(model: str, raw_confidence: Any) -> np.ndarray:
+    confidence = _vector(raw_confidence, 'raw_confidence')
+    if model == 'VGGT':
+        return -np.log(np.maximum(confidence - 1.0, 1e-12))
+    if model == 'MASt3R':
+        return -np.log(np.maximum(confidence, 1e-12))
+    raise AuditError(f'unknown model for native confidence risk conversion: {model}')
+
+
+def load_official_dtu_evidence(
+    *,
+    sample_key: str,
+    frozen_materialization: Path,
+    split_manifest: Path,
+) -> dict[str, Any]:
+    from .contracts import SampleKey
+
+    key = SampleKey.parse(sample_key)
+    if key.dataset != 'dtu':
+        raise AuditError('official DTU evidence requires dtu sample_key')
+    frozen = json.loads(frozen_materialization.read_text(encoding='utf-8'))
+    splits = json.loads(split_manifest.read_text(encoding='utf-8'))
+    if key.scene not in splits.get(key.split, []):
+        raise AuditError('sample scene/split is not present in split manifest')
+    try:
+        scene_record = frozen['scenes'][key.scene]
+        ply_path = Path(scene_record['ply_path'])
+        expected = scene_record['ply_sha256']
+    except KeyError as exc:
+        raise AuditError(f'frozen materialization missing {exc.args[0]}') from exc
+    actual = _file_sha256(ply_path)
+    if actual != expected:
+        raise AuditError('official DTU source digest mismatch')
+    return {
+        'scene': key.scene,
+        'split': key.split,
+        'ply_path': str(ply_path),
+        'ply_sha256': actual,
+    }

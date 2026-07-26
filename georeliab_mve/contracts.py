@@ -582,12 +582,20 @@ def validate_artifact_bundle(
     for key in ('raw_confidence', 'risk', 'gt_error', 'provenance_count', 'failure_label'):
         if dense[key].shape != (voxel_count,):
             raise ContractError(f'invalid-mask/confidence filtering drift in dense {key}')
+    if prediction.invalid_prediction:
+        if voxel_count != 0:
+            raise ContractError('invalid predictions require empty dense audit payload')
+        if not audit.failure_label or audit.accepted or audit.downstream_outcome != 0.0:
+            raise ContractError('invalid predictions must be failure, rejected, and F-score zero')
+    else:
+        if voxel_count == 0:
+            raise ContractError('valid predictions require non-empty dense audit payload')
     for key in ('voxel_points', 'raw_confidence', 'risk', 'gt_error'):
         _require_finite_array(dense[key], f'dense_audit_uri:{key}')
     if dense['failure_label'].dtype != np.bool_:
         raise ContractError('dense failure_label must be boolean')
-    if not np.issubdtype(dense['provenance_count'].dtype, np.integer) or np.any(
-        dense['provenance_count'] < 1
+    if not np.issubdtype(dense['provenance_count'].dtype, np.integer) or (
+        voxel_count and np.any(dense['provenance_count'] < 1)
     ):
         raise ContractError('dense provenance_count must contain positive integers')
     if int(np.sum(dense['provenance_count'])) > int(np.count_nonzero(valid_mask)):

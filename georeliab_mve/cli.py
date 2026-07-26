@@ -37,7 +37,12 @@ from .readiness import assess_readiness
 from .prepare_cli import PREPARE_OPERATIONS, run_prepare_operation
 from .splits import validate_scene_disjoint
 from .statistics import holm_adjust, paired_scene_bootstrap, tost_equivalence
-from .audit import AuditError, load_georeliab_evidence_input, write_dense_audit_bundle
+from .audit import (
+    AuditError,
+    load_georeliab_evidence_input,
+    load_stage_evidence_manifest,
+    write_dense_audit_bundle,
+)
 
 
 DEFAULT_PROTOCOL = Path('configs/dual_mve_protocol.toml')
@@ -150,6 +155,9 @@ def _georeliab_input(payload: Mapping[str, Any]) -> GeoReliabGateInput:
             ZeroUpdateEvidence(**item)
             for item in _require_records(payload, 'zero_update')
         ),
+        split=payload.get('split', 'test'),
+        schedule_counts=dict(payload.get('schedule_counts', {})),
+        downstream_schedule_counts=dict(payload.get('downstream_schedule_counts', {})),
     )
 
 
@@ -318,6 +326,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     audit = subparsers.add_parser('audit-georeliab')
     audit.add_argument('--input', type=Path)
+    audit.add_argument('--stage-evidence', type=Path)
     audit.add_argument('--output', type=Path)
     audit.add_argument('--manifest', type=Path)
     audit.add_argument('--prediction', type=Path)
@@ -389,6 +398,20 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(payload, indent=2, sort_keys=True))
             return 0
         if args.command == 'audit-georeliab':
+            if args.stage_evidence is not None:
+                if args.output is None:
+                    raise ValueError('stage evidence audit requires --output')
+                evidence = load_stage_evidence_manifest(args.stage_evidence)
+                gate_input = evidence.to_gate_input()
+                georeliab = evaluate_georeliab_gate(gate_input)
+                payload = {
+                    'gate_input': evidence.to_dict(),
+                    'georeliab_gate': georeliab.to_dict(),
+                    'p5_skip_reason': evidence.p5_skip_reason,
+                }
+                _write_json(args.output, payload)
+                print(json.dumps(payload, indent=2, sort_keys=True))
+                return 0
             if args.manifest is not None:
                 required = (
                     args.prediction,

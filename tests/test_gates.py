@@ -84,6 +84,7 @@ def geometry_input(**overrides):
 
 
 def georeliab_input(**overrides):
+    scenes = tuple(f's{i:02d}' for i in range(20))
     conditions = tuple(
         GeoReliabConditionEvidence(
             model=model,
@@ -95,6 +96,12 @@ def georeliab_input(**overrides):
             cross_view_consistent=True,
             gt_geometry_invariant=True,
             relative_decline_ci_lower=0.60,
+            scene_ids=scenes,
+            scene_count=20,
+            n_resamples=10_000,
+            relative_decline_raw_p=0.001,
+            relative_decline_adjusted_p=0.006,
+            relative_decline_holm_rejected=True,
         )
         for model in ("VGGT", "MASt3R")
         for corruption in ("fog", "low-light-noise", "defocus")
@@ -105,13 +112,18 @@ def georeliab_input(**overrides):
         "required_datasets_ready": True,
         "tartanair_native_fog_sanity": True,
         "conditions": conditions,
-        "downstream_harm": (
-            DownstreamHarmEvidence("VGGT", "fog", -0.02, -0.01),
-            DownstreamHarmEvidence("MASt3R", "defocus", -0.03, -0.01),
+        "downstream_harm": tuple(
+            DownstreamHarmEvidence(model, f'{corruption}-s2', -0.02 if corruption in ('fog', 'defocus') else 0.01, -0.01 if corruption in ('fog', 'defocus') else 0.02)
+            for model in ("VGGT", "MASt3R")
+            for corruption in ("fog", "low-light-noise", "defocus")
         ),
-        "zero_update": (
-            ZeroUpdateEvidence("VGGT", "fog", 0.10, 0.01),
+        "zero_update": tuple(
+            ZeroUpdateEvidence(model, f'{corruption}-s2', 0.10 if model == 'VGGT' and corruption == 'fog' else 0.0, 0.01 if model == 'VGGT' and corruption == 'fog' else -0.01)
+            for model in ("VGGT", "MASt3R")
+            for corruption in ("fog", "low-light-noise", "defocus")
         ),
+        "schedule_counts": {'scheduled': 400, 'completed': 400, 'missing': 0, 'invalid': 0},
+        "downstream_schedule_counts": {'scheduled': 6, 'completed': 6, 'missing': 0},
     }
     fields.update(overrides)
     return GeoReliabGateInput(**fields)
@@ -186,14 +198,12 @@ def test_georeliab_all_three_gates_pass():
 def test_georeliab_point_estimate_without_ci_cannot_pass():
     no_ci = tuple(
         GeoReliabConditionEvidence(
-            model=item.model,
-            corruption=item.corruption,
-            clean_rho=item.clean_rho,
-            severity_rhos=item.severity_rhos,
-            failure_auroc=item.failure_auroc,
-            corruption_severity_monotonic=item.corruption_severity_monotonic,
-            cross_view_consistent=item.cross_view_consistent,
-            gt_geometry_invariant=item.gt_geometry_invariant,
+            **{
+                **item.to_dict(),
+                'relative_decline_ci_lower': None,
+                'relative_decline_adjusted_p': None,
+                'relative_decline_holm_rejected': False,
+            }
         )
         for item in georeliab_input().conditions
     )
@@ -205,15 +215,7 @@ def test_georeliab_point_estimate_without_ci_cannot_pass():
 def test_georeliab_ci_must_clear_threshold_not_touch_it():
     boundary = tuple(
         GeoReliabConditionEvidence(
-            model=item.model,
-            corruption=item.corruption,
-            clean_rho=item.clean_rho,
-            severity_rhos=item.severity_rhos,
-            failure_auroc=item.failure_auroc,
-            corruption_severity_monotonic=item.corruption_severity_monotonic,
-            cross_view_consistent=item.cross_view_consistent,
-            gt_geometry_invariant=item.gt_geometry_invariant,
-            relative_decline_ci_lower=0.50,
+            **{**item.to_dict(), 'relative_decline_ci_lower': 0.50}
         )
         for item in georeliab_input().conditions
     )
@@ -227,7 +229,7 @@ def test_georeliab_duplicate_harm_condition_does_not_satisfy_gate():
         georeliab_input(downstream_harm=(duplicate, duplicate))
     )
     assert result.status is GateStatus.FAIL
-    assert 'DOWNSTREAM_HARM_GATE_NOT_MET' in result.reason_codes
+    assert 'DOWNSTREAM_EXECUTION_GRID_INVALID' in result.reason_codes
 
 
 def test_georeliab_rejects_endpoint_only_severity_evidence():

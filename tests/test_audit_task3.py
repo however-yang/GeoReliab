@@ -292,7 +292,7 @@ def test_downstream_harm_and_zero_update_use_scene_pairs_and_predicted_alignment
         )
 
 
-def test_georeliab_evidence_short_circuits_p5_when_p4_fails():
+def test_georeliab_evidence_rejects_incomplete_p3_before_p4():
     payload = build_georeliab_evidence(
         condition_evidence=[],
         downstream_harm=[],
@@ -306,9 +306,9 @@ def test_georeliab_evidence_short_circuits_p5_when_p4_fails():
     )
     gate = evaluate_georeliab_gate(payload.to_gate_input())
     assert gate.status.value == 'FAIL'
-    assert payload.p5_skip_reason == 'P4_CONFIDENCE_PHENOMENON_GATE_FAILED'
+    assert payload.p5_skip_reason is None
     assert payload.statistics['holm_primary']['fog']['adjusted_p'] == pytest.approx(0.02)
-    assert gate.reason_codes == ('CONFIDENCE_FAILURE_GATE_NOT_MET',)
+    assert gate.reason_codes == ('P3_SCHEDULE_COUNTS_INVALID',)
 
 
 def test_audit_cli_rejects_smoke_and_writes_test_evidence(tmp_path: Path):
@@ -329,7 +329,8 @@ def test_audit_cli_rejects_smoke_and_writes_test_evidence(tmp_path: Path):
     written = json.loads((tmp_path / 'out.json').read_text(encoding='utf-8'))
     assert written['gate_input']['run_mode'] == 'real'
     assert written['gate_input']['evidence_schema_version'] == '1.1'
-    assert written['p5_skip_reason'] == 'P4_CONFIDENCE_PHENOMENON_GATE_FAILED'
+    assert written['p5_skip_reason'] is None
+    assert written['georeliab_gate']['reason_codes'] == ['P3_SCHEDULE_COUNTS_INVALID']
 
 
 def test_audit_cli_bundle_mode_writes_dense_npz_and_validated_audit(tmp_path: Path):

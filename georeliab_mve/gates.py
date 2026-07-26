@@ -344,6 +344,17 @@ class GeoReliabConditionEvidence:
     relative_decline_ci_lower: float | None = None
     failure_auroc_ci_upper: float | None = None
     extreme_ood_only: bool = False
+    scene_ids: tuple[str, ...] = ()
+    scene_count: int = 0
+    invalid_count: int = 0
+    n_resamples: int = 0
+    relative_decline_raw_p: float | None = None
+    relative_decline_adjusted_p: float | None = None
+    relative_decline_holm_rejected: bool = False
+    failure_auroc_raw_p: float | None = None
+    failure_auroc_adjusted_p: float | None = None
+    failure_auroc_holm_rejected: bool = False
+    branch_reason_codes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model:
@@ -375,6 +386,10 @@ class GeoReliabConditionEvidence:
             self.failure_auroc,
             self.relative_decline_ci_lower,
             self.failure_auroc_ci_upper,
+            self.relative_decline_raw_p,
+            self.relative_decline_adjusted_p,
+            self.failure_auroc_raw_p,
+            self.failure_auroc_adjusted_p,
         )
         if any(
             value is not None
@@ -398,6 +413,22 @@ class GeoReliabConditionEvidence:
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")
+        if self.scene_count < 0 or self.invalid_count < 0 or self.n_resamples < 0:
+            raise ValueError('scene_count, invalid_count, and n_resamples must be non-negative')
+        for name in ('relative_decline_holm_rejected', 'failure_auroc_holm_rejected'):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f'{name} must be boolean')
+        if any(not isinstance(item, str) or not item for item in self.scene_ids):
+            raise ValueError('scene_ids must contain non-empty strings')
+        if any(not isinstance(item, str) or not item for item in self.branch_reason_codes):
+            raise ValueError('branch_reason_codes must contain non-empty strings')
+
+    def to_dict(self) -> dict[str, Any]:
+        result = asdict(self)
+        result['severity_rhos'] = list(self.severity_rhos)
+        result['scene_ids'] = list(self.scene_ids)
+        result['branch_reason_codes'] = list(self.branch_reason_codes)
+        return result
 
     @property
     def severity3_rho(self) -> float:
@@ -426,11 +457,17 @@ class GeoReliabConditionEvidence:
             relative_decline > GEORELIAB_RHO_DECLINE_THRESHOLD
             and self.relative_decline_ci_lower is not None
             and self.relative_decline_ci_lower > GEORELIAB_RHO_DECLINE_THRESHOLD
+            and self.relative_decline_adjusted_p is not None
+            and self.relative_decline_adjusted_p <= 0.05
+            and self.relative_decline_holm_rejected
         )
         auroc_supported = (
             self.failure_auroc < GEORELIAB_FAILURE_AUROC_THRESHOLD
             and self.failure_auroc_ci_upper is not None
             and self.failure_auroc_ci_upper < GEORELIAB_FAILURE_AUROC_THRESHOLD
+            and self.failure_auroc_adjusted_p is not None
+            and self.failure_auroc_adjusted_p <= 0.05
+            and self.failure_auroc_holm_rejected
         )
         return relative_supported or auroc_supported
 
@@ -493,6 +530,9 @@ class GeoReliabGateInput:
     zero_update: tuple[ZeroUpdateEvidence, ...]
     run_mode: RunMode = RunMode.REAL
     evidence_schema_version: str = '1.1'
+    split: str = 'test'
+    schedule_counts: dict[str, int] = None
+    downstream_schedule_counts: dict[str, int] = None
 
 
 def evaluate_georeliab_gate(value: GeoReliabGateInput) -> GateDecision:
@@ -529,6 +569,33 @@ def evaluate_georeliab_gate(value: GeoReliabGateInput) -> GateDecision:
                 "ready_models": sorted(ready_models),
                 "required_datasets_ready": value.required_datasets_ready,
             },
+            scientific_validity=value.scientific_validity,
+        )
+
+    if value.split != 'test' or not _p3_schedule_counts_valid(value.schedule_counts):
+        return GateDecision(
+            lane='georeliab',
+            status=GateStatus.FAIL,
+            reason_codes=('P3_SCHEDULE_COUNTS_INVALID',),
+            details={'split': value.split, 'schedule_counts': value.schedule_counts or {}},
+            scientific_validity=value.scientific_validity,
+        )
+
+    condition_reason = _validate_georeliab_condition_grid(value.conditions)
+    if condition_reason is not None:
+        return GateDecision(
+            lane='georeliab',
+            status=GateStatus.FAIL,
+            reason_codes=(condition_reason,),
+            details={'condition_count': len(value.conditions)},
+            scientific_validity=value.scientific_validity,
+        )
+    if sum(item.invalid_count for item in value.conditions) != value.schedule_counts.get('invalid'):
+        return GateDecision(
+            lane='georeliab',
+            status=GateStatus.FAIL,
+            reason_codes=('INVALID_PROVENANCE_COUNTS_UNBOUND',),
+            details={'condition_invalid': sum(item.invalid_count for item in value.conditions), 'schedule_invalid': value.schedule_counts.get('invalid')},
             scientific_validity=value.scientific_validity,
         )
 
@@ -584,6 +651,23 @@ def evaluate_georeliab_gate(value: GeoReliabGateInput) -> GateDecision:
             },
             scientific_validity=value.scientific_validity,
         )
+    if not _p5_downstream_schedule_counts_valid(value.downstream_schedule_counts):
+        return GateDecision(
+            lane='georeliab',
+            status=GateStatus.FAIL,
+            reason_codes=('P5_DOWNSTREAM_SCHEDULE_COUNTS_INVALID',),
+            details={'downstream_schedule_counts': value.downstream_schedule_counts or {}},
+            scientific_validity=value.scientific_validity,
+        )
+    execution_reason = _validate_p5_execution_grid(value.downstream_harm, value.zero_update)
+    if execution_reason is not None:
+        return GateDecision(
+            lane='georeliab',
+            status=GateStatus.FAIL,
+            reason_codes=(execution_reason,),
+            details={'downstream_harm_count': len(value.downstream_harm), 'zero_update_count': len(value.zero_update)},
+            scientific_validity=value.scientific_validity,
+        )
     if not harm_pass:
         reason_codes.append("DOWNSTREAM_HARM_GATE_NOT_MET")
     if not zero_update_pass:
@@ -608,6 +692,61 @@ def evaluate_georeliab_gate(value: GeoReliabGateInput) -> GateDecision:
         },
         scientific_validity=value.scientific_validity,
     )
+
+
+def _p3_schedule_counts_valid(counts: dict[str, int] | None) -> bool:
+    if not isinstance(counts, dict):
+        return False
+    if counts.get('scheduled') != 400 or counts.get('completed') != 400 or counts.get('missing') != 0:
+        return False
+    invalid = counts.get('invalid')
+    return isinstance(invalid, int) and 0 <= invalid <= 400
+
+
+def _p5_downstream_schedule_counts_valid(counts: dict[str, int] | None) -> bool:
+    if not isinstance(counts, dict):
+        return False
+    return counts.get('scheduled') == 6 and counts.get('completed') == 6 and counts.get('missing') == 0
+
+
+def _validate_georeliab_condition_grid(
+    conditions: tuple[GeoReliabConditionEvidence, ...]
+) -> str | None:
+    expected_pairs = {
+        (model, corruption)
+        for model in GEORELIAB_MVE_REQUIRED_MODELS
+        for corruption in GEORELIAB_REQUIRED_CORRUPTIONS
+    }
+    observed_pairs = [(item.model, item.corruption) for item in conditions]
+    if len(observed_pairs) != len(expected_pairs) or set(observed_pairs) != expected_pairs:
+        return 'CONDITION_GRID_INVALID'
+    if len(set(observed_pairs)) != len(observed_pairs):
+        return 'CONDITION_GRID_INVALID'
+    scene_sets = {tuple(item.scene_ids) for item in conditions}
+    if len(scene_sets) != 1:
+        return 'CONDITION_SCENE_KEYS_INVALID'
+    for item in conditions:
+        if item.scene_count != 20 or len(item.scene_ids) != 20 or item.n_resamples != 10_000:
+            return 'CONDITION_PROVENANCE_INVALID'
+    return None
+
+
+def _validate_p5_execution_grid(
+    downstream_harm: tuple[DownstreamHarmEvidence, ...],
+    zero_update: tuple[ZeroUpdateEvidence, ...]
+) -> str | None:
+    expected = {
+        (model, f'{corruption}-s2')
+        for model in GEORELIAB_MVE_REQUIRED_MODELS
+        for corruption in GEORELIAB_REQUIRED_CORRUPTIONS
+    }
+    harm_pairs = [(item.model, item.condition) for item in downstream_harm]
+    zero_pairs = [(item.model, item.condition) for item in zero_update]
+    if len(harm_pairs) != 6 or set(harm_pairs) != expected or len(set(harm_pairs)) != 6:
+        return 'DOWNSTREAM_EXECUTION_GRID_INVALID'
+    if len(zero_pairs) != 6 or set(zero_pairs) != expected or len(set(zero_pairs)) != 6:
+        return 'ZERO_UPDATE_EXECUTION_GRID_INVALID'
+    return None
 
 def select_track(
     geometry: GateDecision, georeliab: GateDecision

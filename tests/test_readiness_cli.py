@@ -228,6 +228,7 @@ def test_gate_json_parser_requires_current_real_evidence_metadata():
 
 
 def test_cli_returns_success_when_georeliab_is_selected(tmp_path):
+    scenes = [f's{i:02d}' for i in range(20)]
     geometry = {
         'scientific_validity': 'SCIENTIFIC',
         'run_mode': 'real',
@@ -248,6 +249,12 @@ def test_cli_returns_success_when_georeliab_is_selected(tmp_path):
             'severity_rhos': [0.6, 0.4, 0.2],
             'failure_auroc': 0.7,
             'relative_decline_ci_lower': 0.6,
+            'scene_ids': scenes,
+            'scene_count': 20,
+            'n_resamples': 10000,
+            'relative_decline_raw_p': 0.001,
+            'relative_decline_adjusted_p': 0.006,
+            'relative_decline_holm_rejected': True,
             'corruption_severity_monotonic': True,
             'cross_view_consistent': True,
             'gt_geometry_invariant': True,
@@ -265,26 +272,26 @@ def test_cli_returns_success_when_georeliab_is_selected(tmp_path):
         'conditions': conditions,
         'downstream_harm': [
             {
-                'model': 'VGGT',
-                'condition': 'fog',
-                'effect_vs_random': -0.02,
-                'ci_upper': -0.01,
-            },
-            {
-                'model': 'MASt3R',
-                'condition': 'defocus',
-                'effect_vs_random': -0.03,
-                'ci_upper': -0.01,
-            },
+                'model': model,
+                'condition': f'{corruption}-s2',
+                'effect_vs_random': -0.02 if corruption in ('fog', 'defocus') else 0.01,
+                'ci_upper': -0.01 if corruption in ('fog', 'defocus') else 0.02,
+            }
+            for model in ('VGGT', 'MASt3R')
+            for corruption in ('fog', 'low-light-noise', 'defocus')
         ],
         'zero_update': [
             {
-                'model': 'VGGT',
-                'condition': 'fog',
-                'auroc_gain': 0.1,
-                'ci_lower': 0.01,
+                'model': model,
+                'condition': f'{corruption}-s2',
+                'auroc_gain': 0.10 if model == 'VGGT' and corruption == 'fog' else 0.0,
+                'ci_lower': 0.01 if model == 'VGGT' and corruption == 'fog' else -0.01,
             }
+            for model in ('VGGT', 'MASt3R')
+            for corruption in ('fog', 'low-light-noise', 'defocus')
         ],
+        'schedule_counts': {'scheduled': 400, 'completed': 400, 'missing': 0, 'invalid': 0},
+        'downstream_schedule_counts': {'scheduled': 6, 'completed': 6, 'missing': 0},
     }
     geometry_path = tmp_path / 'geometry.json'
     georeliab_path = tmp_path / 'georeliab.json'
