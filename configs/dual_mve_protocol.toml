@@ -1,0 +1,117 @@
+protocol_version = '1.0'
+generated = '2026-07-26'
+internal_freeze = '2026-09-15'
+official_cvpr_2027_deadline = 'TBA'
+bootstrap_resamples = 10000
+bootstrap_unit = 'scene-or-sequence'
+multiple_testing = 'Holm'
+
+[budgets]
+dual_mve_gpu_hours = 50
+geometry_full_gpu_hours = 160
+geometry_storage_tb = 1
+georeliab_full_gpu_hours = 400
+georeliab_storage_tb_min = 1
+georeliab_storage_tb_max = 5
+
+[geometry_gate]
+minimum_models = 2
+minimum_geometry_strata = 2
+delta_geom = 0.05
+recovery = 0.30
+equivalence_margin = 0.02
+matched_intervention_required = true
+zeroing_only_is_artifact = true
+
+[georeliab_gate]
+minimum_models = 2
+minimum_corruptions = 3
+rho_decline = 0.50
+rho_clean_magnitude_floor = 0.20
+failure_auroc = 0.65
+minimum_harm_model_conditions = 2
+zero_update_auroc_gain = 0.10
+
+[splits]
+required = ['dev', 'reference-token', 'calibration', 'test']
+scene_disjoint = true
+
+[geometry]
+model_order = ['Spatial-MLLM', 'SpatialStack', 'GUIDE']
+benchmarks = ['VSI-Bench', 'CVT-Bench']
+interventions = ['matched-scene-swap', 'spatial-permutation', 'mean-replacement', 'activation-patching']
+controls = ['fixed-rgb', 'fixed-prompt', 'fixed-decoder', 'fixed-seed', 'semantic-2d-control']
+
+[georeliab]
+model_order = ['VGGT', 'MASt3R', 'CUT3R']
+mve_dataset = 'DTU-20-scenes'
+corruptions = ['fog', 'low-light-noise', 'defocus']
+severity = [1, 2, 3]
+downstream_control = 'coverage-matched-random-filtering'
+
+[[resource]]
+name = 'spatial-mllm-checkpoint'
+kind = 'model-checkpoint'
+required = false
+source_url = 'https://github.com/THU-SI/Spatial-MLLM'
+
+[[resource]]
+name = 'spatialstack-checkpoint'
+kind = 'model-checkpoint'
+required = false
+source_url = 'https://spatial-stack.github.io/'
+
+[[resource]]
+name = 'guide-checkpoint'
+kind = 'model-checkpoint'
+required = false
+source_url = 'https://arxiv.org/abs/2604.05695'
+
+[[resource]]
+name = 'vsi-bench'
+kind = 'dataset'
+required = true
+
+[[resource]]
+name = 'cvt-bench'
+kind = 'dataset'
+required = true
+source_url = 'https://arxiv.org/abs/2603.21114'
+
+[[resource]]
+name = 'vggt-checkpoint'
+kind = 'model-checkpoint'
+required = false
+source_url = 'https://github.com/facebookresearch/vggt'
+
+[[resource]]
+name = 'mast3r-checkpoint'
+kind = 'model-checkpoint'
+required = false
+source_url = 'https://github.com/naver/mast3r'
+
+[[resource]]
+name = 'dtu-20-scenes'
+kind = 'dataset'
+required = true
+
+[[resource]]
+name = 'tartanair-native-fog'
+kind = 'sanity-dataset'
+required = true
+
+[[resource]]
+name = 'cut3r-checkpoint'
+kind = 'model-checkpoint'
+required = false
+source_url = 'https://github.com/CUT3R/CUT3R'
+
+[[resource_group]]
+name = 'geometry-model-candidates'
+members = ['spatial-mllm-checkpoint', 'spatialstack-checkpoint', 'guide-checkpoint']
+minimum_ready = 2
+
+[[resource_group]]
+name = 'georeliab-mve-models'
+members = ['vggt-checkpoint', 'mast3r-checkpoint']
+minimum_ready = 2

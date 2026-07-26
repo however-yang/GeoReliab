@@ -1,0 +1,340 @@
+'''Command-line entry points for protocol checks, dry-run, and gate evaluation.'''
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import platform
+import sys
+from typing import Any, Mapping
+
+from .contracts import (
+    AuditRecord,
+    PredictionArtifact,
+    RunManifest,
+    RunMode,
+    ScientificValidity,
+    SampleKey,
+    read_json_artifact,
+    validate_artifact_linkage,
+    write_json_artifact,
+)
+from .gates import (
+    DownstreamHarmEvidence,
+    GeometryEvidence,
+    GeometryGateInput,
+    GeoReliabConditionEvidence,
+    GeoReliabGateInput,
+    SelectedTrack,
+    ZeroUpdateEvidence,
+    evaluate_geometry_gate,
+    evaluate_georeliab_gate,
+    select_track,
+)
+from .protocol import ProtocolConfig
+from .readiness import assess_readiness
+from .splits import validate_scene_disjoint
+from .statistics import holm_adjust, paired_scene_bootstrap, tost_equivalence
+
+
+DEFAULT_PROTOCOL = Path('configs/dual_mve_protocol.toml')
+
+
+def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + '\n',
+        encoding='utf-8',
+    )
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(payload, dict):
+        raise ValueError(f'{path} must contain a JSON object')
+    return payload
+
+
+def _require_bool(payload: Mapping[str, Any], key: str) -> bool:
+    value = payload[key]
+    if type(value) is not bool:
+        raise ValueError(f'{key} must be a JSON boolean')
+    return value
+
+
+def _require_string_list(
+    payload: Mapping[str, Any], key: str
+) -> tuple[str, ...]:
+    value = payload[key]
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item for item in value
+    ):
+        raise ValueError(f'{key} must be a JSON array of non-empty strings')
+    return tuple(value)
+
+
+def _require_records(
+    payload: Mapping[str, Any], key: str
+) -> list[dict[str, Any]]:
+    value = payload[key]
+    if not isinstance(value, list) or any(
+        not isinstance(item, dict) for item in value
+    ):
+        raise ValueError(f'{key} must be a JSON array of objects')
+    return value
+
+
+def _geometry_input(payload: Mapping[str, Any]) -> GeometryGateInput:
+    return GeometryGateInput(
+        scientific_validity=ScientificValidity(payload['scientific_validity']),
+        reproducible_checkpoints=_require_string_list(
+            payload, 'reproducible_checkpoints'
+        ),
+        hookable_models=_require_string_list(payload, 'hookable_models'),
+        required_datasets_ready=_require_bool(payload, 'required_datasets_ready'),
+        fixed_inputs_verified=_require_bool(payload, 'fixed_inputs_verified'),
+        zeroing_effective=_require_bool(payload, 'zeroing_effective'),
+        matched_intervention_effective=_require_bool(
+            payload, 'matched_intervention_effective'
+        ),
+        evidence=tuple(
+            GeometryEvidence(**item)
+            for item in _require_records(payload, 'evidence')
+        ),
+    )
+
+
+def _georeliab_input(payload: Mapping[str, Any]) -> GeoReliabGateInput:
+    return GeoReliabGateInput(
+        scientific_validity=ScientificValidity(payload['scientific_validity']),
+        required_models_ready=_require_string_list(
+            payload, 'required_models_ready'
+        ),
+        required_datasets_ready=_require_bool(payload, 'required_datasets_ready'),
+        tartanair_native_fog_sanity=_require_bool(
+            payload, 'tartanair_native_fog_sanity'
+        ),
+        conditions=tuple(
+            GeoReliabConditionEvidence(**item)
+            for item in _require_records(payload, 'conditions')
+        ),
+        downstream_harm=tuple(
+            DownstreamHarmEvidence(**item)
+            for item in _require_records(payload, 'downstream_harm')
+        ),
+        zero_update=tuple(
+            ZeroUpdateEvidence(**item)
+            for item in _require_records(payload, 'zero_update')
+        ),
+    )
+
+
+def run_dry_run(protocol_path: Path, output_dir: Path) -> dict[str, Any]:
+    '''Exercise every local boundary without producing scientific evidence.'''
+
+    protocol = ProtocolConfig.load(protocol_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    splits = {
+        'dev': ['fixture-dev'],
+        'reference-token': ['fixture-reference'],
+        'calibration': ['fixture-calibration'],
+        'test': ['fixture-test'],
+    }
+    split_report = validate_scene_disjoint(splits)
+    sample_key = SampleKey(
+        dataset='fixture',
+        split='test',
+        scene='fixture-test',
+        view_set='views-0001',
+        condition='clean',
+        severity='0',
+        seed='0',
+    )
+    manifest = RunManifest(
+        run_id='DRYRUN-001',
+        mode=RunMode.FIXTURE,
+        scientific_validity=ScientificValidity.NON_SCIENTIFIC_FIXTURE,
+        model='fixture-model',
+        checkpoint_hash='fixture-not-a-checkpoint',
+        dataset='fixture',
+        split='test',
+        seed=0,
+        intervention_version='geometry-v1',
+        corruption_version='georeliab-c-v1',
+        environment={
+            'python': platform.python_version(),
+            'platform': platform.platform(),
+        },
+        rgb_digest='fixture-rgb-fixed',
+        prompt_digest='fixture-prompt-fixed',
+        decoder_digest='fixture-decoder-fixed',
+    )
+    prediction = PredictionArtifact(
+        run_id=manifest.run_id,
+        sample_key=str(sample_key),
+        geometry_prediction_uri='fixture://geometry/0001',
+        native_confidence_uri='fixture://confidence/0001',
+        valid_mask_uri='fixture://mask/0001',
+        hook_location='fixture.fusion.layer0',
+        runtime_seconds=0.0,
+        peak_memory_mb=0.0,
+    )
+    audit = AuditRecord(
+        run_id=manifest.run_id,
+        sample_key=str(sample_key),
+        gt_error=0.1,
+        failure_label=False,
+        selection_score=0.8,
+        coverage=1.0,
+        accepted=True,
+        downstream_outcome=0.5,
+        metadata={'fixture': 'true'},
+    )
+    validate_artifact_linkage(manifest, prediction, audit)
+    readiness = assess_readiness(
+        protocol.resources,
+        mode=RunMode.FIXTURE,
+        requirements=protocol.resource_groups,
+    )
+
+    bootstrap = paired_scene_bootstrap(
+        {'s1': 0.4, 's2': 0.5, 's3': 0.6, 's4': 0.7},
+        {'s1': 0.3, 's2': 0.4, 's3': 0.5, 's4': 0.6},
+        n_resamples=10_000,
+        seed=0,
+    )
+    tost = tost_equivalence(
+        {'s1': 0.001, 's2': -0.001, 's3': 0.002, 's4': -0.002}
+    )
+    holm = holm_adjust({'geometry': 0.01, 'georeliab': 0.04})
+
+    validity = ScientificValidity.NON_SCIENTIFIC_FIXTURE
+    geometry = evaluate_geometry_gate(
+        GeometryGateInput(
+            scientific_validity=validity,
+            reproducible_checkpoints=('fixture-a', 'fixture-b'),
+            hookable_models=('fixture-a', 'fixture-b'),
+            required_datasets_ready=True,
+            fixed_inputs_verified=True,
+            zeroing_effective=True,
+            matched_intervention_effective=True,
+            evidence=(),
+        )
+    )
+    georeliab = evaluate_georeliab_gate(
+        GeoReliabGateInput(
+            scientific_validity=validity,
+            required_models_ready=('fixture-a', 'fixture-b'),
+            required_datasets_ready=True,
+            tartanair_native_fog_sanity=True,
+            conditions=(),
+            downstream_harm=(),
+            zero_update=(),
+        )
+    )
+    selection = select_track(geometry, georeliab)
+
+    write_json_artifact(output_dir / 'run_manifest.json', manifest)
+    write_json_artifact(output_dir / 'prediction_artifact.json', prediction)
+    write_json_artifact(output_dir / 'audit_record.json', audit)
+    _write_json(output_dir / 'readiness.json', readiness.to_dict())
+    _write_json(output_dir / 'geometry_gate.json', geometry.to_dict())
+    _write_json(output_dir / 'georeliab_gate.json', georeliab.to_dict())
+    _write_json(output_dir / 'selection.json', selection.to_dict())
+    _write_json(
+        output_dir / 'statistics.json',
+        {
+            'bootstrap': bootstrap.to_dict(),
+            'tost': tost.to_dict(),
+            'holm': {name: result.to_dict() for name, result in holm.items()},
+        },
+    )
+    summary = {
+        'scientific_validity': validity.value,
+        'notice': 'NON-SCIENTIFIC fixture output; never cite as experiment evidence',
+        'selection': selection.selected_track.value,
+        'protocol_version': protocol.protocol_version,
+        'split_scene_count': split_report.total_scenes,
+        'output_dir': str(output_dir.resolve()),
+    }
+    _write_json(output_dir / 'dry_run_summary.json', summary)
+    return summary
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog='python -m georeliab_mve')
+    subparsers = parser.add_subparsers(dest='command', required=True)
+
+    dry_run = subparsers.add_parser('dry-run')
+    dry_run.add_argument('--protocol', type=Path, default=DEFAULT_PROTOCOL)
+    dry_run.add_argument('--output-dir', type=Path, required=True)
+
+    readiness = subparsers.add_parser('readiness')
+    readiness.add_argument('--protocol', type=Path, default=DEFAULT_PROTOCOL)
+
+    evaluate = subparsers.add_parser('evaluate-gates')
+    evaluate.add_argument('--geometry', type=Path, required=True)
+    evaluate.add_argument('--georeliab', type=Path, required=True)
+    evaluate.add_argument('--output', type=Path, required=True)
+
+    validate = subparsers.add_parser('validate-artifact')
+    validate.add_argument(
+        '--type',
+        choices=('manifest', 'prediction', 'audit'),
+        required=True,
+    )
+    validate.add_argument('path', type=Path)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if args.command == 'dry-run':
+            summary = run_dry_run(args.protocol, args.output_dir)
+            print(json.dumps(summary, indent=2, sort_keys=True))
+            return 0
+        if args.command == 'readiness':
+            protocol = ProtocolConfig.load(args.protocol)
+            report = assess_readiness(
+                protocol.resources,
+                mode=RunMode.REAL,
+                requirements=protocol.resource_groups,
+            )
+            print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+            return 0 if report.ready else 2
+        if args.command == 'evaluate-gates':
+            geometry = evaluate_geometry_gate(_geometry_input(_load_json(args.geometry)))
+            georeliab = evaluate_georeliab_gate(
+                _georeliab_input(_load_json(args.georeliab))
+            )
+            selection = select_track(geometry, georeliab)
+            payload = {
+                'geometry': geometry.to_dict(),
+                'georeliab': georeliab.to_dict(),
+                'selection': selection.to_dict(),
+            }
+            _write_json(args.output, payload)
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            if selection.selected_track in (
+                SelectedTrack.GEOMETRY,
+                SelectedTrack.GEORELIAB,
+            ):
+                return 0
+            if selection.selected_track is SelectedTrack.STOP:
+                return 1
+            return 2
+        if args.command == 'validate-artifact':
+            artifact_types = {
+                'manifest': RunManifest,
+                'prediction': PredictionArtifact,
+                'audit': AuditRecord,
+            }
+            read_json_artifact(args.path, artifact_types[args.type])
+            print(f'VALID {args.type}: {args.path}')
+            return 0
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
+        print(f'ERROR: {exc}', file=sys.stderr)
+        return 2
+    raise AssertionError('unreachable command')
