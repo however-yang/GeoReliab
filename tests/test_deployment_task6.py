@@ -121,6 +121,15 @@ def test_launch_script_exposes_p0_to_p6_and_runner_commands() -> None:
     assert 'require_stage_complete test 400' in text
 
 
+def test_overlay_value_uses_dependency_light_top_level_toml_import() -> None:
+    common = (ROOT / 'scripts' / 'a100' / 'common.sh').read_text(encoding='utf-8')
+    overlay_value = common.split('overlay_value() {', 1)[1].split('\nruntime_root()', 1)[0]
+    assert 'PYTHONNOUSERSITE=1 PYTHONPATH="$typing_site:$GEORELIAB_PROJECT_ROOT/georeliab_mve"' in overlay_value
+    assert 'import toml_compat as tomllib' in overlay_value
+    assert 'from georeliab_mve import toml_compat' not in overlay_value
+    assert 'from georeliab_mve import' not in overlay_value
+
+
 def test_scripts_pin_all_runtime_caches_off_home_and_mark_no_home_write() -> None:
     launch = (ROOT / 'scripts' / 'a100' / 'launch_stage.sh').read_text(encoding='utf-8')
     common = (ROOT / 'scripts' / 'a100' / 'common.sh').read_text(encoding='utf-8')
@@ -139,6 +148,9 @@ def test_scripts_pin_all_runtime_caches_off_home_and_mark_no_home_write() -> Non
     assert 'typing_extensions site must resolve to frozen package cache' in common
     assert 'validate_typing_extensions_runtime "$overlay"' in common
     assert 'PYTHONPATH="$typing_site:$GEORELIAB_PROJECT_ROOT"' in common
+    assert 'PYTHONPATH="$typing_site:$GEORELIAB_PROJECT_ROOT/georeliab_mve"' in common
+    assert 'import toml_compat as tomllib' in common
+    assert 'from georeliab_mve import toml_compat' not in common
     assert 'no_home_write_marker.json' in verify
     assert 'runtime.cache' in common
 

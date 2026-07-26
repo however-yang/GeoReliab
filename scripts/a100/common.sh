@@ -56,11 +56,11 @@ validate_typing_extensions_runtime() {
 overlay_value() {
   local overlay=$1 dotted=$2 typing_site
   typing_site=$(validate_typing_extensions_runtime "$overlay")
-  PYTHONNOUSERSITE=1 PYTHONPATH="$typing_site:$GEORELIAB_PROJECT_ROOT" \
+  PYTHONNOUSERSITE=1 PYTHONPATH="$typing_site:$GEORELIAB_PROJECT_ROOT/georeliab_mve" \
     "$(python_bin)" - "$overlay" "$dotted" <<'PY'
 import sys
 from pathlib import Path
-from georeliab_mve import toml_compat as tomllib
+import toml_compat as tomllib
 payload = tomllib.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
 value = payload
 for part in sys.argv[2].split('.'):
