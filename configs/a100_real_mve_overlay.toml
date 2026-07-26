@@ -3,13 +3,33 @@
 
 [runtime]
 root = '/srv/private/smli/GeoReliab'
-vggt_source = '/home/smli/VGGT'
-mast3r_source = '/home/smli/MASt3R'
+vggt_source = '/home/smli/workspace/vggt'
+mast3r_source = '/home/smli/workspace/external/mast3r'
+vggt_env = '/home/smli/miniforge3/envs/vggt_env'
+mast3r_env = '/home/smli/miniforge3/envs/surg_mast3r'
 
 [resources]
 dtu_sampleset_url = 'https://roboimagedata2.compute.dtu.dk/data/MVS/SampleSet.zip'
 dtu_points_url = 'https://roboimagedata2.compute.dtu.dk/data/MVS/Points.zip'
 dtu_rectified_url = 'https://roboimagedata2.compute.dtu.dk/data/MVS/Rectified.zip'
+dtu_sampleset_bytes = 6905656531
+dtu_sampleset_sha256 = 'f719a5259db9257c4716ce014964444c1bb82fbb893e0d100b5fa01b82c029c7'
+dtu_points_bytes = 6966262016
+dtu_points_sha256 = '85862c8844978e8958040982b0071442d2a47fe67391aa1aca9a743153c9edc1'
+dtu_rectified_bytes = 129593443783
+vggt_checkpoint = '/home/smli/models/vggt/model.pt'
+vggt_checkpoint_sha256 = 'd15bf50a8615c8225ed48b51ea5cac673d82442ec0309036df555a053253afe0'
+vggt_source_commit = 'a288dd0f14786c93483e45524328726ab7b1b4ce'
+mast3r_checkpoint_sha256 = '0a615eb05fa9db654050aa655945ee5696e7c6c1b7f93f1ee8c37249010f6feb'
+mast3r_source_commit = 'f5209afc300cec36239a7ac992263f36847bbba0'
+dust3r_source_commit = '3cc8c88c413bb9e34c41db0e0eef99c2ee010b12'
+croco_source_commit = 'd7de0705845239092414480bd829228723bf20de'
+mast3r_checkpoint = '/home/smli/models/mast3r/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric/model.safetensors'
+mast3r_config = '/home/smli/models/mast3r/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric/config.json'
+mast3r_config_sha256 = '718eb93dc4f9e4332b60cc0041af962d712cbd346d7770ce35c5b22cff68eae4'
+dtu_rectified_etag = '1e2c5f05c7-5652dcf644cb3'
+tartanair_hf_commit = '0d2d145e973832742a2aaa04b7d2ebffc8d82817'
+tartanair_depth_bytes = 21045555462
 tartanair_environment = 'GreatMarsh'
 tartanair_difficulty = 'easy'
 tartanair_trajectory = 'P000'

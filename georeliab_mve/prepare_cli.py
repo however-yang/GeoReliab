@@ -52,3 +52,4 @@ def run_prepare_operation(
     partial.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n', encoding='utf-8')
     partial.replace(state_path)
     return payload
+from .prepare_dispatch_round1 import run_prepare_operation  # noqa: E402

@@ -48,9 +48,9 @@ def download_tartanair_whole_archive(destination: Path, *, dry_run: bool = False
     # target_path kwargs. P000-bounded preparation must use range extraction.
     download(
         env='GreatMarsh',
-        difficulty='easy',
+        difficulty=['easy'],
         modality=['image', 'depth'],
-        camera_name='lcam_front',
+        camera_name=['lcam_front'],
         unzip=True,
         delete_zip=False,
     )

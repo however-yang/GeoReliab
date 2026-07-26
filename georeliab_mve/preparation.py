@@ -563,3 +563,13 @@ def acquire_tartanair_p000(destination: Path, *, dry_run: bool = False) -> Path:
     '''Compatibility wrapper: API is whole-archive; bounded P000 uses range ZIP extraction.'''
     from .tartanair import download_tartanair_whole_archive
     return download_tartanair_whole_archive(destination, dry_run=dry_run)
+
+# Review-round implementations keep the public API stable while making official
+# DTU source naming, render provenance, and manifest completeness fail closed.
+from .preparation_round1 import (  # noqa: E402
+    build_split_view_manifest, fog_render, low_light_noise_render,
+    parse_dtu_inventory, render_defocus, verify_dtu_scene,
+)
+from .overlay_round1 import A100Overlay  # noqa: E402
+from .archive_round1 import download_archive, verify_archive  # noqa: E402
+from .inventory_round1 import parse_dtu_inventory  # noqa: E402
