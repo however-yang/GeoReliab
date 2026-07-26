@@ -1,0 +1,22 @@
+# Deployment-only paths and identities for Task 2.  Scientific thresholds live
+# exclusively in dual_mve_protocol.toml and are rejected if copied here.
+
+[runtime]
+root = '/srv/private/smli/GeoReliab'
+vggt_source = '/home/smli/VGGT'
+mast3r_source = '/home/smli/MASt3R'
+
+[resources]
+dtu_sampleset_url = 'https://roboimagedata2.compute.dtu.dk/data/MVS/SampleSet.zip'
+dtu_points_url = 'https://roboimagedata2.compute.dtu.dk/data/MVS/Points.zip'
+dtu_rectified_url = 'https://roboimagedata2.compute.dtu.dk/data/MVS/Rectified.zip'
+tartanair_environment = 'GreatMarsh'
+tartanair_difficulty = 'easy'
+tartanair_trajectory = 'P000'
+tartanair_modalities = ['image', 'depth']
+tartanair_camera = 'lcam_front'
+
+[execution]
+device = 'cuda:0'
+download_resume = true
+archive_verify = 'zip-crc-and-central-directory'

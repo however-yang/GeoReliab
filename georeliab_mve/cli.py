@@ -34,6 +34,7 @@ from .gates import (
 )
 from .protocol import ProtocolConfig
 from .readiness import assess_readiness
+from .prepare_cli import PREPARE_OPERATIONS, run_prepare_operation
 from .splits import validate_scene_disjoint
 from .statistics import holm_adjust, paired_scene_bootstrap, tost_equivalence
 
@@ -306,6 +307,13 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     validate.add_argument('path', type=Path)
+    prepare = subparsers.add_parser('prepare-georeliab')
+    prepare.add_argument('--operation', choices=PREPARE_OPERATIONS, required=True)
+    prepare.add_argument('--data-root', type=Path, required=True)
+    prepare.add_argument('--state', type=Path, required=True)
+    prepare.add_argument('--overlay', type=Path)
+    prepare.add_argument('--dry-run', action='store_true')
+
     return parser
 
 
@@ -354,6 +362,16 @@ def main(argv: list[str] | None = None) -> int:
             }
             read_json_artifact(args.path, artifact_types[args.type])
             print(f'VALID {args.type}: {args.path}')
+            return 0
+        if args.command == 'prepare-georeliab':
+            payload = run_prepare_operation(
+                operation=args.operation,
+                data_root=args.data_root,
+                state_path=args.state,
+                dry_run=args.dry_run,
+                overlay_path=args.overlay,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
             return 0
     except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
         print(f'ERROR: {exc}', file=sys.stderr)
