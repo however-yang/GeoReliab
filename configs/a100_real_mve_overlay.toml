@@ -5,6 +5,8 @@
 root = '/srv/private/smli/GeoReliab'
 vggt_source = '/home/smli/workspace/vggt'
 mast3r_source = '/home/smli/workspace/external/mast3r'
+dust3r_source = '/home/smli/workspace/external/mast3r/dust3r'
+croco_source = '/home/smli/workspace/external/mast3r/dust3r/croco'
 vggt_env = '/home/smli/miniforge3/envs/vggt_env'
 mast3r_env = '/home/smli/miniforge3/envs/surg_mast3r'
 vggt_python = '3.10.20'

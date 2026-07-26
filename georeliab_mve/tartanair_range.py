@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 import struct
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 import urllib.request
 import zlib
 
@@ -141,22 +141,62 @@ def index_remote_zip(url: str) -> RemoteZipIndex:
     return RemoteZipIndex(total, etag or range_etag, entries, hashlib.sha256(raw).hexdigest())
 
 
-def extract_range_members(url: str, index: RemoteZipIndex, members: Sequence[str], destination: Path) -> dict[str, str]:
-    '''Fetch selected members atomically and verify ZIP compression, CRC, and size.'''
+def _read_and_verify_existing(path: Path, entry: RemoteZipEntry) -> str:
+    if path.stat().st_size != entry.uncompressed_size:
+        raise PreparationError(f'existing selected member has wrong size: {entry.name}')
+    digest = hashlib.sha256()
+    crc = 0
+    with path.open('rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+            crc = zlib.crc32(block, crc)
+    if crc & 0xffffffff != entry.crc32:
+        raise PreparationError(f'existing selected member has wrong CRC: {entry.name}')
+    return digest.hexdigest()
 
-    digests: dict[str, str] = {}
+
+def extract_range_members_evidence(
+    url: str, index: RemoteZipIndex, members: Sequence[str], destination: Path,
+) -> dict[str, dict[str, Any]]:
+    '''Fetch selected members atomically and retain ZIP/source evidence.'''
+
+    evidence: dict[str, dict[str, Any]] = {}
+    seen: set[str] = set()
     for name in members:
+        if name in seen:
+            raise PreparationError(f'duplicate selected ZIP member request: {name}')
+        seen.add(name)
         entry = index.entries.get(name)
         if entry is None or name.startswith('/') or '..' in Path(name).parts:
             raise PreparationError(f'requested range member is not a safe indexed ZIP member: {name}')
+        output = destination / name
+        if output.exists():
+            evidence[name] = _member_evidence(
+                entry, output, _read_and_verify_existing(output, entry), 'reused'
+            )
+            continue
         header, etag, total = _request_range(url, entry.local_offset, entry.local_offset + 29)
         if total != index.content_length or (index.etag and etag and index.etag != etag) or header[:4] != b'PK\x03\x04':
             raise PreparationError('archive changed or local ZIP header is invalid')
         name_len, extra_len = struct.unpack_from('<HH', header, 26)
+        local_name_raw, local_etag, local_total = _request_range(
+            url, entry.local_offset + 30, entry.local_offset + 29 + name_len,
+        )
+        if local_total != index.content_length or (index.etag and local_etag and index.etag != local_etag):
+            raise PreparationError('archive changed while verifying local ZIP member name')
+        try:
+            local_name = local_name_raw.decode('utf-8')
+        except UnicodeDecodeError as exc:
+            raise PreparationError('local ZIP member name is not UTF-8') from exc
+        if local_name != name:
+            raise PreparationError(f'central/local ZIP member name mismatch: {name} != {local_name}')
         data_start = entry.local_offset + 30 + name_len + extra_len
-        packed, etag, total = _request_range(url, data_start, data_start + entry.compressed_size - 1)
-        if total != index.content_length or (index.etag and etag and index.etag != etag):
-            raise PreparationError('archive changed during range member extraction')
+        if entry.compressed_size:
+            packed, etag, total = _request_range(url, data_start, data_start + entry.compressed_size - 1)
+            if total != index.content_length or (index.etag and etag and index.etag != etag):
+                raise PreparationError('archive changed during range member extraction')
+        else:
+            packed = b''
         if entry.compression == 0:
             data = packed
         elif entry.compression == 8:
@@ -165,10 +205,35 @@ def extract_range_members(url: str, index: RemoteZipIndex, members: Sequence[str
             raise PreparationError(f'unsupported ZIP compression for {name}: {entry.compression}')
         if len(data) != entry.uncompressed_size or zlib.crc32(data) & 0xffffffff != entry.crc32:
             raise PreparationError(f'ZIP integrity mismatch for selected member: {name}')
-        output = destination / name
         output.parent.mkdir(parents=True, exist_ok=True)
         partial = output.with_suffix(output.suffix + '.partial')
         partial.write_bytes(data)
+        digest = _read_and_verify_existing(partial, entry)
         partial.replace(output)
-        digests[name] = hashlib.sha256(data).hexdigest()
-    return digests
+        evidence[name] = _member_evidence(entry, output, digest, 'written')
+    return evidence
+
+
+def _member_evidence(
+    entry: RemoteZipEntry, path: Path, digest: str, disposition: str,
+) -> dict[str, Any]:
+    return {
+        'member': entry.name,
+        'path': str(path),
+        'compressed_size': entry.compressed_size,
+        'uncompressed_size': entry.uncompressed_size,
+        'crc32': f'{entry.crc32:08x}',
+        'raw_sha256': digest,
+        'disposition': disposition,
+    }
+
+
+def extract_range_members(url: str, index: RemoteZipIndex, members: Sequence[str], destination: Path) -> dict[str, str]:
+    '''Compatibility wrapper returning only raw SHA-256 digests.'''
+
+    return {
+        name: row['raw_sha256']
+        for name, row in extract_range_members_evidence(
+            url, index, members, destination
+        ).items()
+    }

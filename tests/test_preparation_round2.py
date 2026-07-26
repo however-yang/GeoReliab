@@ -15,12 +15,14 @@ from georeliab_mve.preparation import (
     calibration_qa,
     calibrate_corruptions,
 )
+from georeliab_mve.preparation_round2 import PreparedBatch
 
 
 def _overlay(path: Path) -> Path:
     path.write_text(
         "[runtime]\nroot = '/srv/private/smli/GeoReliab'\n"
         "vggt_source = '/home/smli/vggt'\nmast3r_source = '/home/smli/mast3r'\n"
+        "dust3r_source = '/home/smli/mast3r/dust3r'\ncroco_source = '/home/smli/mast3r/dust3r/croco'\n"
         "vggt_env = '/home/smli/env-vggt'\nmast3r_env = '/home/smli/env-mast3r'\nvggt_python = '3.10.20'\nvggt_torch = '2.3.1+cu121'\nmast3r_python = '3.10.20'\nmast3r_torch = '2.5.1+cu121'\n"
         "[resources]\n"
         "dtu_sampleset_url = 'https://example.test/SampleSet.zip'\n"
@@ -47,58 +49,104 @@ def _overlay(path: Path) -> Path:
     return path
 
 
-def _prepared_contract(root: Path) -> None:
-    prepared = root / 'prepared'
-    prepared.mkdir(parents=True)
-    image = np.linspace(0.1, 0.9, 64 * 64 * 3).reshape(64, 64, 3)
-    depth = np.tile(np.linspace(1.0, 4.0, 64), (64, 1))
-    records = []
-    calibration_ids = [115, 107, 82, 45, 117, 61, 127, 83, 56, 92]
-    for scene in calibration_ids:
-        rgb = prepared / f'{scene}_rgb.npy'
-        z = prepared / f'{scene}_depth.npy'
-        np.save(rgb, image)
-        np.save(z, depth)
-        records.append({'scene_id': scene, 'view_id': 1, 'sample_key': f'scan{scene}',
-                        'linear_rgb_npy': str(rgb), 'depth_npy': str(z),
-                        'raw_source_sha256': hashlib.sha256(rgb.read_bytes()).hexdigest(),
-                        'gt_digest': hashlib.sha256(z.read_bytes()).hexdigest()})
-    (prepared / 'calibration_inputs.json').write_text(json.dumps({'schema_version': 'prepared-input-v1', 'records': records}), encoding='utf-8')
-    (prepared / 'render_inputs.json').write_text(json.dumps({'schema_version': 'prepared-input-v1', 'records': records[:1]}), encoding='utf-8')
-    frames = []
-    for index in range(100):
-        rgb = prepared / f'tartan_{index}_rgb.npy'
-        z = prepared / f'tartan_{index}_depth.npy'
-        np.save(rgb, 1.0 / depth[..., None] * np.ones(3))
-        np.save(z, depth)
-        frames.append({'rgb_npy': str(rgb), 'depth_npy': str(z)})
-    (prepared / 'tartanair_p000_pairs.json').write_text(json.dumps({'schema_version': 'tartanair-p000-v1', 'pairs': frames}), encoding='utf-8')
-
-
 def test_calibration_qa_rejects_each_required_nonmonotonic_failure():
-    image = np.dstack([np.tile(np.linspace(0.1, 0.9, 64), (64, 1))] * 3)
-    depth = np.tile(np.linspace(1.0, 4.0, 64), (64, 1))
+    image = np.random.default_rng(7).uniform(0.1, 0.9, (64, 64, 3))
+    depth = np.tile(np.linspace(1.0, 8.0, 64), (64, 1))
     calibration = calibrate_corruptions([depth], [image])
-    valid = calibration_qa(calibration, [(1, image, depth, '0' * 64, '1' * 64)])
+    valid = calibration_qa(calibration, [(1, 1, image, depth, '0' * 64, '1' * 64)])
     assert valid['passed'] is True
     for key in ('fog', 'low_light', 'defocus', 'gt', 'cross_view', 'synthetic_fog'):
         broken = dict(valid)
         broken['checks'] = dict(valid['checks'])
         broken['checks'][key] = False
         with pytest.raises(CalibrationError, match=key):
-            calibration_qa(calibration, [(1, image, depth, '0' * 64, '1' * 64)], expected=broken)
+            calibration_qa(calibration, [(1, 1, image, depth, '0' * 64, '1' * 64)], expected=broken)
 
 
-def test_non_dry_preparation_calibration_rendering_and_sanity_have_success_paths(tmp_path):
+def test_calibration_qa_rejects_rank_invariant_fog_fixture():
+    '''A severity label cannot substitute for observed contrast degradation.'''
+    image = np.dstack([np.tile(np.linspace(0.1, 0.9, 64), (64, 1))] * 3)
+    depth = np.tile(np.linspace(1.0, 4.0, 64), (64, 1))
+    calibration = calibrate_corruptions([depth], [image])
+    with pytest.raises(CalibrationError, match='synthetic_fog'):
+        calibration_qa(
+            calibration,
+            [(1, 1, image, depth, '0' * 64, '1' * 64)],
+        )
+
+
+def test_non_dry_preparation_calibration_rendering_and_sanity_have_success_paths(monkeypatch, tmp_path):
+    import georeliab_mve.prepare_dispatch_round1 as dispatch
+
     root = tmp_path / 'data'
-    _prepared_contract(root)
+    prepared = root / 'prepared'
+    prepared.mkdir(parents=True)
+    for name in ('calibration_inputs.json', 'render_inputs.json', 'tartanair_p000_pairs.json'):
+        (prepared / name).write_text('{}', encoding='utf-8')
+    image = np.random.default_rng(9).uniform(0.1, 0.9, (64, 64, 3))
+    depth = np.tile(np.linspace(1.0, 8.0, 64), (64, 1))
+    calibration_records = tuple(
+        (scene, 1, f'calibration/scan{scene}/view1', image, depth, '0' * 64, '1' * 64)
+        for scene in (115, 107, 82, 45, 117, 61, 127, 83, 56, 92)
+    )
+    calibration_batch = PreparedBatch('calibration', 'calibration', '2' * 64, '3' * 64, calibration_records)
+    smoke_batch = PreparedBatch('smoke', 'dev', '2' * 64, '3' * 64, (calibration_records[0],))
+    monkeypatch.setattr(dispatch, 'load_prepared_batch', lambda path, expected_stage=None: calibration_batch if 'calibration' in path.name else smoke_batch)
+    def passing_qa(calibration, _records):
+        return {'schema_version': 'calibration-qa-v1', 'passed': True,
+                'checks': {'synthetic_fog': True},
+                'parameter_manifest_sha256': calibration.manifest().sha256,
+                'metrics': []}
+    monkeypatch.setattr(dispatch, 'calibration_qa', passing_qa)
+    monkeypatch.setattr(dispatch, 'load_tartanair_prepared_pairs', lambda _path: [
+        (f'{index:06d}', 1.0 / depth[..., None] * np.ones(3), depth)
+        for index in range(100)
+    ])
     state = tmp_path / 'state.json'
     calibration = run_prepare_operation(operation='calibration', data_root=root, state_path=state, dry_run=False, overlay_path=None)
-    assert calibration['resources_ready'] is True
+    assert calibration['resources_ready'] is False
     rendering = run_prepare_operation(operation='rendering', data_root=root, state_path=state, dry_run=False, overlay_path=None)
-    assert rendering['rendered_count'] == 9
+    assert rendering['rendered_count'] == 10
     sanity = run_prepare_operation(operation='sanity', data_root=root, state_path=state, dry_run=False, overlay_path=None)
     assert sanity['reason_code'] == 'TARTANAIR_NATIVE_FOG_SANITY'
+
+
+def test_test_render_lock_and_existing_artifacts_are_immutable(monkeypatch, tmp_path):
+    import georeliab_mve.prepare_dispatch_round1 as dispatch
+
+    root = tmp_path / 'data'
+    manifests = root / 'manifests'
+    prepared = root / 'prepared'
+    manifests.mkdir(parents=True)
+    prepared.mkdir()
+    image = np.random.default_rng(12).uniform(0.1, 0.9, (16, 16, 3))
+    depth = np.tile(np.linspace(1.0, 4.0, 16), (16, 1))
+    calibration = calibrate_corruptions([depth], [image])
+    calibration.manifest().write(manifests / 'corruption_calibration.json')
+    (manifests / 'corruption_calibration_qa.json').write_text(json.dumps({
+        'passed': True,
+        'parameter_manifest_sha256': calibration.manifest().sha256,
+        'split_view_manifest_sha256': '2' * 64,
+        'materialization_sha256': '3' * 64,
+    }), encoding='utf-8')
+    render_input = prepared / 'render_inputs.json'
+    render_input.write_text('{"frozen":true}', encoding='utf-8')
+    record = (1, 1, 'dtu/test/scan1/view1/clean/0/0', image, depth, '0' * 64, '1' * 64)
+    batch = PreparedBatch('test', 'test', '2' * 64, '3' * 64, (record,))
+    monkeypatch.setattr(dispatch, 'load_prepared_batch', lambda _path: batch)
+    first = dispatch._run_rendering(root)
+    assert first['written'] == 10 and first['reused'] == 0
+    second = dispatch._run_rendering(root)
+    assert second['written'] == 0 and second['reused'] == 10
+    original_input = render_input.read_text(encoding='utf-8')
+    render_input.write_text('{"frozen":false}', encoding='utf-8')
+    with pytest.raises(PreparationError, match='changed after freeze'):
+        dispatch._run_rendering(root)
+    render_input.write_text(original_input, encoding='utf-8')
+    rendered = next((root / 'rendered' / 'test').glob('*.png'))
+    rendered.write_bytes(b'tampered')
+    with pytest.raises(PreparationError, match='tampered'):
+        dispatch._run_rendering(root)
 
 
 def test_overlay_requires_every_frozen_identity(tmp_path):
@@ -123,23 +171,32 @@ def test_non_dry_download_verify_index_and_manifests_have_success_paths(monkeypa
         return destination
     def fake_verify(path, **kwargs):
         return {'path': str(path), 'bytes': kwargs.get('expected_bytes'), 'sha256': kwargs.get('expected_sha256', 'x'), 'entries': 1}
-    def fake_index(url):
-        if 'image' in url:
-            return RemoteZipIndex(2, '"image-etag"', {'a': object()}, 'a' * 64)
-        if 'depth' in url:
-            return RemoteZipIndex(2, 'W/"depth-etag"', {'a': object()}, 'b' * 64)
-        return RemoteZipIndex(2, '"etag"', {'a': object()}, 'c' * 64)
+    empty_indexes = {
+        name: RemoteZipIndex(2, 'etag', {}, 'a' * 64)
+        for name in ('Rectified.zip', 'tartanair-image', 'tartanair-depth')
+    }
+    remote_evidence = {'schema_version': 'remote-zip-evidence-v1',
+                       'remote_indexes': [], 'tartanair_selected_frame_ids': []}
     monkeypatch.setattr(dispatch, 'download_archive', fake_download)
     monkeypatch.setattr(dispatch, 'verify_archive', fake_verify)
-    monkeypatch.setattr(dispatch, 'index_remote_zip', fake_index)
-    assert run_prepare_operation(operation='download', data_root=root, state_path=state, dry_run=False, overlay_path=overlay)['resources_ready'] is True
+    monkeypatch.setattr(dispatch, 'validate_remote_indexes', lambda _resources: (remote_evidence, empty_indexes))
+    monkeypatch.setattr(dispatch, 'verify_frozen_overlay_identities', lambda **_kwargs: {'schema_version': 'frozen-runtime-identity-v1'})
+    assert run_prepare_operation(operation='download', data_root=root, state_path=state, dry_run=False, overlay_path=overlay)['resources_ready'] is False
     assert run_prepare_operation(operation='verify', data_root=root, state_path=state, dry_run=False, overlay_path=overlay)['resources_ready'] is True
 
     ids = list(range(1, 78)) + list(range(82, 129))
     scenes = tuple(DtuScene(scene, tuple(f'rect_{view:03d}_3_r5000.png' for view in range(1, 50)),
                      {view: np.array([float(view), 0.0, 1.0]) for view in range(1, 50)},
                      f'Points/stl/stl{scene:03d}_total.ply', f'ObsMask/ObsMask{scene}_10.mat') for scene in ids)
-    monkeypatch.setattr(dispatch, 'parse_dtu_inventory', lambda _: scenes)
-    assert run_prepare_operation(operation='index', data_root=root, state_path=state, dry_run=False, overlay_path=None)['scene_count'] == len(scenes)
-    manifest = run_prepare_operation(operation='manifests', data_root=root, state_path=state, dry_run=False, overlay_path=None)
+    provenance = {'schema_version': 'dtu-archive-inventory-provenance-v1', 'camera_members': {}, 'scenes': []}
+    monkeypatch.setattr(dispatch, 'build_dtu_archive_inventory', lambda *_args: (scenes, provenance))
+    assert run_prepare_operation(operation='index', data_root=root, state_path=state, dry_run=False, overlay_path=overlay)['scene_count'] == len(scenes)
+    def fake_materialize(**kwargs):
+        path = root / 'manifests' / 'frozen_materialization.json'
+        path.write_text('{}', encoding='utf-8')
+        return {'materialization_path': str(path), 'materialization_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                'dtu_scene_count': 45, 'dtu_rgb_count': 360, 'tartanair_pair_count': 100}
+    monkeypatch.setattr(dispatch, 'materialize_frozen_selection', fake_materialize)
+    monkeypatch.setattr(dispatch, 'verify_materialization_manifest', lambda *_args, **_kwargs: {})
+    manifest = run_prepare_operation(operation='manifests', data_root=root, state_path=state, dry_run=False, overlay_path=overlay)
     assert len(json.loads(Path(manifest['manifest_path']).read_text())['views']) == 45

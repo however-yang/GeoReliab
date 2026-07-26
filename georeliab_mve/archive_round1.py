@@ -44,6 +44,10 @@ def verify_archive(path: Path, *, required_entries: Sequence[str] = (), expected
 def download_archive(url: str, destination: Path, *, dry_run: bool = False, expected_bytes: int | None = None, expected_sha256: str | None = None) -> Path:
     if dry_run:
         return destination.with_suffix(destination.suffix + '.partial')
+    if destination.exists():
+        # A complete destination is immutable unless it proves its frozen identity.
+        verify_archive(destination, expected_bytes=expected_bytes, expected_sha256=expected_sha256)
+        return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_suffix(destination.suffix + '.partial')
     offset = partial.stat().st_size if partial.exists() else 0

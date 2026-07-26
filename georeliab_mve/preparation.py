@@ -572,5 +572,6 @@ from .inventory_round1 import parse_dtu_inventory  # noqa: E402
 # Round 2 provides the single public rendering and QA implementation.
 from .preparation_round2 import (  # noqa: E402
     CALIBRATION_SCENES, atomic_json, build_split_view_manifest, calibration_qa, fog_render,
-    load_prepared_records, low_light_noise_render, render_defocus, verify_dtu_scene,
+    load_prepared_batch, load_prepared_records, load_tartanair_prepared_pairs,
+    low_light_noise_render, render_defocus, verify_dtu_scene,
 )

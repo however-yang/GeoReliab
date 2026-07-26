@@ -36,7 +36,8 @@ def test_manifest_refuses_missing_any_frozen_scene_inventory():
 
 def test_low_light_metadata_contains_raw_and_png_digests():
     image = np.full((8, 8, 3), 0.5)
-    _, metadata = low_light_noise_render(image, 's', 1, severity=1, gt_digest=hashlib.sha256(image.tobytes()).hexdigest(), raw_source_sha256=hashlib.sha256(image.tobytes()).hexdigest())
+    calibration = calibrate_corruptions([np.ones((8, 8))], [image])
+    _, metadata = low_light_noise_render(image, 's', 1, severity=1, gt_digest=hashlib.sha256(image.tobytes()).hexdigest(), raw_source_sha256=hashlib.sha256(image.tobytes()).hexdigest(), calibration=calibration)
     assert metadata['raw_source_sha256'] == hashlib.sha256(image.tobytes()).hexdigest()
     assert len(metadata['rendered_png_sha256']) == 64
     assert len(metadata['parameter_manifest_sha256']) == 64
@@ -61,7 +62,7 @@ def test_overlay_rejects_nested_threshold_override(tmp_path):
 
 
 def test_prepare_non_dry_index_fails_closed_without_verified_inventory(tmp_path):
-    with pytest.raises(PreparationError, match='inventory'):
+    with pytest.raises(PreparationError, match='frozen A100 overlay'):
         run_prepare_operation(
             operation='index', data_root=tmp_path / 'missing',
             state_path=tmp_path / 'state.json', dry_run=False, overlay_path=None,
