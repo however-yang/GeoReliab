@@ -74,6 +74,7 @@ screen_prefix = 'georeliab'
 download_resume = true
 archive_verify = 'zip-crc-and-central-directory'
 gpu_hour_limit = 50
+preflight_gpu_hour_reservation = 2.0
 storage_tb_limit = 1
 max_storage_bytes = 1000000000000
 home_read_only = true

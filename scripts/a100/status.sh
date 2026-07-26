@@ -10,7 +10,7 @@ root=$(runtime_root "$overlay")
 enforce_storage_cap "$overlay"
 
 "$(orchestrator_python "$overlay")" - "$overlay" "$root" "$commit" <<'PY'
-import json, subprocess, sys
+import json, math, subprocess, sys
 from pathlib import Path
 
 overlay, root, commit = sys.argv[1:]
@@ -40,13 +40,39 @@ for path in sorted(root_path.glob('stage/**/*.json')) if (root_path / 'stage').e
         raw_schedule_counts.append({'path': str(path), 'schedule_counts': payload['schedule_counts'], 'status': payload.get('status')})
     if 'reason_code' in payload or 'reason_codes' in payload:
         reason_codes.append({'path': str(path), 'reason_code': payload.get('reason_code'), 'reason_codes': payload.get('reason_codes')})
-    identity = str(payload.get('artifact_sha256') or payload.get('prediction_sha256') or payload.get('sample_key') or path)
-    for key in ('runtime_seconds', 'runtime_sec'):
-        if isinstance(payload.get(key), (int, float)):
-            runtime_by_key[identity] = max(runtime_by_key.get(identity, 0.0), float(payload[key]))
     for key in ('peak_memory_mb', 'peak_memory_mib'):
         if isinstance(payload.get(key), (int, float)):
             peak_memory_mb = max(peak_memory_mb, float(payload[key]))
+
+ledger_paths = []
+ledger_parse_errors = []
+if (root_path / 'stage').exists():
+    ledger_paths.extend((root_path / 'stage').glob('*/ledger.jsonl'))
+if (root_path / 'preflight-real').exists():
+    ledger_paths.extend((root_path / 'preflight-real').glob('*/stage/*/ledger.jsonl'))
+for ledger in sorted(set(ledger_paths)):
+    try:
+        lines = ledger.read_text(encoding='utf-8').splitlines()
+    except OSError as exc:
+        ledger_parse_errors.append({'path': str(ledger), 'line': None, 'reason': f'read error: {exc}'})
+        continue
+    for index, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            ledger_parse_errors.append({'path': str(ledger), 'line': index, 'reason': f'JSON decode error: {exc}'})
+            continue
+        runtime = row.get('runtime_seconds')
+        if isinstance(runtime, bool) or not isinstance(runtime, (int, float)) or not math.isfinite(float(runtime)) or float(runtime) < 0.0:
+            ledger_parse_errors.append({'path': str(ledger), 'line': index, 'reason': f'invalid runtime_seconds: {runtime!r}'})
+            continue
+        key = f'{ledger}:{index}'
+        runtime_by_key[key] = float(runtime)
+        for memory_key in ('peak_memory_mb', 'peak_memory_mib'):
+            if isinstance(row.get(memory_key), (int, float)):
+                peak_memory_mb = max(peak_memory_mb, float(row[memory_key]))
 
 canonical_counts = {}
 try:
@@ -91,6 +117,8 @@ payload = {
     'project_commit': commit or None, 'screens': run(['screen', '-list']),
     'gpu': run(['nvidia-smi', '--query-gpu=index,name,utilization.gpu,memory.used,memory.total', '--format=csv,noheader']),
     'observed_gpu_hours': sum(runtime_by_key.values()) / 3600.0, 'peak_memory_mb': peak_memory_mb,
+    'budget_evidence_status': 'OK' if not ledger_parse_errors else 'UNAVAILABLE',
+    'ledger_parse_errors': ledger_parse_errors,
     'output_bytes': output_bytes, 'missing_count_tail_sum': count_field('missing'),
     'invalid_count_tail_sum': count_field('invalid'), 'canonical_schedule_counts': canonical_counts,
     'schedule_counts_tail': raw_schedule_counts[-20:], 'reason_codes_tail': reason_codes[-20:],

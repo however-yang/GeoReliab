@@ -58,6 +58,7 @@ def test_a100_overlay_freezes_paths_resources_and_limits() -> None:
     assert resources['mast3r_checkpoint_sha256'] == '0a615eb05fa9db654050aa655945ee5696e7c6c1b7f93f1ee8c37249010f6feb'
     assert resources['mast3r_config_sha256'] == '718eb93dc4f9e4332b60cc0041af962d712cbd346d7770ce35c5b22cff68eae4'
     assert execution['gpu_hour_limit'] == 50
+    assert execution['preflight_gpu_hour_reservation'] == 2.0
     assert execution['max_storage_bytes'] == 1_000_000_000_000
     assert execution['devices'] == ['cuda:0', 'cuda:1']
     assert execution['force_tmp_under_runtime'] is True
@@ -98,6 +99,10 @@ def test_launch_script_exposes_p0_to_p6_and_runner_commands() -> None:
     assert '--stage smoke --model all --device cuda:0 --shard 0/2' in text
     assert '--stage test --model all --device cuda:0 --shard 0/2' in text
     assert '--stage zero-update --model all' in text
+    assert 'require_native_gate_pass; enforce_stage_gpu_budget zero-update' in text
+    assert 'SHORT_CIRCUIT_P5' in text
+    assert 'require_stage_complete smoke 200' in text
+    assert 'require_stage_complete test 400' in text
 
 
 def test_scripts_pin_all_runtime_caches_off_home_and_mark_no_home_write() -> None:
@@ -124,17 +129,36 @@ def test_deploy_and_verify_are_idempotent_and_reject_correct_dirty_state() -> No
     assert 'diff --quiet HEAD --' in common
     assert 'write_immutable_file' in deploy
     assert 'write_immutable_file' in verify
+    assert '<<\'PY\' | write_immutable_file "$root" "$manifest"' in deploy
+    assert '<<\'PY\' | write_immutable_file "$root" "$lock_path"' in verify
     assert 'immutable artifact mismatch' in common
     assert 'mv -f' not in deploy
     assert 'mv -f' not in verify
 
 
+def test_every_stage_is_bound_to_clean_exact_commit_and_resource_budget() -> None:
+    launch = (ROOT / 'scripts' / 'a100' / 'launch_stage.sh').read_text(encoding='utf-8')
+    common = (ROOT / 'scripts' / 'a100' / 'common.sh').read_text(encoding='utf-8')
+    finalize = (ROOT / 'scripts' / 'a100' / 'finalize_p6.sh').read_text(encoding='utf-8')
+    assert 'assert_project_worktree_clean "$worktree" "$commit"' in launch
+    assert 'assert_project_worktree_clean "$worktree" "$commit"' in finalize
+    assert 'status --porcelain --untracked-files=all' in common
+    assert 'project worktree commit mismatch' in common
+    assert 'enforce_stage_gpu_budget preflight' in launch
+    assert 'enforce_stage_gpu_budget smoke' in launch
+    assert 'enforce_stage_gpu_budget test' in launch
+    assert 'BUDGET_ESTIMATE_UNAVAILABLE' in launch
+    assert 'BLOCKED_RESOURCE_BUDGET' in launch
+
+
 def test_status_reports_canonical_budget_relevant_observations() -> None:
     status = (ROOT / 'scripts' / 'a100' / 'status.sh').read_text(encoding='utf-8')
-    for token in ('observed_gpu_hours', 'peak_memory_mb', 'missing_count_tail_sum', 'invalid_count_tail_sum', 'canonical_schedule_counts', 'schedule_counts_tail', 'reason_codes_tail', 'output_bytes'):
+    for token in ('observed_gpu_hours', 'peak_memory_mb', 'budget_evidence_status', 'ledger_parse_errors', 'missing_count_tail_sum', 'invalid_count_tail_sum', 'canonical_schedule_counts', 'schedule_counts_tail', 'reason_codes_tail', 'output_bytes'):
         assert token in status
     assert 'stage_progress_counts' in status
     assert 'runtime_by_key' in status
+    assert "glob('*/ledger.jsonl')" in status
+    assert "glob('*/stage/*/ledger.jsonl')" in status
     assert 'enforce_storage_cap' in status
 
 
@@ -154,8 +178,22 @@ def test_p6_generates_fail_closed_evidence_bundle_and_one_page_decision_table() 
         'tartanair_p000_pairs.json', 'tartanair_native_fog_sanity.json',
         'official_resource_hashes', 'project_tree', 'worker_log_hashes',
         'p6_status_core.json', 'existing P6 bundle does not match current commit/native gate',
+        'P6 canonical schedule counts are UNAVAILABLE', "require_complete('smoke', 200)",
+        "require_complete('test', 400)", "require_complete('zero-update', 480)",
+        'P4 FAIL must short-circuit P5', 'P5_INVALID_SUBSET_PREDICTION',
+        'BLOCKED_RESOURCE_BUDGET', "gate.get('status') not in {'PASS', 'FAIL'}",
+        "'deployment': req", "rev-parse', 'HEAD^{tree}'",
+        "status.get('budget_evidence_status') != 'OK'", "status.get('ledger_parse_errors') != []",
     ):
         assert token in finalize
+
+
+def test_runbook_has_one_fail_closed_authoritative_p6_path() -> None:
+    text = (ROOT / 'docs' / 'A100_REAL_MVE_RUNBOOK.md').read_text(encoding='utf-8')
+    assert 'The only authoritative outputs are:' in text
+    assert '$ROOT/artifacts/p6_evidence_bundle.json' in text
+    assert 'bundle_path.write_text' not in text
+    assert "evidence_dir / 'p6_evidence_bundle.json'" not in text
 
 
 def test_prereqs_enforce_storage_cap_device_count_and_frozen_env_orchestrator() -> None:

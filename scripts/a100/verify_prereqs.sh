@@ -57,7 +57,7 @@ artifacts=$(overlay_value "$overlay" runtime.artifacts)
 lock_dir="$artifacts/environment_locks"
 mkdir_under_root "$root" "$lock_dir"
 lock_path="$lock_dir/a100_environment_lock.json"
-"$python" - "$overlay" <<'PY'
+"$python" - "$overlay" <<'PY' | write_immutable_file "$root" "$lock_path"
 import json, platform, subprocess, sys
 from pathlib import Path
 try:
@@ -82,7 +82,6 @@ out = {
 }
 print(json.dumps(out, indent=2, sort_keys=True))
 PY
-write_immutable_file "$root" "$lock_path"
 sha256sum "$lock_path" | write_immutable_file "$root" "$lock_path.sha256"
 printf '{"schema_version":"no-home-write-marker-v1","status":"ENFORCED","root":"%s"}\n' "$root" | write_immutable_file "$root" "$artifacts/no_home_write_marker.json"
 info "P0 prerequisites verified; environment lock: $lock_path"

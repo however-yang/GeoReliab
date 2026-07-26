@@ -346,86 +346,17 @@ cd "$WORKTREE"
 ./scripts/a100/launch_stage.sh "$OVERLAY" "$COMMIT" p6 cuda:0
 ```
 
-Then create the final bundle and one-page decision table:
+The canonical launcher runs `status.sh` and `finalize_p6.sh` itself. Do not hand-write,
+repair, or replace the final bundle: the finalizer rejects incomplete schedules,
+non-terminal gates, dirty/mismatched worktrees, unavailable resource evidence, and
+digest drift. The only authoritative outputs are:
 
-```bash
-cd "$WORKTREE"
-$PYTHON - <<'PY'
-from pathlib import Path
-import hashlib
-import json
-import os
+- `$ROOT/artifacts/p6_evidence_bundle.json`
+- `$ROOT/artifacts/p6_one_page_decision.md`
+- `$ROOT/artifacts/p6_one_page_decision.md.sha256`
 
-root = Path('/srv/private/smli/GeoReliab')
-commit = os.environ['COMMIT']
-evidence_dir = root / 'evidence'
-evidence_dir.mkdir(parents=True, exist_ok=True)
-
-def sha(path):
-    h = hashlib.sha256()
-    with path.open('rb') as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b''):
-            h.update(block)
-    return h.hexdigest()
-
-def load(path):
-    return json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
-
-paths = {
-    'deploy': root / 'artifacts/deploy' / f'{commit}.json',
-    'runtime_identity': root / 'evidence/frozen_runtime_identity.json',
-    'official_resources': root / 'evidence/official_resources.json',
-    'tartanair_sanity': root / 'evidence/tartanair_native_fog_sanity.json',
-    'split_view_manifest': root / 'manifests/split_view_manifest.json',
-    'materialization': root / 'manifests/frozen_materialization.json',
-    'prepared_writer': root / 'manifests/prepared_inputs_writer.json',
-    'calibration': root / 'manifests/corruption_calibration.json',
-    'calibration_qa': root / 'manifests/corruption_calibration_qa.json',
-    'test_render_lock': root / 'manifests/test_render_lock.json',
-    'stage_freeze': root / 'stage/test/stage_freeze.json',
-    'stage_evidence_p3': root / 'stage/test/stage_evidence_p3.json',
-    'native_gate': root / 'stage/test/native_phenomenon_gate.json',
-    'stage_evidence_full': root / 'stage/test/stage_evidence.json',
-    'p6_status': root / 'artifacts/p6_status.json',
-    'final_gate': root / 'evidence/georeliab_final_gate.json',
-    'p3_gate': root / 'evidence/georeliab_p3_gate.json',
-}
-artifacts = {name: {'path': str(path), 'sha256': sha(path)} for name, path in paths.items() if path.exists()}
-native_gate = load(paths['native_gate']) or {}
-full_gate = load(paths['final_gate']) or load(paths['p3_gate']) or {}
-status = load(paths['p6_status']) or {}
-
-bundle = {
-    'schema_version': 'georeliab-p6-evidence-bundle-v1',
-    'project_commit': commit,
-    'artifacts': artifacts,
-    'native_phenomenon_gate': native_gate,
-    'final_gate_output': full_gate,
-    'status_snapshot': status,
-    'selection_note': 'GeoReliab PASS remains GEORELIAB_PASS_PENDING_GEOMETRY / BLOCKED_PENDING_GEOMETRY until Geometry has terminal evidence.',
-}
-bundle_path = evidence_dir / 'p6_evidence_bundle.json'
-bundle_path.write_text(json.dumps(bundle, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-
-def table_row(field, value):
-    return f'| `{field}` | {value} |'
-rows = [
-    '| Field | Value |', '|---|---|',
-    table_row('project_commit', commit),
-    table_row('p4_status', native_gate.get('status', 'MISSING')),
-    table_row('p4_reason_codes', ', '.join(native_gate.get('reason_codes', [])) or native_gate.get('reason_code', '')),
-    table_row('p5_executed', 'yes' if paths['stage_evidence_full'].exists() else 'no'),
-    table_row('georeliab_gate_status', (full_gate.get('georeliab_gate') or {}).get('status', full_gate.get('status', 'MISSING'))),
-    table_row('track_selection', 'BLOCKED_PENDING_GEOMETRY unless Geometry is terminal'),
-    table_row('resource_status', status.get('schema_version', 'status snapshot missing')),
-    table_row('bundle_sha256', sha(bundle_path)),
-]
-page = '# GeoReliab P6 One-Page Decision Table\n\n' + '\n'.join(rows) + '\n'
-(evidence_dir / 'p6_one_page_decision.md').write_text(page, encoding='utf-8')
-print(bundle_path)
-print(evidence_dir / 'p6_one_page_decision.md')
-PY
-```
+To validate an already completed P6 idempotently, rerun the same canonical P6 launch;
+the finalizer verifies every stored path and digest before reporting reuse.
 
 The P6 bundle must include project commit, upstream/checkpoint/environment SHA values, split/materialization/prepared/calibration/render-lock hashes, schedule counts, invalid/missing counts, GPU/storage status, worker logs, gate reasons, and the pending-Geometry selection note.
 

@@ -37,7 +37,7 @@ else
 fi
 
 manifest="$artifacts/deploy/$commit.json"
-"$(orchestrator_python "$overlay")" - "$overlay" "$commit" "$bare" "$target" <<'PY'
+"$(orchestrator_python "$overlay")" - "$overlay" "$commit" "$bare" "$target" <<'PY' | write_immutable_file "$root" "$manifest"
 import json, subprocess, sys
 overlay, commit, bare, worktree = sys.argv[1:]
 def sha(path): return subprocess.check_output(['sha256sum', path], text=True).split()[0]
@@ -53,6 +53,5 @@ payload = {
 }
 print(json.dumps(payload, indent=2, sort_keys=True))
 PY
-write_immutable_file "$root" "$manifest"
 sha256sum "$manifest" | write_immutable_file "$root" "$manifest.sha256"
 info "deployed detached worktree: $target"

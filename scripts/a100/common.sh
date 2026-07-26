@@ -105,6 +105,17 @@ assert_git_commit_clean() {
   git -C "$path" diff --cached --quiet || die "tracked worktree has staged changes: $path"
 }
 
+assert_project_worktree_clean() {
+  local path=$1 expected=$2 actual dirty
+  git -C "$path" rev-parse --git-dir >/dev/null 2>&1 || die "not a project git worktree: $path"
+  actual=$(git -C "$path" rev-parse HEAD)
+  [ "$actual" = "$expected" ] || die "project worktree commit mismatch: $actual != $expected"
+  git -C "$path" diff --quiet HEAD -- || die "project worktree has unstaged changes: $path"
+  git -C "$path" diff --cached --quiet || die "project worktree has staged changes: $path"
+  dirty=$(git -C "$path" status --porcelain --untracked-files=all)
+  [ -z "$dirty" ] || die "project worktree has untracked files: $path"
+}
+
 project_commit_arg() {
   local commit=${1:-}
   [ -n "$commit" ] || die 'project commit is required'
