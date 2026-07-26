@@ -8,6 +8,7 @@ import zipfile
 import numpy as np
 import pytest
 
+from georeliab_mve.cli import main
 from georeliab_mve.prepare_cli import run_prepare_operation
 from georeliab_mve.preparation import (
     CalibrationError,
@@ -81,7 +82,7 @@ def test_non_dry_preparation_calibration_rendering_and_sanity_have_success_paths
     root = tmp_path / 'data'
     prepared = root / 'prepared'
     prepared.mkdir(parents=True)
-    for name in ('calibration_inputs.json', 'render_inputs.json', 'tartanair_p000_pairs.json'):
+    for name in ('calibration_inputs.json', 'render_inputs_smoke.json', 'tartanair_p000_pairs.json'):
         (prepared / name).write_text('{}', encoding='utf-8')
     image = np.random.default_rng(9).uniform(0.1, 0.9, (64, 64, 3))
     depth = np.tile(np.linspace(1.0, 8.0, 64), (64, 1))
@@ -105,7 +106,7 @@ def test_non_dry_preparation_calibration_rendering_and_sanity_have_success_paths
     state = tmp_path / 'state.json'
     calibration = run_prepare_operation(operation='calibration', data_root=root, state_path=state, dry_run=False, overlay_path=None)
     assert calibration['resources_ready'] is False
-    rendering = run_prepare_operation(operation='rendering', data_root=root, state_path=state, dry_run=False, overlay_path=None)
+    rendering = run_prepare_operation(operation='rendering', stage='smoke', data_root=root, state_path=state, dry_run=False, overlay_path=None)
     assert rendering['rendered_count'] == 10
     sanity = run_prepare_operation(operation='sanity', data_root=root, state_path=state, dry_run=False, overlay_path=None)
     assert sanity['reason_code'] == 'TARTANAIR_NATIVE_FOG_SANITY'
@@ -129,24 +130,24 @@ def test_test_render_lock_and_existing_artifacts_are_immutable(monkeypatch, tmp_
         'split_view_manifest_sha256': '2' * 64,
         'materialization_sha256': '3' * 64,
     }), encoding='utf-8')
-    render_input = prepared / 'render_inputs.json'
+    render_input = prepared / 'render_inputs_test.json'
     render_input.write_text('{"frozen":true}', encoding='utf-8')
     record = (1, 1, 'dtu/test/scan1/view1/clean/0/0', image, depth, '0' * 64, '1' * 64)
     batch = PreparedBatch('test', 'test', '2' * 64, '3' * 64, (record,))
-    monkeypatch.setattr(dispatch, 'load_prepared_batch', lambda _path: batch)
-    first = dispatch._run_rendering(root)
+    monkeypatch.setattr(dispatch, 'load_prepared_batch', lambda _path, expected_stage=None: batch)
+    first = dispatch._run_rendering(root, stage='test')
     assert first['written'] == 10 and first['reused'] == 0
-    second = dispatch._run_rendering(root)
+    second = dispatch._run_rendering(root, stage='test')
     assert second['written'] == 0 and second['reused'] == 10
     original_input = render_input.read_text(encoding='utf-8')
     render_input.write_text('{"frozen":false}', encoding='utf-8')
     with pytest.raises(PreparationError, match='changed after freeze'):
-        dispatch._run_rendering(root)
+        dispatch._run_rendering(root, stage='test')
     render_input.write_text(original_input, encoding='utf-8')
     rendered = next((root / 'rendered' / 'test').glob('*.png'))
     rendered.write_bytes(b'tampered')
     with pytest.raises(PreparationError, match='tampered'):
-        dispatch._run_rendering(root)
+        dispatch._run_rendering(root, stage='test')
 
 
 def test_overlay_requires_every_frozen_identity(tmp_path):
@@ -200,3 +201,45 @@ def test_non_dry_download_verify_index_and_manifests_have_success_paths(monkeypa
     monkeypatch.setattr(dispatch, 'verify_materialization_manifest', lambda *_args, **_kwargs: {})
     manifest = run_prepare_operation(operation='manifests', data_root=root, state_path=state, dry_run=False, overlay_path=overlay)
     assert len(json.loads(Path(manifest['manifest_path']).read_text())['views']) == 45
+
+
+def test_prepared_operation_invokes_production_writer(monkeypatch, tmp_path):
+    import georeliab_mve.prepare_dispatch_round1 as dispatch
+
+    root = tmp_path / 'data'
+    overlay = _overlay(tmp_path / 'overlay.toml')
+    state = tmp_path / 'state.json'
+    expected = {
+        'calibration_record_count': 80,
+        'smoke_record_count': 80,
+        'test_record_count': 160,
+        'tartanair_record_count': 100,
+    }
+    calls = []
+
+    def fake_writer(actual_root):
+        calls.append(actual_root)
+        return expected
+
+    monkeypatch.setattr(dispatch, 'write_prepared_inputs', fake_writer)
+    result = run_prepare_operation(
+        operation='prepared', data_root=root, state_path=state,
+        dry_run=False, overlay_path=overlay,
+    )
+    assert calls == [root]
+    assert {key: result[key] for key in expected} == expected
+    assert result['state_transition'] == 'prepared:completed'
+    assert json.loads(state.read_text(encoding='utf-8')) == result
+
+
+def test_prepare_cli_requires_stage_only_for_rendering(tmp_path):
+    root = tmp_path / 'data'
+    state = tmp_path / 'state.json'
+    base = ['prepare-georeliab', '--data-root', str(root), '--state', str(state), '--dry-run']
+
+    assert main([*base, '--operation', 'rendering']) == 2
+    assert main([*base, '--operation', 'index', '--stage', 'smoke']) == 2
+    assert main([*base, '--operation', 'rendering', '--stage', 'smoke']) == 0
+    payload = json.loads(state.read_text(encoding='utf-8'))
+    assert payload['operation'] == 'rendering'
+    assert payload['stage'] == 'smoke'

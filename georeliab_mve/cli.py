@@ -312,6 +312,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument('--data-root', type=Path, required=True)
     prepare.add_argument('--state', type=Path, required=True)
     prepare.add_argument('--overlay', type=Path)
+    prepare.add_argument('--stage', choices=('smoke', 'test'))
     prepare.add_argument('--dry-run', action='store_true')
 
     return parser
@@ -370,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
                 state_path=args.state,
                 dry_run=args.dry_run,
                 overlay_path=args.overlay,
+                stage=args.stage,
             )
             print(json.dumps(payload, indent=2, sort_keys=True))
             return 0

@@ -456,6 +456,13 @@ def materialize_frozen_selection(
         range(1, 50)
     ):
         raise PreparationError("DTU inventory provenance is incomplete")
+    for view, member in camera_members.items():
+        normalized = str(member).replace("\\", "/")
+        expected = f"MVS Data/Calibration/cal18/pos_{view:03d}.txt"
+        if not normalized.endswith(expected):
+            raise PreparationError(
+                f"DTU camera provenance view {view} must reference exact pos_{view:03d}.txt"
+            )
 
     dtu_members: list[str] = []
     for scene in sorted(expected_scenes):
@@ -761,7 +768,16 @@ def verify_materialization_manifest(
             raise PreparationError(
                 f"materialized scan{scene} must contain eight views"
             )
-        for member in (*rgb.values(), *cameras.values()):
+        for member in rgb.values():
+            verify_materialized_member(member, materialized_root=materialized_root)
+        for view_text, member in cameras.items():
+            view = int(view_text)
+            normalized = str(member.get("member", "")).replace("\\", "/")
+            expected = f"MVS Data/Calibration/cal18/pos_{view:03d}.txt"
+            if not normalized.endswith(expected):
+                raise PreparationError(
+                    f"materialized DTU camera view {view} is not exact pos_{view:03d}.txt"
+                )
             verify_materialized_member(member, materialized_root=materialized_root)
     if seen_scenes != set(split_membership):
         raise PreparationError("DTU materialization does not contain the exact frozen 45 scenes")

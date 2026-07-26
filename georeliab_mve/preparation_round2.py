@@ -299,6 +299,23 @@ def _verify_asset_reference(
         )
 
 
+def _require_prepared_output(path: Path, manifest_path: Path, label: str) -> None:
+    """Decoded outputs must live below the manifest's prepared directory."""
+    try:
+        path.resolve().relative_to(manifest_path.parent.resolve())
+    except (OSError, ValueError) as exc:
+        raise _base.PreparationError(f'{label} output is out-of-band: {path}') from exc
+
+
+def _verify_camera_view(evidence: Mapping[str, Any], view_id: int) -> None:
+    expected = f'MVS Data/Calibration/cal18/pos_{view_id:03d}.txt'
+    member = str(evidence.get('member', '')).replace('\\', '/')
+    if not member.endswith(expected):
+        raise _base.PreparationError(
+            f'prepared camera for view {view_id} is not exact pos_{view_id:03d}.txt'
+        )
+
+
 _STAGE_SPLIT = {
     'calibration': 'calibration',
     'smoke': 'dev',
@@ -314,6 +331,12 @@ def load_prepared_batch(
     payload = _load_json(path, 'prepared input')
     if payload.get('schema_version') != 'prepared-input-v2':
         raise _base.PreparationError('prepared input must use prepared-input-v2')
+    from .prepared_inputs import (
+        DTU_IMAGE_SIZE, DtuPlyCache, decode_dtu_assets,
+        implementation_evidence, npy_bytes,
+    )
+    if payload.get('producer') != implementation_evidence():
+        raise _base.PreparationError('prepared input producer/dependency recipe mismatch')
     stage = payload.get('stage')
     split = payload.get('split')
     if stage not in _STAGE_SPLIT or split != _STAGE_SPLIT[stage]:
@@ -353,12 +376,14 @@ def load_prepared_batch(
         rows = payload['records']
     except (KeyError, TypeError, ValueError) as exc:
         raise _base.PreparationError('prepared input schedule is incomplete') from exc
-    if not isinstance(rows, list) or not required:
+    if (not isinstance(rows, list) or not required
+            or payload.get('record_count') != len(required)):
         raise _base.PreparationError('prepared input records must be a non-empty list')
 
     records: list[tuple[int, int, str, np.ndarray, np.ndarray, str, str]] = []
     seen: set[tuple[int, int]] = set()
     sample_keys: set[str] = set()
+    ply_cache = DtuPlyCache()
     for row in rows:
         try:
             scene = int(row['scene_id'])
@@ -371,6 +396,7 @@ def load_prepared_batch(
             depth_path = Path(str(row['depth_npy']))
             depth_sha = row['depth_npy_sha256']
             gt_digest = row['gt_digest']
+            rgb_decode = row['rgb_decode']
             derivation = row['depth_derivation']
         except (KeyError, TypeError, ValueError) as exc:
             raise _base.PreparationError('prepared input record is incomplete') from exc
@@ -384,34 +410,34 @@ def load_prepared_batch(
             raise _base.PreparationError('prepared input is not present in its materialized split')
         for name in ('rgb', 'camera', 'points', 'mask'):
             _verify_asset_reference(row, expected[name], name)
+        _verify_camera_view(expected['camera'], view)
         if raw_path != Path(str(expected['rgb']['path'])) or raw_sha != expected['rgb']['raw_sha256']:
             raise _base.PreparationError('prepared RGB is not bound to the official materialized bytes')
         if not raw_path.is_file() or _sha_file(raw_path) != raw_sha:
             raise _base.PreparationError('prepared raw RGB digest mismatch')
-        for file_path, digest, label in (
-            (rgb_path, rgb_sha, 'linear RGB'),
-            (depth_path, depth_sha, 'depth'),
-        ):
-            if not file_path.is_file() or _sha_file(file_path) != digest:
-                raise _base.PreparationError(f'prepared {label} array digest mismatch')
-        if gt_digest != depth_sha:
-            raise _base.PreparationError('prepared GT digest is not bound to the depth array')
-        expected_inputs = {
-            name: expected[name]['raw_sha256']
-            for name in ('camera', 'points', 'mask')
-        }
-        if (
-            not isinstance(derivation, Mapping)
-            or derivation.get('algorithm') != 'dtu-points-camera-projection-v1'
-            or derivation.get('input_sha256') != expected_inputs
-            or derivation.get('output_sha256') != depth_sha
-        ):
-            raise _base.PreparationError('prepared depth derivation provenance mismatch')
-        try:
-            image = np.load(rgb_path, allow_pickle=False)
-            depth = np.load(depth_path, allow_pickle=False)
-        except (OSError, ValueError) as exc:
-            raise _base.PreparationError('prepared arrays are unreadable') from exc
+        _require_prepared_output(rgb_path, path, 'linear RGB')
+        _require_prepared_output(depth_path, path, 'depth')
+        image, depth, expected_rgb_decode, expected_derivation = decode_dtu_assets(
+            expected, view_id=view, ply_cache=ply_cache, image_size=DTU_IMAGE_SIZE,
+        )
+        expected_rgb_sha = _sha_bytes(npy_bytes(image))
+        expected_depth_sha = _sha_bytes(npy_bytes(depth))
+        expected_rgb_decode['output_sha256'] = expected_rgb_sha
+        expected_derivation['output_sha256'] = expected_depth_sha
+        if (not rgb_path.is_file() or _sha_file(rgb_path) != expected_rgb_sha
+                or rgb_sha != expected_rgb_sha):
+            raise _base.PreparationError(
+                'prepared linear RGB does not match deterministic decode of official bytes'
+            )
+        if (not depth_path.is_file() or _sha_file(depth_path) != expected_depth_sha
+                or depth_sha != expected_depth_sha or gt_digest != expected_depth_sha):
+            raise _base.PreparationError(
+                'prepared depth does not match deterministic projection of official bytes'
+            )
+        if rgb_decode != expected_rgb_decode:
+            raise _base.PreparationError('prepared RGB decode recipe/provenance mismatch')
+        if derivation != expected_derivation:
+            raise _base.PreparationError('prepared depth derivation recipe/provenance mismatch')
         image, depth, _ = _base._require_image_depth(image, depth)
         records.append((scene, view, sample_key, image, depth, raw_sha, gt_digest))
         seen.add(pair)
@@ -456,6 +482,12 @@ def load_tartanair_prepared_pairs(
     payload = _load_json(path, 'TartanAir prepared input')
     if payload.get('schema_version') != 'tartanair-prepared-v2':
         raise _base.PreparationError('TartanAir prepared input must use tartanair-prepared-v2')
+    from .prepared_inputs import (
+        TARTAN_IMAGE_SIZE, decode_tartanair_assets,
+        implementation_evidence, npy_bytes,
+    )
+    if payload.get('producer') != implementation_evidence():
+        raise _base.PreparationError('TartanAir producer/dependency recipe mismatch')
     try:
         materialization_path = Path(str(payload['materialization_path']))
         materialization_sha = payload['materialization_sha256']
@@ -479,7 +511,8 @@ def load_tartanair_prepared_pairs(
         str(pair['frame_id']): pair
         for pair in materialization.get('tartanair', {}).get('pairs', [])
     }
-    if len(official) != 100 or not isinstance(records, list) or len(records) != 100:
+    if (len(official) != 100 or not isinstance(records, list)
+            or len(records) != 100 or payload.get('record_count') != 100):
         raise _base.PreparationError('TartanAir prepared input requires exactly 100 frozen pairs')
     result: list[tuple[str, np.ndarray, np.ndarray]] = []
     seen: set[str] = set()
@@ -514,27 +547,27 @@ def load_tartanair_prepared_pairs(
                 raise _base.PreparationError(
                     f'TartanAir {name} provenance is tampered or cross-frame swapped'
                 )
-        for decoded_path, decoded_sha, label in (
-            (rgb_path, rgb_sha, 'RGB'), (depth_path, depth_sha, 'depth'),
-        ):
-            if not decoded_path.is_file() or _sha_file(decoded_path) != decoded_sha:
-                raise _base.PreparationError(f'TartanAir decoded {label} digest mismatch')
-        if (
-            not isinstance(rgb_decode, Mapping)
-            or rgb_decode.get('algorithm') != 'png-linear-rgb-v1'
-            or rgb_decode.get('input_sha256') != expected['rgb']['raw_sha256']
-            or rgb_decode.get('output_sha256') != rgb_sha
-            or not isinstance(depth_decode, Mapping)
-            or depth_decode.get('algorithm') != 'tartanair-depth-png-v1'
-            or depth_decode.get('input_sha256') != expected['depth']['raw_sha256']
-            or depth_decode.get('output_sha256') != depth_sha
-        ):
-            raise _base.PreparationError('TartanAir decode provenance mismatch')
-        try:
-            image = np.load(rgb_path, allow_pickle=False)
-            depth = np.load(depth_path, allow_pickle=False)
-        except (OSError, ValueError) as exc:
-            raise _base.PreparationError('TartanAir decoded arrays are unreadable') from exc
+        _require_prepared_output(rgb_path, path, 'TartanAir RGB')
+        _require_prepared_output(depth_path, path, 'TartanAir depth')
+        image, depth, expected_rgb_decode, expected_depth_decode = decode_tartanair_assets(
+            expected, image_size=TARTAN_IMAGE_SIZE,
+        )
+        expected_rgb_sha = _sha_bytes(npy_bytes(image))
+        expected_depth_sha = _sha_bytes(npy_bytes(depth))
+        expected_rgb_decode['output_sha256'] = expected_rgb_sha
+        expected_depth_decode['output_sha256'] = expected_depth_sha
+        if (not rgb_path.is_file() or _sha_file(rgb_path) != expected_rgb_sha
+                or rgb_sha != expected_rgb_sha):
+            raise _base.PreparationError(
+                'TartanAir RGB does not match deterministic decode of official bytes'
+            )
+        if (not depth_path.is_file() or _sha_file(depth_path) != expected_depth_sha
+                or depth_sha != expected_depth_sha):
+            raise _base.PreparationError(
+                'TartanAir depth does not match official BGRA little-endian decode'
+            )
+        if rgb_decode != expected_rgb_decode or depth_decode != expected_depth_decode:
+            raise _base.PreparationError('TartanAir decode recipe/provenance mismatch')
         image, depth, _ = _base._require_image_depth(image, depth)
         result.append((frame, image, depth))
         seen.add(frame)

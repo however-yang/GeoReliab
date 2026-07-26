@@ -253,6 +253,21 @@ def test_full_materialization_and_v2_provenance_contracts_fail_closed(monkeypatc
     assert result['dtu_rgb_count'] == 360
     assert result['tartanair_pair_count'] == 100
 
+    original_materialization = materialization_path.read_text(encoding='utf-8')
+    camera_swap = json.loads(original_materialization)
+    camera_keys = list(camera_swap['dtu'][0]['cameras'])
+    first, second = camera_keys[:2]
+    camera_swap['dtu'][0]['cameras'][first], camera_swap['dtu'][0]['cameras'][second] = (
+        camera_swap['dtu'][0]['cameras'][second],
+        camera_swap['dtu'][0]['cameras'][first],
+    )
+    materialization_path.write_text(json.dumps(camera_swap), encoding='utf-8')
+    with pytest.raises(PreparationError, match='not exact pos_'):
+        verify_materialization_manifest(
+            materialization_path, split_manifest_path=split_path,
+        )
+    materialization_path.write_text(original_materialization, encoding='utf-8')
+
     split_payload = json.loads(split_path.read_text(encoding='utf-8'))
     by_pair = {
         (int(scene['scene_id']), int(view)): {
@@ -304,52 +319,7 @@ def test_full_materialization_and_v2_provenance_contracts_fail_closed(monkeypatc
     }
     prepared_path = tmp_path / 'prepared-v2.json'
     prepared_path.write_text(json.dumps(prepared_payload), encoding='utf-8')
-    assert len(load_prepared_batch(prepared_path, expected_stage='smoke').records) == 80
-    swapped = json.loads(json.dumps(prepared_payload))
-    swapped['records'][0]['source_assets']['camera'] = swapped['records'][1]['source_assets']['camera']
-    prepared_path.write_text(json.dumps(swapped), encoding='utf-8')
-    with pytest.raises(PreparationError, match='cross-resource swap'):
+    # Round 4 removes the former trust gap: hand-authored decoded arrays are
+    # not a production artifact, even when every self-digest is updated.
+    with pytest.raises(PreparationError, match='producer/dependency recipe mismatch'):
         load_prepared_batch(prepared_path, expected_stage='smoke')
-    wrong_stage = json.loads(json.dumps(prepared_payload))
-    wrong_stage['stage'] = 'test'
-    prepared_path.write_text(json.dumps(wrong_stage), encoding='utf-8')
-    with pytest.raises(PreparationError, match='stage/split binding'):
-        load_prepared_batch(prepared_path)
-
-    tartan_records = []
-    for pair in frozen['tartanair']['pairs']:
-        frame = pair['frame_id']
-        rgb_npy = decoded / f'tartan_{frame}_rgb.npy'
-        depth_npy = decoded / f'tartan_{frame}_depth.npy'
-        np.save(rgb_npy, np.full((4, 4, 3), 0.5, dtype=np.float64))
-        np.save(depth_npy, np.full((4, 4), 2.0, dtype=np.float64))
-        rgb_sha = hashlib.sha256(rgb_npy.read_bytes()).hexdigest()
-        depth_sha = hashlib.sha256(depth_npy.read_bytes()).hexdigest()
-        tartan_records.append({
-            'frame_id': frame, 'raw_rgb_path': pair['rgb']['path'],
-            'raw_depth_path': pair['depth']['path'],
-            'rgb_npy': str(rgb_npy), 'rgb_npy_sha256': rgb_sha,
-            'depth_npy': str(depth_npy), 'depth_npy_sha256': depth_sha,
-            'source_assets': {
-                name: {'member': pair[name]['member'],
-                       'raw_sha256': pair[name]['raw_sha256']}
-                for name in ('rgb', 'depth')
-            },
-            'rgb_decode': {'algorithm': 'png-linear-rgb-v1',
-                           'input_sha256': pair['rgb']['raw_sha256'],
-                           'output_sha256': rgb_sha},
-            'depth_decode': {'algorithm': 'tartanair-depth-png-v1',
-                             'input_sha256': pair['depth']['raw_sha256'],
-                             'output_sha256': depth_sha},
-        })
-    tartan_payload = {'schema_version': 'tartanair-prepared-v2',
-                      'materialization_path': str(materialization_path),
-                      'materialization_sha256': hashlib.sha256(materialization_path.read_bytes()).hexdigest(),
-                      'records': tartan_records}
-    tartan_path = tmp_path / 'tartan-prepared-v2.json'
-    tartan_path.write_text(json.dumps(tartan_payload), encoding='utf-8')
-    assert len(load_tartanair_prepared_pairs(tartan_path)) == 100
-    tartan_payload['records'][0]['source_assets']['depth'] = tartan_payload['records'][1]['source_assets']['depth']
-    tartan_path.write_text(json.dumps(tartan_payload), encoding='utf-8')
-    with pytest.raises(PreparationError, match='cross-frame swapped'):
-        load_tartanair_prepared_pairs(tartan_path)

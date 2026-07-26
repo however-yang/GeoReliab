@@ -9,7 +9,10 @@ from typing import Any
 from .preparation import A100Overlay, PreparationError
 
 
-PREPARE_OPERATIONS = ('verify', 'download', 'index', 'manifests', 'calibration', 'rendering', 'sanity')
+PREPARE_OPERATIONS = (
+    'verify', 'download', 'index', 'manifests', 'prepared',
+    'calibration', 'rendering', 'sanity',
+)
 
 
 def run_prepare_operation(
@@ -19,6 +22,7 @@ def run_prepare_operation(
     state_path: Path,
     dry_run: bool,
     overlay_path: Path | None,
+    stage: str | None = None,
 ) -> dict[str, Any]:
     '''Record an explicit preparation state without declaring missing data ready.
 
@@ -39,6 +43,7 @@ def run_prepare_operation(
     payload = {
         'schema_version': 'preparation-state-v1',
         'operation': operation,
+        'stage': stage,
         'data_root': str(data_root),
         'dry_run': dry_run,
         'overlay': str(overlay.source) if overlay else None,

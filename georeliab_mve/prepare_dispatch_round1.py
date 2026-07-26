@@ -16,6 +16,7 @@ from .materialization import (
     verify_frozen_overlay_identities,
     verify_materialization_manifest,
 )
+from .prepared_inputs import write_prepared_inputs
 from .preparation import (
     CALIBRATION_SCENES, A100Overlay, PreparationError, atomic_json,
     build_split_view_manifest, calibration_qa, calibrate_corruptions,
@@ -176,7 +177,9 @@ def _write_render_artifact(target: Path, png: bytes, metadata: dict[str, Any]) -
     return 'written'
 
 
-def _run_rendering(root: Path) -> dict[str, Any]:
+def _run_rendering(root: Path, *, stage: str) -> dict[str, Any]:
+    if stage not in ('smoke', 'test'):
+        raise PreparationError('rendering requires explicit stage smoke or test')
     calibration_path = root / 'manifests' / 'corruption_calibration.json'
     qa_path = root / 'manifests' / 'corruption_calibration_qa.json'
     try:
@@ -191,9 +194,8 @@ def _run_rendering(root: Path) -> dict[str, Any]:
     from .preparation import CorruptionCalibration
     calibration = CorruptionCalibration(float(calibration_payload['d_ref']), tuple(calibration_payload['airlight']),
         tuple(calibration_payload['fog_betas']), tuple(calibration_payload['defocus_scales']), calibration_payload['implementation_version'])
-    batch = load_prepared_batch(root / 'prepared' / 'render_inputs.json')
-    if batch.stage not in ('smoke', 'test'):
-        raise PreparationError('rendering accepts only smoke/dev or test/test prepared batches')
+    input_path = root / 'prepared' / f'render_inputs_{stage}.json'
+    batch = load_prepared_batch(input_path, expected_stage=stage)
     if (
         qa.get('split_view_manifest_sha256') != batch.split_view_manifest_sha256
         or qa.get('materialization_sha256') != batch.materialization_sha256
@@ -203,7 +205,6 @@ def _run_rendering(root: Path) -> dict[str, Any]:
         )
     records = batch.records
     parameter_sha = hashlib.sha256(calibration_path.read_bytes()).hexdigest()
-    input_path = root / 'prepared' / 'render_inputs.json'
     lock_payload = {
         'schema_version': 'test-render-lock-v1',
         'stage': batch.stage,
@@ -292,17 +293,27 @@ def _run_sanity(root: Path) -> dict[str, Any]:
     return payload
 
 
-def run_prepare_operation(*, operation: str, data_root: Path, state_path: Path, dry_run: bool, overlay_path: Path | None) -> dict[str, Any]:
-    operations = ('verify', 'download', 'index', 'manifests', 'calibration', 'rendering', 'sanity')
+def run_prepare_operation(*, operation: str, data_root: Path, state_path: Path,
+                          dry_run: bool, overlay_path: Path | None,
+                          stage: str | None = None) -> dict[str, Any]:
+    operations = ('verify', 'download', 'index', 'manifests', 'prepared',
+                  'calibration', 'rendering', 'sanity')
     if operation not in operations:
         raise PreparationError(f'unsupported prepare operation: {operation}')
-    base = {'schema_version': 'preparation-state-v4', 'operation': operation, 'data_root': str(data_root),
+    if operation == 'rendering' and stage not in ('smoke', 'test'):
+        raise PreparationError('rendering requires explicit --stage smoke or test')
+    if operation != 'rendering' and stage is not None:
+        raise PreparationError('--stage is valid only for rendering')
+    base = {'schema_version': 'preparation-state-v5', 'operation': operation,
+            'stage': stage, 'data_root': str(data_root),
             'dry_run': dry_run, 'scientific_ready': False}
     if dry_run:
         payload = {**base, 'resources_ready': False, 'notice': 'Dry-run did not acquire, verify, or claim scientific readiness.'}
         _write_state(state_path, payload)
         return payload
-    overlay = _overlay(overlay_path) if operation in ('verify', 'download', 'index', 'manifests') else None
+    overlay = _overlay(overlay_path) if operation in (
+        'verify', 'download', 'index', 'manifests', 'prepared',
+    ) else None
     if overlay is not None and os.name != 'nt':
         if data_root.resolve() != Path(overlay.runtime_root).resolve():
             raise PreparationError(
@@ -350,10 +361,12 @@ def run_prepare_operation(*, operation: str, data_root: Path, state_path: Path, 
         )
         result = {'split_view_manifest_sha256': manifest.sha256,
                   'manifest_path': str(split_path), **materialization}
+    elif operation == 'prepared':
+        result = write_prepared_inputs(data_root)
     elif operation == 'calibration':
         result = _run_calibration(data_root)
     elif operation == 'rendering':
-        result = _run_rendering(data_root)
+        result = _run_rendering(data_root, stage=stage)
     else:
         result = _run_sanity(data_root)
     readiness = operation == 'verify'
