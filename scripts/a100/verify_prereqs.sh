@@ -49,11 +49,18 @@ expected_python, expected_torch = sys.argv[4], sys.argv[5]
 sys.path.insert(0, str(site))
 import typing_extensions
 from importlib import metadata
+expected_dist_info = (site / "typing_extensions-4.15.0.dist-info").resolve()
 actual_file = Path(typing_extensions.__file__).resolve()
 expected_file = (site / "typing_extensions.py").resolve()
 assert actual_file == expected_file, f"typing_extensions import escaped frozen site: {actual_file}"
 assert hashlib.sha256(actual_file.read_bytes()).hexdigest() == expected_sha
 assert metadata.version("typing_extensions") == expected_version
+dist = metadata.distribution("typing_extensions")
+dist_root = Path(dist.locate_file("")).resolve()
+dist_info = Path(dist.locate_file("typing_extensions-4.15.0.dist-info")).resolve()
+assert dist_root == site.resolve(), f"typing_extensions distribution root escaped frozen site: {dist_root}"
+assert dist_info == expected_dist_info and dist_info.is_dir(), f"typing_extensions dist-info escaped frozen site: {dist_info}"
+assert dist.version == expected_version
 import torch
 assert platform.python_version() == expected_python
 assert torch.__version__ == expected_torch
@@ -67,11 +74,18 @@ expected_python, expected_torch = sys.argv[4], sys.argv[5]
 sys.path.insert(0, str(site))
 import typing_extensions
 from importlib import metadata
+expected_dist_info = (site / "typing_extensions-4.15.0.dist-info").resolve()
 actual_file = Path(typing_extensions.__file__).resolve()
 expected_file = (site / "typing_extensions.py").resolve()
 assert actual_file == expected_file, f"typing_extensions import escaped frozen site: {actual_file}"
 assert hashlib.sha256(actual_file.read_bytes()).hexdigest() == expected_sha
 assert metadata.version("typing_extensions") == expected_version
+dist = metadata.distribution("typing_extensions")
+dist_root = Path(dist.locate_file("")).resolve()
+dist_info = Path(dist.locate_file("typing_extensions-4.15.0.dist-info")).resolve()
+assert dist_root == site.resolve(), f"typing_extensions distribution root escaped frozen site: {dist_root}"
+assert dist_info == expected_dist_info and dist_info.is_dir(), f"typing_extensions dist-info escaped frozen site: {dist_info}"
+assert dist.version == expected_version
 import torch
 assert platform.python_version() == expected_python
 assert torch.__version__ == expected_torch
@@ -108,6 +122,7 @@ out = {
             'site': payload['runtime']['typing_extensions_site'],
             'version': payload['resources']['typing_extensions_version'],
             'typing_extensions_file_path': str(Path(payload['runtime']['typing_extensions_site']) / 'typing_extensions.py'),
+            'typing_extensions_dist_info_path': str(Path(payload['runtime']['typing_extensions_site']) / 'typing_extensions-4.15.0.dist-info'),
             'typing_extensions_file_sha256': payload['resources']['typing_extensions_sha256'],
         }
     },

@@ -135,7 +135,8 @@ def test_scripts_pin_all_runtime_caches_off_home_and_mark_no_home_write() -> Non
     assert 'GEORELIAB_NO_HOME_WRITE=1' in common
     assert 'PYTHONNOUSERSITE=1' in common
     assert 'typing_site=$(CDPATH= cd -- "$typing_site" 2>/dev/null && pwd -P)' in common
-    assert 'must not expose /home/smli/.local' in common
+    assert 'typing_extensions site must equal frozen package cache' in common
+    assert 'typing_extensions site must resolve to frozen package cache' in common
     assert 'validate_typing_extensions_runtime "$overlay"' in common
     assert 'PYTHONPATH="$typing_site:$GEORELIAB_PROJECT_ROOT"' in common
     assert 'no_home_write_marker.json' in verify
@@ -231,5 +232,9 @@ def test_prereqs_enforce_storage_cap_device_count_and_frozen_env_orchestrator() 
     assert 'expected_python, expected_torch = sys.argv[4], sys.argv[5]' in verify
     assert 'assert platform.python_version() == "$(' not in verify
     assert 'import typing_extensions' in verify
+    assert 'metadata.distribution("typing_extensions")' in verify
+    assert 'typing_extensions-4.15.0.dist-info' in verify
+    assert 'dist_info == expected_dist_info' in verify
     assert 'typing_extensions_file_sha256' in verify
+    assert 'typing_extensions_dist_info_path' in verify
     assert 'typing_extensions_file_path' in verify

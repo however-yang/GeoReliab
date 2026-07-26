@@ -117,8 +117,14 @@ def _git(path: Path) -> str:
     return '1' * 40
 
 
-def _env(path: Path, typing_site: Path, typing_sha: str) -> tuple[str, str, str, str]:
-    return '3.10.20', '2.5.1+cu121' if 'mast3r' in str(path).lower() else '2.3.1+cu121', '4.15.0', str(typing_site / 'typing_extensions.py')
+def _env(path: Path, typing_site: Path, typing_sha: str) -> tuple[str, str, str, str, str]:
+    return (
+        '3.10.20',
+        '2.5.1+cu121' if 'mast3r' in str(path).lower() else '2.3.1+cu121',
+        '4.15.0',
+        str(typing_site / 'typing_extensions.py'),
+        str(typing_site / 'typing_extensions-4.15.0.dist-info'),
+    )
 
 
 def test_lazy_import_reports_missing_upstream_without_importing_at_module_import(tmp_path):
@@ -144,15 +150,27 @@ def test_frozen_runtime_probe_carries_typing_extensions_identity(tmp_path):
     runtime = _runtime(tmp_path)
     seen = {}
 
-    def probe(env_path: Path, typing_site: Path, typing_sha: str) -> tuple[str, str, str, str]:
+    def probe(env_path: Path, typing_site: Path, typing_sha: str) -> tuple[str, str, str, str, str]:
         seen['typing_site'] = typing_site
         seen['typing_sha'] = typing_sha
-        return '3.10.20', '2.3.1+cu121', '4.15.0', str(typing_site / 'typing_extensions.py')
+        return '3.10.20', '2.3.1+cu121', '4.15.0', str(typing_site / 'typing_extensions.py'), str(typing_site / 'typing_extensions-4.15.0.dist-info')
 
     evidence = verify_frozen_runtime('VGGT', runtime, git_probe=_git, env_probe=probe)
     assert seen == {'typing_site': runtime.typing_extensions_site, 'typing_sha': runtime.typing_extensions_sha256}
     assert evidence.environment['typing_extensions_version'] == '4.15.0'
     assert evidence.environment['typing_extensions_sha256'] == runtime.typing_extensions_sha256
+    assert evidence.environment['typing_extensions_dist_info'].endswith('typing_extensions-4.15.0.dist-info')
+
+
+@pytest.mark.parametrize('dist_info', ['', 'outside/typing_extensions-4.15.0.dist-info'])
+def test_frozen_runtime_rejects_wrong_typing_extensions_distribution_origin(tmp_path, dist_info):
+    runtime = _runtime(tmp_path)
+
+    def probe(env_path: Path, typing_site: Path, typing_sha: str) -> tuple[str, str, str, str, str]:
+        return '3.10.20', '2.3.1+cu121', '4.15.0', str(typing_site / 'typing_extensions.py'), str(tmp_path / dist_info)
+
+    with pytest.raises(AdapterError, match='dist-info origin'):
+        verify_frozen_runtime('VGGT', runtime, git_probe=_git, env_probe=probe)
 
 
 def test_frozen_runtime_rejects_typing_extensions_hash_mismatch_before_probe(tmp_path):

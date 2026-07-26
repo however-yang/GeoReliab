@@ -562,7 +562,7 @@ def test_isolated_model_workers_build_frozen_typing_extensions_env(tmp_path: Pat
     captured = []
 
     def fake_run(cmd, **kwargs):
-        captured.append(kwargs["env"])
+        captured.append((cmd, kwargs["env"]))
         summary_path = Path(cmd[cmd.index("--summary-json") + 1])
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         summary_path.write_text('{"status":"OK"}', encoding="utf-8")
@@ -574,8 +574,17 @@ def test_isolated_model_workers_build_frozen_typing_extensions_env(tmp_path: Pat
     args = runner.build_parser().parse_args(["preflight-real", "--config", str(config), "--output-root", str(root), "--device", "cuda:0"])
     result = runner._run_isolated_model_workers(args, runner.RunnerContext(root=root, output_root=root, config_path=config, device="cuda:0"))
     assert result["status"] == "OK"
-    assert captured and all(env["PYTHONNOUSERSITE"] == "1" for env in captured)
-    assert all(env["PYTHONPATH"].split(os.pathsep)[0] == typing_site.as_posix() for env in captured)
+    assert captured and all(env["PYTHONNOUSERSITE"] == "1" for _cmd, env in captured)
+    assert all(env["PYTHONPATH"].split(os.pathsep)[0] == typing_site.as_posix() for _cmd, env in captured)
+    for cmd, _env in captured:
+        assert cmd[1:4] == ["-I", "-B", "-c"]
+        assert cmd[5] == typing_site.as_posix()
+        assert cmd[6] == str(Path(runner.__file__).resolve().parents[1])
+        assert "metadata.distribution('typing_extensions')" in cmd[4]
+        assert "typing_extensions-4.15.0.dist-info" in cmd[4]
+        assert "frozen_version = '4.15.0'" in cmd[4]
+        assert "metadata.version('typing_extensions') != frozen_version" in cmd[4]
+        assert cmd[7] == "preflight-real"
 
 
 def test_adapter_outputs_are_committed_inside_atomic_bundle(tmp_path: Path):

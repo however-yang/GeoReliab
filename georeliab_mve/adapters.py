@@ -20,6 +20,7 @@ import numpy as np
 
 from .contracts import PredictionArtifact, RunManifest, SampleKey, write_json_artifact
 from .materialization import (
+    FROZEN_TYPING_EXTENSIONS_DIST_INFO,
     FROZEN_TYPING_EXTENSIONS_SHA256,
     FROZEN_TYPING_EXTENSIONS_SITE,
     FROZEN_TYPING_EXTENSIONS_VERSION,
@@ -166,7 +167,7 @@ class AdapterOutput:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
-EnvProbe = Callable[[Path, Path, str], tuple[str, str, str, str]]
+EnvProbe = Callable[[Path, Path, str], tuple[str, str, str, str, str]]
 GitProbe = Callable[[Path], str]
 
 
@@ -193,7 +194,7 @@ def _env_python(env_path: Path) -> Path:
     raise AdapterError(f'frozen environment has no Python executable: {env_path}')
 
 
-def _probe_python_torch(env_path: Path, typing_site: Path, typing_sha256: str) -> tuple[str, str, str, str]:
+def _probe_python_torch(env_path: Path, typing_site: Path, typing_sha256: str) -> tuple[str, str, str, str, str]:
     env = dict(os.environ)
     env['PYTHONDONTWRITEBYTECODE'] = '1'
     env['PYTHONNOUSERSITE'] = '1'
@@ -205,24 +206,32 @@ def _probe_python_torch(env_path: Path, typing_site: Path, typing_sha256: str) -
         'sys.path.insert(0, str(site))\n'
         'import typing_extensions\n'
         'from importlib import metadata\n'
+        f'expected_dist_info = (site / "{FROZEN_TYPING_EXTENSIONS_DIST_INFO}").resolve()\n'
         'actual_file = Path(typing_extensions.__file__).resolve()\n'
         'expected_file = (site / "typing_extensions.py").resolve()\n'
         'assert actual_file == expected_file, f"typing_extensions import escaped frozen site: {actual_file}"\n'
         'assert hashlib.sha256(actual_file.read_bytes()).hexdigest() == expected_sha\n'
+        'dist = metadata.distribution("typing_extensions")\n'
+        'dist_root = Path(dist.locate_file("")).resolve()\n'
+        f'dist_info = Path(dist.locate_file("{FROZEN_TYPING_EXTENSIONS_DIST_INFO}")).resolve()\n'
+        'assert dist_root == site.resolve(), f"typing_extensions distribution root escaped frozen site: {dist_root}"\n'
+        'assert dist_info == expected_dist_info and dist_info.is_dir(), f"typing_extensions dist-info escaped frozen site: {dist_info}"\n'
+        'assert dist.version == metadata.version("typing_extensions")\n'
         'import torch\n'
         'print(platform.python_version())\n'
         'print(torch.__version__)\n'
         'print(metadata.version("typing_extensions"))\n'
         'print(str(actual_file))\n'
+        'print(str(dist_info))\n'
     )
     try:
         result = subprocess.run([str(_env_python(env_path)), '-I', '-B', '-c', code, str(typing_site), typing_sha256], check=True, capture_output=True, text=True, timeout=60, env=env)
     except (OSError, subprocess.SubprocessError) as exc:
         raise AdapterError(f'cannot verify Python/Torch/typing_extensions versions in {env_path}') from exc
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if len(lines) != 4:
+    if len(lines) != 5:
         raise AdapterError(f'frozen environment emitted invalid version evidence: {env_path}')
-    return lines[0], lines[1], lines[2], lines[3]
+    return lines[0], lines[1], lines[2], lines[3], lines[4]
 
 
 def verify_frozen_runtime(model: str, runtime: FrozenRuntime, *, git_probe: GitProbe = _git_head, env_probe: EnvProbe = _probe_python_torch) -> AdapterPreflight:
@@ -249,7 +258,7 @@ def verify_frozen_runtime(model: str, runtime: FrozenRuntime, *, git_probe: GitP
         raise AdapterError(
             f'{model} typing_extensions.py SHA-256 mismatch: {actual_typing_sha} != {runtime.typing_extensions_sha256}'
         )
-    python, torch, typing_version, typing_file = env_probe(
+    python, torch, typing_version, typing_file, typing_dist_info = env_probe(
         runtime.environment, runtime.typing_extensions_site, runtime.typing_extensions_sha256
     )
     if python != runtime.python_version or torch != runtime.torch_version:
@@ -257,6 +266,23 @@ def verify_frozen_runtime(model: str, runtime: FrozenRuntime, *, git_probe: GitP
     if typing_version != runtime.typing_extensions_version:
         raise AdapterError(
             f'{model} typing_extensions mismatch: {typing_version} != {runtime.typing_extensions_version}'
+        )
+    try:
+        actual_typing_file = Path(typing_file).resolve()
+    except OSError as exc:
+        raise AdapterError(f'{model} typing_extensions module origin is unreadable: {typing_file}') from exc
+    if actual_typing_file != typing_path.resolve():
+        raise AdapterError(
+            f'{model} typing_extensions module origin mismatch: {actual_typing_file} != {typing_path.resolve()}'
+        )
+    expected_dist_info = (runtime.typing_extensions_site / FROZEN_TYPING_EXTENSIONS_DIST_INFO).resolve()
+    try:
+        actual_dist_info = Path(typing_dist_info).resolve()
+    except OSError as exc:
+        raise AdapterError(f'{model} typing_extensions dist-info origin is unreadable: {typing_dist_info}') from exc
+    if actual_dist_info != expected_dist_info or not actual_dist_info.is_dir():
+        raise AdapterError(
+            f'{model} typing_extensions dist-info origin mismatch: {actual_dist_info} != {expected_dist_info}'
         )
     dust3r_commit = None
     croco_commit = None
@@ -276,6 +302,7 @@ def verify_frozen_runtime(model: str, runtime: FrozenRuntime, *, git_probe: GitP
         'torch': torch,
         'typing_extensions_site': str(runtime.typing_extensions_site),
         'typing_extensions_file': typing_file,
+        'typing_extensions_dist_info': typing_dist_info,
         'typing_extensions_version': typing_version,
         'typing_extensions_sha256': runtime.typing_extensions_sha256,
     }, actual_config, dust3r_commit, croco_commit)

@@ -44,6 +44,7 @@ _TARTAN_DEPTH_RE = re.compile(
 FROZEN_TYPING_EXTENSIONS_SITE = Path("/home/smli/miniforge3/pkgs/typing_extensions-4.15.0-pyhcf101f3_0/site-packages")
 FROZEN_TYPING_EXTENSIONS_VERSION = "4.15.0"
 FROZEN_TYPING_EXTENSIONS_SHA256 = "433d11d170d3a24d2eb065ebc1bfe848cea7e3d7ce68567ab52bea2d4c2f7ed8"
+FROZEN_TYPING_EXTENSIONS_DIST_INFO = "typing_extensions-4.15.0.dist-info"
 
 
 def sha256_file(path: Path) -> str:
@@ -90,13 +91,19 @@ def verify_typing_extensions_dependency(
     """Verify the frozen typing_extensions module used by isolated probes."""
 
     if enforce_home_prefix:
+        frozen_site = FROZEN_TYPING_EXTENSIONS_SITE.as_posix()
+        requested_site = site.as_posix().rstrip("/")
+        if requested_site != frozen_site:
+            raise PreparationError(
+                f"typing_extensions site must equal the frozen package cache: {FROZEN_TYPING_EXTENSIONS_SITE}"
+            )
         try:
             normalized = site.resolve().as_posix().rstrip("/")
         except OSError as exc:
             raise PreparationError(f"cannot resolve typing_extensions site: {site}") from exc
-        if not normalized.startswith("/home/smli/") or normalized == "/home/smli/.local" or normalized.startswith("/home/smli/.local/"):
+        if normalized != frozen_site:
             raise PreparationError(
-                f"typing_extensions site must be the frozen /home/smli package cache: {site}"
+                f"typing_extensions site must resolve to the frozen package cache: {FROZEN_TYPING_EXTENSIONS_SITE}"
             )
     expected_sha = require_sha256(expected_sha256, "typing_extensions.py digest")
     if expected_version != FROZEN_TYPING_EXTENSIONS_VERSION:
@@ -894,6 +901,7 @@ def _env_python(env_path: Path) -> Path:
 def _python_torch_versions(
     env_path: Path, *, cache_root: Path, typing_site: Path = FROZEN_TYPING_EXTENSIONS_SITE,
     typing_sha256: str = FROZEN_TYPING_EXTENSIONS_SHA256,
+    typing_version: str = FROZEN_TYPING_EXTENSIONS_VERSION,
 ) -> tuple[str, str]:
     python = _env_python(env_path)
     cache_root.mkdir(parents=True, exist_ok=True)
@@ -918,17 +926,28 @@ def _python_torch_versions(
                     "from pathlib import Path\n"
                     "site=Path(sys.argv[1])\n"
                     "expected_sha=sys.argv[2]\n"
+                    "expected_version=sys.argv[3]\n"
                     "sys.path.insert(0, str(site))\n"
                     "import typing_extensions\n"
+                    "from importlib import metadata\n"
                     "actual=Path(typing_extensions.__file__).resolve()\n"
                     "assert actual == (site / 'typing_extensions.py').resolve()\n"
                     "assert hashlib.sha256(actual.read_bytes()).hexdigest() == expected_sha\n"
+                    f"expected_dist_info = (site / '{FROZEN_TYPING_EXTENSIONS_DIST_INFO}').resolve()\n"
+                    "assert metadata.version('typing_extensions') == expected_version\n"
+                    "dist = metadata.distribution('typing_extensions')\n"
+                    "dist_root = Path(dist.locate_file('')).resolve()\n"
+                    f"dist_info = Path(dist.locate_file('{FROZEN_TYPING_EXTENSIONS_DIST_INFO}')).resolve()\n"
+                    "assert dist_root == site.resolve(), f'typing_extensions distribution root escaped frozen site: {dist_root}'\n"
+                    "assert dist_info == expected_dist_info and dist_info.is_dir(), f'typing_extensions dist-info escaped frozen site: {dist_info}'\n"
+                    "assert dist.version == expected_version\n"
                     "import torch\n"
                     "print(platform.python_version())\n"
                     "print(torch.__version__)"
                 ),
                 str(typing_site),
                 typing_sha256,
+                typing_version,
             ],
             check=True,
             capture_output=True,
@@ -1007,6 +1026,7 @@ def verify_frozen_overlay_identities(
             cache_root=cache_root / name,
             typing_site=Path(str(runtime.get("typing_extensions_site", FROZEN_TYPING_EXTENSIONS_SITE))),
             typing_sha256=str(resources.get("typing_extensions_sha256", FROZEN_TYPING_EXTENSIONS_SHA256)),
+            typing_version=str(resources.get("typing_extensions_version", FROZEN_TYPING_EXTENSIONS_VERSION)),
         )
         expected_python = str(runtime[f"{name}_python"])
         expected_torch = str(runtime[f"{name}_torch"])

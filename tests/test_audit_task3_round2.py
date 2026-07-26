@@ -39,6 +39,11 @@ from georeliab_mve.gates import (
     ZeroUpdateEvidence,
     evaluate_georeliab_gate,
 )
+from georeliab_mve.materialization import (
+    FROZEN_TYPING_EXTENSIONS_SHA256,
+    FROZEN_TYPING_EXTENSIONS_SITE,
+    FROZEN_TYPING_EXTENSIONS_VERSION,
+)
 from georeliab_mve.preparation import PreparationError, TEST_SCENES
 from georeliab_mve.preparation_round2 import PreparedBatch
 from georeliab_mve.prepared_inputs import implementation_evidence
@@ -655,6 +660,12 @@ def _write_realistic_dtu_materialization(tmp_path: Path) -> tuple[Path, Path, di
         'split_view_manifest_sha256': _sha256(split_path),
         'dtu_inventory_provenance_path': str(inventory),
         'dtu_inventory_provenance_sha256': _sha256(inventory),
+        'dependencies': {'typing_extensions': {
+            'site': str(FROZEN_TYPING_EXTENSIONS_SITE),
+            'path': str(FROZEN_TYPING_EXTENSIONS_SITE / 'typing_extensions.py'),
+            'version': FROZEN_TYPING_EXTENSIONS_VERSION,
+            'sha256': FROZEN_TYPING_EXTENSIONS_SHA256,
+        }},
         'archives': {'tartanair-image': {'url': f'https://hf/resolve/{commit}/image.zip'}, 'tartanair-depth': {'url': f'https://hf/resolve/{commit}/depth.zip'}},
         'dtu': rows,
         'tartanair': {'source_commit': commit, 'pairs': [
@@ -667,7 +678,22 @@ def _write_realistic_dtu_materialization(tmp_path: Path) -> tuple[Path, Path, di
     return frozen, split_path, {'ply': ply, 'mask': mask, 'camera1': cameras[1]}
 
 
-def test_official_loader_binds_real_materialization_and_exact_sources(tmp_path: Path):
+def _ignore_typing_dependency_for_official_loader_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
+    import georeliab_mve.materialization as materialization
+
+    def fake_verify_typing_extensions_dependency(**kwargs):
+        return {
+            'site': str(kwargs['site']),
+            'path': str(Path(kwargs['site']) / 'typing_extensions.py'),
+            'version': kwargs['expected_version'],
+            'sha256': kwargs['expected_sha256'],
+        }
+
+    monkeypatch.setattr(materialization, 'verify_typing_extensions_dependency', fake_verify_typing_extensions_dependency)
+
+
+def test_official_loader_binds_real_materialization_and_exact_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _ignore_typing_dependency_for_official_loader_fixture(monkeypatch)
     frozen, split, paths = _write_realistic_dtu_materialization(tmp_path)
     evidence = load_official_dtu_evidence(
         sample_key='dtu/test/scan026/views-0001/clean/0/0',
@@ -684,7 +710,8 @@ def test_official_loader_binds_real_materialization_and_exact_sources(tmp_path: 
         load_official_dtu_evidence(sample_key='dtu/test/scan026/views-0001/clean/0/0', frozen_materialization=frozen, split_manifest=split)
 
 
-def test_official_loader_rejects_mask_camera_and_split_view_mismatch(tmp_path: Path):
+def test_official_loader_rejects_mask_camera_and_split_view_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _ignore_typing_dependency_for_official_loader_fixture(monkeypatch)
     frozen, split, paths = _write_realistic_dtu_materialization(tmp_path)
     paths['mask'].write_bytes(b'tamper')
     with pytest.raises(AuditError, match='materialization verification failed'):

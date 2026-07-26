@@ -34,16 +34,18 @@ shell_toml_value() {
 }
 
 validate_typing_extensions_runtime() {
-  local overlay=$1 typing_site typing_file expected_sha expected_version actual_sha
+  local overlay=$1 typing_site typing_site_raw typing_file expected_sha expected_version actual_sha frozen_site
+  frozen_site='/home/smli/miniforge3/pkgs/typing_extensions-4.15.0-pyhcf101f3_0/site-packages'
   typing_site=$(shell_toml_value "$overlay" runtime.typing_extensions_site)
   expected_sha=$(shell_toml_value "$overlay" resources.typing_extensions_sha256)
   expected_version=$(shell_toml_value "$overlay" resources.typing_extensions_version)
   [ -n "$typing_site" ] || die 'runtime.typing_extensions_site is required'
   [ -n "$expected_sha" ] || die 'resources.typing_extensions_sha256 is required'
   [ "$expected_version" = '4.15.0' ] || die "typing_extensions frozen version mismatch: $expected_version"
+  typing_site_raw=${typing_site%/}
+  [ "$typing_site_raw" = "$frozen_site" ] || die "typing_extensions site must equal frozen package cache: $typing_site"
   typing_site=$(CDPATH= cd -- "$typing_site" 2>/dev/null && pwd -P) || die "cannot resolve typing_extensions site: $typing_site"
-  case "$typing_site" in /home/smli/*) ;; *) die "typing_extensions site must remain under /home/smli: $typing_site" ;; esac
-  case "$typing_site" in /home/smli/.local|/home/smli/.local/*) die "typing_extensions site must not expose /home/smli/.local: $typing_site" ;; esac
+  [ "$typing_site" = "$frozen_site" ] || die "typing_extensions site must resolve to frozen package cache: $typing_site"
   typing_file="$typing_site/typing_extensions.py"
   [ -r "$typing_file" ] || die "missing frozen typing_extensions.py: $typing_file"
   actual_sha=$(sha256sum "$typing_file" | awk '{print $1}')

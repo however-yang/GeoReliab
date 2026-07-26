@@ -26,6 +26,7 @@ import numpy as np
 from . import toml_compat as tomllib
 from .adapters import RenderedView
 from .materialization import (
+    FROZEN_TYPING_EXTENSIONS_DIST_INFO,
     FROZEN_TYPING_EXTENSIONS_SHA256,
     FROZEN_TYPING_EXTENSIONS_SITE,
     FROZEN_TYPING_EXTENSIONS_VERSION,
@@ -2117,6 +2118,14 @@ def _verify_current_worker_runtime(context: RunnerContext, model: str) -> None:
     from importlib import metadata
     if metadata.version("typing_extensions") != spec.typing_extensions_version:
         raise RunnerError(f"{model} worker typing_extensions version mismatch")
+    dist = metadata.distribution("typing_extensions")
+    dist_root = Path(dist.locate_file("")).resolve()
+    dist_info = Path(dist.locate_file(FROZEN_TYPING_EXTENSIONS_DIST_INFO)).resolve()
+    expected_dist_info = (Path(spec.typing_extensions_site) / FROZEN_TYPING_EXTENSIONS_DIST_INFO).resolve()
+    if dist_root != Path(spec.typing_extensions_site).resolve() or dist_info != expected_dist_info or not dist_info.is_dir():
+        raise RunnerError(f"{model} worker typing_extensions dist-info origin mismatch")
+    if dist.version != spec.typing_extensions_version:
+        raise RunnerError(f"{model} worker typing_extensions distribution version mismatch")
     import torch
 
     if platform.python_version() != spec.python or torch.__version__ != spec.torch:
@@ -2133,6 +2142,39 @@ def _run_isolated_model_workers(args: argparse.Namespace, context: RunnerContext
     pythonpath = os.pathsep.join([typing_site, str(source_root)])
     env["PYTHONPATH"] = pythonpath
     env["PYTHONNOUSERSITE"] = "1"
+    bootstrap = (
+        "import hashlib, sys\n"
+        "from importlib import metadata\n"
+        "from pathlib import Path\n"
+        f"frozen_site = {str(FROZEN_TYPING_EXTENSIONS_SITE)!r}\n"
+        f"frozen_sha = {FROZEN_TYPING_EXTENSIONS_SHA256!r}\n"
+        f"frozen_version = {FROZEN_TYPING_EXTENSIONS_VERSION!r}\n"
+        f"frozen_dist_info = {FROZEN_TYPING_EXTENSIONS_DIST_INFO!r}\n"
+        "site = Path(sys.argv[1])\n"
+        "project = Path(sys.argv[2])\n"
+        "if site.as_posix().rstrip('/') != frozen_site:\n"
+        "    raise SystemExit(f'typing_extensions site must equal frozen package cache: {site}')\n"
+        "if site.resolve().as_posix().rstrip('/') != frozen_site:\n"
+        "    raise SystemExit(f'typing_extensions site must resolve to frozen package cache: {site}')\n"
+        "sys.path.insert(0, str(project))\n"
+        "sys.path.insert(0, str(site))\n"
+        "import typing_extensions\n"
+        "actual_file = Path(typing_extensions.__file__).resolve()\n"
+        "expected_file = (site / 'typing_extensions.py').resolve()\n"
+        "if actual_file != expected_file or hashlib.sha256(actual_file.read_bytes()).hexdigest() != frozen_sha:\n"
+        "    raise SystemExit(f'typing_extensions import escaped frozen site: {actual_file}')\n"
+        "dist = metadata.distribution('typing_extensions')\n"
+        "dist_root = Path(dist.locate_file('')).resolve()\n"
+        "dist_info = Path(dist.locate_file(frozen_dist_info)).resolve()\n"
+        "expected_dist_info = (site / frozen_dist_info).resolve()\n"
+        "if dist_root != site.resolve() or dist_info != expected_dist_info or not dist_info.is_dir():\n"
+        "    raise SystemExit(f'typing_extensions dist-info escaped frozen site: {dist_info}')\n"
+        "if dist.version != frozen_version or metadata.version('typing_extensions') != frozen_version:\n"
+        "    raise SystemExit(f'typing_extensions distribution version mismatch: {dist.version}')\n"
+        "sys.argv = [sys.argv[0], *sys.argv[3:]]\n"
+        "from georeliab_mve.cli import main\n"
+        "raise SystemExit(main())\n"
+    )
     for model in ("vggt", "mast3r"):
         python = _worker_python_path(context, model)
         shard_token = str(getattr(args, "shard", "0/1")).replace("/", "of")
@@ -2154,7 +2196,7 @@ def _run_isolated_model_workers(args: argparse.Namespace, context: RunnerContext
                 "--summary-json", str(summary_path),
             ]
         result = subprocess.run(
-            [str(python), "-c", "from georeliab_mve.cli import main; raise SystemExit(main())", *child_argv],
+            [str(python), "-I", "-B", "-c", bootstrap, typing_site, str(source_root), *child_argv],
             cwd=str(source_root), capture_output=True, text=True, timeout=None, env=env,
         )
         _atomic_text(stdout_path, result.stdout)

@@ -11,6 +11,7 @@ import pytest
 
 from georeliab_mve.materialization import (
     DTU_SCAN_IDS,
+    FROZEN_TYPING_EXTENSIONS_SITE,
     build_dtu_archive_inventory,
     materialize_frozen_selection,
     validate_rectified_index,
@@ -187,10 +188,11 @@ def test_frozen_identity_verifier_checks_every_source_file_and_environment(monke
         resources[f'{name}_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
     by_path = {str(tmp_path / name): commit for name, commit in commits.items()}
     monkeypatch.setattr(materialization, '_git_head', lambda path: by_path[str(path)])
-    monkeypatch.setattr(
-        materialization, '_python_torch_versions',
-        lambda path, cache_root, **_kwargs: ('3.10.20', '2.3.1+cu121') if path.name == 'env-vggt' else ('3.10.20', '2.5.1+cu121'),
-    )
+    probes = []
+    def fake_python_torch_versions(path, cache_root, **kwargs):
+        probes.append(kwargs)
+        return ('3.10.20', '2.3.1+cu121') if path.name == 'env-vggt' else ('3.10.20', '2.5.1+cu121')
+    monkeypatch.setattr(materialization, '_python_torch_versions', fake_python_torch_versions)
     evidence = verify_frozen_overlay_identities(
         runtime=runtime, resources=resources, cache_root=tmp_path / 'cache',
         enforce_typing_extensions_home=False,
@@ -199,12 +201,22 @@ def test_frozen_identity_verifier_checks_every_source_file_and_environment(monke
     assert set(evidence['files']) == {'vggt_checkpoint', 'mast3r_checkpoint', 'mast3r_config'}
     assert evidence['dependencies']['typing_extensions']['path'] == str(typing_file)
     assert evidence['dependencies']['typing_extensions']['version'] == '4.15.0'
+    assert probes and all(probe['typing_version'] == '4.15.0' for probe in probes)
     resources['mast3r_config_sha256'] = '0' * 64
     with pytest.raises(PreparationError, match='mast3r_config SHA-256 mismatch'):
         verify_frozen_overlay_identities(
             runtime=runtime, resources=resources, cache_root=tmp_path / 'cache',
             enforce_typing_extensions_home=False,
         )
+
+
+def test_python_torch_version_probe_checks_typing_distribution_origin():
+    import georeliab_mve.materialization as materialization
+
+    source = Path(materialization.__file__).read_text(encoding='utf-8')
+    assert "metadata.distribution('typing_extensions')" in source
+    assert "dist.locate_file('{FROZEN_TYPING_EXTENSIONS_DIST_INFO}')" in source
+    assert "dist.version == expected_version" in source
 
 
 def test_frozen_identity_verifier_fails_closed_on_typing_extensions_hash_mismatch(tmp_path):
@@ -219,6 +231,17 @@ def test_frozen_identity_verifier_fails_closed_on_typing_extensions_hash_mismatc
             expected_sha256='0' * 64,
             expected_version='4.15.0',
             enforce_home_prefix=False,
+        )
+
+
+def test_frozen_identity_verifier_requires_exact_typing_extensions_site():
+    from georeliab_mve.materialization import verify_typing_extensions_dependency
+
+    with pytest.raises(PreparationError, match='must equal the frozen package cache'):
+        verify_typing_extensions_dependency(
+            site=FROZEN_TYPING_EXTENSIONS_SITE.parent / 'typing_extensions-4.15.0-pyhcf101f3_0-alias' / 'site-packages',
+            expected_sha256='0' * 64,
+            expected_version='4.15.0',
         )
 
 
