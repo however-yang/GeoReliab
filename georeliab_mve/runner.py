@@ -71,6 +71,14 @@ class RunnerError(RuntimeError):
     """Raised when runner governance must fail closed."""
 
 
+class ZeroUpdateTerminalFailure(RunnerError):
+    """Raised after persisting an immutable terminal P5 invalid-output record."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        super().__init__("P5_INVALID_SUBSET_PREDICTION")
+
+
 @dataclass(frozen=True, slots=True)
 class ModelSpec:
     name: str
@@ -735,7 +743,20 @@ def _verify_output_root_policy(context: RunnerContext) -> None:
     if normalized == "/home" or normalized.startswith("/home/"):
         raise RunnerError("real execution refuses every output below /home")
     try:
-        if Path(configured).resolve() != context.output_root.resolve():
+        configured_root = Path(configured).resolve()
+        output_root = context.output_root.resolve()
+        if output_root == configured_root:
+            return
+        try:
+            relative = output_root.relative_to(configured_root)
+        except ValueError:
+            relative = None
+        if relative is not None and relative.parts in {
+            ("preflight-real", "repeat-a"),
+            ("preflight-real", "repeat-b"),
+        }:
+            return
+        if output_root != configured_root:
             raise RunnerError("real output root must equal the frozen A100 runtime.root")
     except OSError as exc:
         raise RunnerError("cannot resolve the frozen real output root") from exc
@@ -1477,6 +1498,85 @@ def build_downstream_evidence(context: RunnerContext) -> list[Path]:
     return written
 
 
+def _zero_update_terminal_failure_path(context: RunnerContext) -> Path:
+    return context.output_root / "stage" / "zero-update" / "terminal_failure.json"
+
+
+def _load_zero_update_terminal_failure(
+    context: RunnerContext,
+    *,
+    current_freeze: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    path = _zero_update_terminal_failure_path(context)
+    if not path.exists():
+        return None
+    payload = _load_json(path)
+    if (
+        payload.get("schema_version") != "zero-update-terminal-failure-v1"
+        or payload.get("status") != "FAIL"
+        or payload.get("reason_code") != "P5_INVALID_SUBSET_PREDICTION"
+        or payload.get("test_stage_fingerprint") != current_freeze.get("stage_fingerprint")
+    ):
+        raise RunnerError("zero-update terminal failure record is invalid or belongs to another freeze")
+    freeze_path = context.output_root / "stage" / "test" / "stage_freeze.json"
+    if payload.get("stage_freeze_sha256") != sha256_file(freeze_path):
+        raise RunnerError("zero-update terminal failure record is not bound to the P3 freeze digest")
+    invalid = payload.get("invalid_subset")
+    if not isinstance(invalid, dict):
+        raise RunnerError("zero-update terminal failure record lacks invalid subset evidence")
+    for prefix in ("stage_item", "zero_update_result", "subset_prediction"):
+        artifact_path = Path(str(invalid.get(f"{prefix}_path", "")))
+        expected_sha = invalid.get(f"{prefix}_sha256")
+        if not artifact_path.is_file() or expected_sha != sha256_file(artifact_path):
+            raise RunnerError("zero-update terminal failure evidence digest mismatch")
+    zero_result = _load_json(Path(str(invalid["zero_update_result_path"])))
+    if zero_result.get("invalid_prediction") is not True or zero_result.get("identity") != invalid.get("identity"):
+        raise RunnerError("zero-update terminal failure does not reference an invalid subset")
+    return payload
+
+
+def _write_zero_update_terminal_failure(
+    context: RunnerContext,
+    *,
+    current_freeze: Mapping[str, Any],
+    item: ScheduleItem,
+    bundle: Path,
+    stage_item_path: Path,
+    result_path: Path,
+    artifact: Path,
+    reason_code: str,
+) -> Path:
+    output = _zero_update_terminal_failure_path(context)
+    if output.exists():
+        _load_zero_update_terminal_failure(context, current_freeze=current_freeze)
+        return output
+    freeze_path = context.output_root / "stage" / "test" / "stage_freeze.json"
+    payload = {
+        "schema_version": "zero-update-terminal-failure-v1",
+        "status": "FAIL",
+        "reason_code": "P5_INVALID_SUBSET_PREDICTION",
+        "test_stage_fingerprint": current_freeze.get("stage_fingerprint"),
+        "stage_freeze_sha256": sha256_file(freeze_path),
+        "invalid_subset": {
+            "model": item.model,
+            "condition": item.condition,
+            "sample_key": str(item.sample_key),
+            "identity": item.identity,
+            "subset": list(item.subset) if item.subset is not None else None,
+            "adapter_reason_code": reason_code,
+            "bundle_path": str(bundle),
+            "stage_item_path": str(stage_item_path),
+            "stage_item_sha256": sha256_file(stage_item_path),
+            "zero_update_result_path": str(result_path),
+            "zero_update_result_sha256": sha256_file(result_path),
+            "subset_prediction_path": str(artifact),
+            "subset_prediction_sha256": sha256_file(artifact),
+        },
+    }
+    _atomic_json(output, payload)
+    return output
+
+
 def build_zero_update_evidence(context: RunnerContext) -> list[Path] | None:
     root = context.output_root / "stage" / "zero-update" / "bundles"
     if not root.exists():
@@ -1488,56 +1588,83 @@ def build_zero_update_evidence(context: RunnerContext) -> list[Path] | None:
     output_root = context.output_root / "stage" / "test" / "zero_update"
     written: list[Path] = []
     omitted_pairs = [list(pair) for pair in ZERO_UPDATE_SUBSETS]
+    canonical_gate = {"schema_version": "native-phenomenon-gate-v1", "status": "PASS"}
+    expected_items = build_zero_update_schedule(context.root, canonical_gate, model="all")
+    indexed: dict[tuple[str, str, str, tuple[int, int]], dict[str, str]] = {}
+    missing = False
+    for item in expected_items:
+        bundle = _zero_update_bundle_dir(context.output_root, item)
+        if not bundle.exists():
+            missing = True
+            continue
+        stage_item_path = bundle / "stage_item.json"
+        result_path = bundle / "zero_update_result.json"
+        artifact = bundle / "subset_prediction.npz"
+        if not stage_item_path.exists() or not result_path.exists() or not artifact.exists():
+            raise RunnerError("zero-update committed bundle is incomplete")
+        stage_item = _load_json(stage_item_path)
+        expected_linkage = {
+            "identity": item.identity,
+            "stage": "zero-update",
+            "model": item.model,
+            "sample_key": str(item.sample_key),
+            "condition": item.condition,
+            "severity": item.severity,
+            "subset": list(item.subset) if item.subset is not None else None,
+            "parent_identity": item.parent_identity,
+            "stage_fingerprint": current_freeze.get("stage_fingerprint"),
+        }
+        if any(stage_item.get(key) != value for key, value in expected_linkage.items()):
+            raise RunnerError("zero-update committed bundle linkage conflicts with the frozen schedule")
+        if stage_item.get("freeze") != current_freeze:
+            raise RunnerError("zero-update committed bundle is not bound to the exact P3 freeze")
+        zero_result = _load_json(result_path)
+        artifact_sha = sha256_file(artifact)
+        result_sha = sha256_file(result_path)
+        if (
+            zero_result.get("schema_version") != "zero-update-result-v1"
+            or zero_result.get("identity") != item.identity
+            or zero_result.get("subset_prediction_sha256") != artifact_sha
+            or stage_item.get("subset_prediction_sha256") != artifact_sha
+            or stage_item.get("zero_update_result_sha256") != result_sha
+        ):
+            raise RunnerError("zero-update evidence artifact digest or identity mismatch")
+        _parent_dir, parent_manifest, parent_prediction, _parent_audit = _parent_bundle_for_zero_update(context, item)
+        if zero_result.get("invalid_prediction") is True:
+            terminal = _write_zero_update_terminal_failure(
+                context,
+                current_freeze=current_freeze,
+                item=item,
+                bundle=bundle,
+                stage_item_path=stage_item_path,
+                result_path=result_path,
+                artifact=artifact,
+                reason_code=str(zero_result.get("reason_code", "INVALID_PREDICTION")),
+            )
+            raise ZeroUpdateTerminalFailure(terminal)
+        _validate_zero_subset_npz(
+            artifact,
+            item,
+            parent_manifest=parent_manifest,
+            parent_prediction=parent_prediction,
+        )
+        key = (item.model, item.condition, item.sample_key.scene, tuple(item.subset or ()))
+        if key in indexed:
+            raise RunnerError("duplicate zero-update subset artifact")
+        indexed[key] = {"artifact_path": str(artifact), "artifact_sha256": artifact_sha}
+    if missing:
+        return None
     for model in MODELS:
         for condition in ("fog", "low-light-noise", "defocus"):
             source_keys = _severity2_source_keys(model, condition)
             subset_artifacts: dict[str, list[dict[str, str]]] = {f"scan{scene}": [] for scene in TEST_SCENES}
-            indexed: dict[tuple[str, tuple[int, int]], dict[str, str]] = {}
-            for bundle in sorted((root / model.lower()).glob("*")):
-                stage_item = _load_json(bundle / "stage_item.json") if (bundle / "stage_item.json").exists() else {}
-                if stage_item.get("stage_fingerprint") != current_freeze.get("stage_fingerprint"):
-                    continue
-                if stage_item.get("condition") != condition or int(stage_item.get("severity", -1)) != 2:
-                    continue
-                sample = SampleKey.parse(str(stage_item.get("sample_key")))
-                sample_key = str(stage_item.get("sample_key"))
-                if sample_key not in source_keys:
-                    continue
-                subset = tuple(int(value) for value in stage_item.get("subset", ()))
-                if subset not in ZERO_UPDATE_SUBSETS:
-                    continue
-                artifact = bundle / "subset_prediction.npz"
-                if not artifact.exists():
-                    continue
-                item = ScheduleItem("zero-update", model, SampleKey.parse(sample_key), int(sample.scene[4:]), condition, 2, (), str(stage_item.get("identity", "0")), subset, str(stage_item.get("parent_identity", "")))
-                try:
-                    _parent_dir, parent_manifest, parent_prediction, _parent_audit = _parent_bundle_for_zero_update(context, item)
-                    result_path = bundle / "zero_update_result.json"
-                    if not result_path.exists():
-                        continue
-                    zero_result = _load_json(result_path)
-                    if zero_result.get("invalid_prediction") is True:
-                        continue
-                    if (
-                        zero_result.get("subset_prediction_sha256") != sha256_file(artifact)
-                        or stage_item.get("subset_prediction_sha256") != sha256_file(artifact)
-                        or stage_item.get("zero_update_result_sha256") != sha256_file(result_path)
-                    ):
-                        raise RunnerError("zero-update evidence artifact digest mismatch")
-                    _validate_zero_subset_npz(artifact, item, parent_manifest=parent_manifest, parent_prediction=parent_prediction)
-                except RunnerError:
-                    continue
-                key = (sample.scene, subset)
-                if key in indexed:
-                    raise RunnerError("duplicate zero-update subset artifact")
-                indexed[key] = {"artifact_path": str(artifact), "artifact_sha256": sha256_file(artifact)}
             for scene in (f"scan{scene_id}" for scene_id in TEST_SCENES):
                 for subset in ZERO_UPDATE_SUBSETS:
-                    artifact = indexed.get((scene, subset))
+                    artifact = indexed.get((model, condition, scene, subset))
                     if artifact is not None:
                         subset_artifacts[scene].append(artifact)
             if any(len(rows) != 4 for rows in subset_artifacts.values()):
-                return None
+                raise RunnerError("zero-update evidence index is incomplete after complete schedule validation")
             path = output_root / f"{model.lower()}_{condition.replace('-', '_')}.json"
             _atomic_json(path, {"schema_version": "zero-update-v1", "model": model, "condition": f"{condition}-s2", "n_resamples": 10000, "omitted_view_pairs": omitted_pairs, "subset_artifacts": subset_artifacts, "source_sample_keys": source_keys})
             written.append(path)
@@ -1737,6 +1864,22 @@ def run_stage(
         freeze = ensure_stage_freeze(context, "test", dry_run=dry_run) if stage == "test" else {"stage": stage, "frozen": False, "dry_run": dry_run}
         if stage == "test":
             fingerprint = dict(freeze)
+    if stage == "zero-update" and not dry_run:
+        terminal = _load_zero_update_terminal_failure(
+            context,
+            current_freeze=fingerprint,
+        )
+        if terminal is not None:
+            terminal_path = _zero_update_terminal_failure_path(context)
+            return {
+                "status": "FAIL",
+                "stage": stage,
+                "dry_run": False,
+                "reason_code": "P5_INVALID_SUBSET_PREDICTION",
+                "schedule_counts": stage_progress_counts(context.output_root, stage, full),
+                "terminal_failure_path": str(terminal_path),
+                "terminal_failure_sha256": sha256_file(terminal_path),
+            }
     budget = estimate_stage_budget(context, stage, full, budget_override)
     if budget["status"] != "OK" and not dry_run:
         return {"status": budget["status"], "stage": stage, "dry_run": dry_run, "budget": budget, "schedule_counts": stage_progress_counts(context.output_root, stage, full)}
@@ -1750,7 +1893,18 @@ def run_stage(
         summary["results"] = [asdict(result) for result in results]
         summary["schedule_counts"] = stage_progress_counts(context.output_root, stage, full)
         summary["ledger"] = read_stage_ledger(context.output_root, stage)["counts"]
-        zero_written = build_zero_update_evidence(context)
+        try:
+            zero_written = build_zero_update_evidence(context)
+        except ZeroUpdateTerminalFailure as exc:
+            summary.update(
+                {
+                    "status": "FAIL",
+                    "reason_code": "P5_INVALID_SUBSET_PREDICTION",
+                    "terminal_failure_path": str(exc.path),
+                    "terminal_failure_sha256": sha256_file(exc.path),
+                }
+            )
+            return summary
         if zero_written is not None:
             summary["zero_update_evidence_count"] = len(zero_written)
             evidence_path = build_stage_evidence_manifest(context, p3_only=True)

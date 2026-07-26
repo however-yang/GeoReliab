@@ -41,6 +41,7 @@ def _write_json(path: Path, payload: dict) -> Path:
 
 
 def _overlay(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "[runtime]\n"
         f"root = '{path.parent.as_posix()}'\n"
@@ -669,6 +670,12 @@ def test_zero_update_executes_six_view_subsets_with_parent_linkage(tmp_path: Pat
     skipped = runner.execute_zero_update_item(context, subsets[0], adapter_factory=lambda _m, _c: adapter, stage_fingerprint=runner.ensure_stage_freeze(context, "test", dry_run=True))
     assert skipped.state == "skipped"
 
+    original_artifact = artifact.read_bytes()
+    artifact.write_bytes(original_artifact + b"tamper")
+    with pytest.raises(runner.RunnerError, match="digest or identity mismatch"):
+        runner.build_zero_update_evidence(context)
+    artifact.write_bytes(original_artifact)
+
     invalid_parent = next(item for item in runner.build_schedule(root, "test", model="mast3r") if item.condition == "fog" and item.severity == 2)
     runner.execute_item(context, invalid_parent, adapter_factory=lambda _m, _c: FakeAdapter(), audit_factory=_audit_factory, stage_fingerprint=runner.ensure_stage_freeze(context, "test", dry_run=True))
     invalid_subset = next(item for item in runner.build_zero_update_schedule(root, gate, model="mast3r") if item.parent_identity == invalid_parent.identity)
@@ -679,6 +686,14 @@ def test_zero_update_executes_six_view_subsets_with_parent_linkage(tmp_path: Pat
     assert invalid_skip.state == "skipped"
     assert invalid_skip.invalid_prediction is True
     assert invalid_skip.reason_code == "INVALID_PREDICTION"
+    with pytest.raises(runner.ZeroUpdateTerminalFailure, match="P5_INVALID_SUBSET_PREDICTION") as terminal_exc:
+        runner.build_zero_update_evidence(context)
+    terminal_path = terminal_exc.value.path
+    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+    assert terminal["status"] == "FAIL"
+    assert terminal["reason_code"] == "P5_INVALID_SUBSET_PREDICTION"
+    assert terminal["invalid_subset"]["identity"] == invalid_subset.identity
+    assert runner._load_zero_update_terminal_failure(context, current_freeze=runner.ensure_stage_freeze(context, "test", dry_run=True)) == terminal
 
 
 def test_full_stage_evidence_chain_reaches_task3_loader_and_freezes_p3(tmp_path: Path, monkeypatch):
@@ -726,8 +741,11 @@ def test_full_stage_evidence_chain_reaches_task3_loader_and_freezes_p3(tmp_path:
 
 def test_preflight_real_runs_two_independent_repeats_and_blocks_threshold(tmp_path: Path, monkeypatch):
     root = _minimal_root(tmp_path)
-    context = runner.RunnerContext(root=root, output_root=tmp_path / "out", config_path=None, device="cuda:0")
-    monkeypatch.setattr(runner, "_verify_stage_readiness", lambda *_args: None)
+    output_root = tmp_path / "out"
+    output_root.mkdir()
+    config = _overlay(output_root / "overlay.toml")
+    context = runner.RunnerContext(root=root, output_root=output_root, config_path=config, device="cuda:0")
+    monkeypatch.setattr(runner, "_verify_stage_readiness", lambda current, *_args: runner._verify_output_root_policy(current))
     payload = runner.run_preflight_real(
         context,
         dry_run=False,
@@ -748,7 +766,12 @@ def test_preflight_real_runs_two_independent_repeats_and_blocks_threshold(tmp_pa
     ])
     monkeypatch.setattr(runner, "_preflight_repeat_snapshot", lambda _root: next(snapshots))
     blocked = runner.run_preflight_real(
-        runner.RunnerContext(root=root, output_root=tmp_path / "out_block", config_path=None, device="cuda:0"),
+        runner.RunnerContext(
+            root=root,
+            output_root=(tmp_path / "out_block"),
+            config_path=_overlay((tmp_path / "out_block" / "overlay.toml")),
+            device="cuda:0",
+        ),
         dry_run=False,
         adapter_factory=lambda _m, _c: FakeAdapter(),
         audit_factory=_audit_factory,
@@ -824,9 +847,38 @@ def test_real_output_policy_requires_exact_non_home_overlay_root(tmp_path: Path)
     root.mkdir()
     config = _overlay(root / "overlay.toml")
     runner._verify_output_root_policy(runner.RunnerContext(root=root, output_root=root, config_path=config, device="cuda:0"))
+    for label in ("repeat-a", "repeat-b"):
+        runner._verify_output_root_policy(
+            runner.RunnerContext(
+                root=root,
+                output_root=root / "preflight-real" / label,
+                config_path=config,
+                device="cuda:0",
+            )
+        )
     with pytest.raises(runner.RunnerError, match="must equal"):
         runner._verify_output_root_policy(runner.RunnerContext(root=root, output_root=tmp_path / "other", config_path=config, device="cuda:0"))
     home_config = tmp_path / "home.toml"
     home_config.write_text("[runtime]\nroot='/home/smli/GeoReliab'\n", encoding="utf-8")
     with pytest.raises(runner.RunnerError, match="below /home"):
         runner._verify_output_root_policy(runner.RunnerContext(root=root, output_root=root, config_path=home_config, device="cuda:0"))
+
+
+def test_runtime_output_directories_cannot_dirty_source_worktree():
+    source_root = runner._source_root()
+    for candidate in (
+        "stage/test/probe.json",
+        "preflight-real/repeat-a/probe.json",
+        "prepared/probe.json",
+        "rendered/test/probe.png",
+        "manifests/probe.json",
+        "evidence/probe.json",
+        "git/GeoReliab.git/HEAD",
+        "worktrees/probe/HEAD",
+    ):
+        checked = subprocess.run(
+            ["git", "check-ignore", "--quiet", candidate],
+            cwd=source_root,
+            check=False,
+        )
+        assert checked.returncode == 0, candidate

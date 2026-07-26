@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+/pytest_tmp*/
 .venv/
 
 .worktrees/
@@ -14,3 +15,14 @@ outputs/
 runs/
 logs/
 *.partial
+
+# Frozen runtime state is generated beneath /srv/private/smli/GeoReliab.
+/stage/
+/preflight-real/
+/prepared/
+/rendered/
+/manifests/
+/evidence/
+/mast3r_cache/
+/git/
+/worktrees/
