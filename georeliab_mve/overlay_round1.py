@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
-import tomllib
 
+from . import toml_compat as tomllib
 from .preparation import A100Overlay as _BaseOverlay, PreparationError
 
 

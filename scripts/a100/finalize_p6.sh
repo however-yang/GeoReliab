@@ -59,10 +59,7 @@ fi
 "$(orchestrator_python "$overlay")" - "$status_live" "$native_gate" "$gate_path" "$overlay" "$commit" "$p5_terminal_failure" <<'PY'
 import json, math, sys
 from pathlib import Path
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
+from georeliab_mve import toml_compat as tomllib
 
 status_path, native_path, gate_path, overlay_path, commit, terminal_path = sys.argv[1:]
 status = json.loads(Path(status_path).read_text(encoding='utf-8'))
@@ -166,10 +163,7 @@ PY
 "$(orchestrator_python "$overlay")" - "$overlay" "$root" "$commit" "$worktree" "$status_core" "$gate_path" "$final_stage" "$p5_terminal_failure" <<'PY' | write_immutable_file "$root" "$bundle_path"
 import json, subprocess, sys
 from pathlib import Path
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
+from georeliab_mve import toml_compat as tomllib
 
 overlay, root, commit, worktree, status_path, gate_path, final_stage, terminal_failure = sys.argv[1:]
 root = Path(root); overlay_path = Path(overlay); status_path = Path(status_path); gate_path = Path(gate_path)

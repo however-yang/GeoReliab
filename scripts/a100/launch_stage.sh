@@ -85,10 +85,7 @@ enforce_stage_gpu_budget() {
     "$python" - "$overlay" "$root" "$runner_stage" <<'PY'
 import json, sys
 from pathlib import Path
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
+from georeliab_mve import toml_compat as tomllib
 from georeliab_mve.runner import (
     RunnerContext, build_zero_update_schedule, estimate_stage_budget,
     full_schedule, load_native_phenomenon_gate,

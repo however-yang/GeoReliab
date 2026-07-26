@@ -60,10 +60,7 @@ lock_path="$lock_dir/a100_environment_lock.json"
 "$python" - "$overlay" <<'PY' | write_immutable_file "$root" "$lock_path"
 import json, platform, subprocess, sys
 from pathlib import Path
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
+from georeliab_mve import toml_compat as tomllib
 overlay = Path(sys.argv[1])
 payload = tomllib.loads(overlay.read_text(encoding='utf-8'))
 def run(cmd): return subprocess.check_output(cmd, text=True).strip()

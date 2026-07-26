@@ -14,10 +14,12 @@ import json
 import math
 from pathlib import Path
 import re
-from typing import Any, ClassVar, Mapping, Self
+from typing import Any, ClassVar, Mapping, TypeVar
 from urllib.parse import unquote, urlparse
 
 import numpy as np
+
+Self = TypeVar('Self')
 
 
 SCHEMA_VERSION = '1.1'

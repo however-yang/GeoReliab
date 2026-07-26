@@ -61,7 +61,7 @@ def _overlay(overlay_path: Path | None) -> A100Overlay:
 def _runtime_values(overlay: A100Overlay) -> dict[str, object]:
     # A100Overlay intentionally stores only root/resources/execution. Preserve
     # extra runtime identities from TOML for validation without exposing writes.
-    import tomllib
+    from . import toml_compat as tomllib
     return tomllib.loads(overlay.source.read_text(encoding='utf-8')).get('runtime', {})
 
 

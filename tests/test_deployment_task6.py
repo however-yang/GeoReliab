@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import subprocess
-import tomllib
 from pathlib import Path
 
 import pytest
 
+from georeliab_mve import toml_compat as tomllib
 from georeliab_mve.preparation import A100Overlay
 
 
@@ -204,3 +204,5 @@ def test_prereqs_enforce_storage_cap_device_count_and_frozen_env_orchestrator() 
     assert 'orchestrator_python' in common
     assert 'runtime.vggt_env' in common
     assert 'die "frozen VGGT environment Python is required' in common
+    assert 'toml_compat' in common
+    assert 'import tomli' not in common

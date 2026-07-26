@@ -17,13 +17,13 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
-import tomllib
 from typing import Any, Callable, Mapping, Sequence
 import argparse
 import sys
 
 import numpy as np
 
+from . import toml_compat as tomllib
 from .adapters import RenderedView
 from .contracts import (
     AuditRecord,

@@ -3,6 +3,7 @@ set -euo pipefail
 
 readonly DEFAULT_OVERLAY="configs/a100_real_mve_overlay.toml"
 readonly DEFAULT_ROOT="/srv/private/smli/GeoReliab"
+readonly GEORELIAB_PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 info() { printf '[georeliab] %s\n' "$*"; }
@@ -15,13 +16,11 @@ python_bin() {
 
 overlay_value() {
   local overlay=$1 dotted=$2
-  "$(python_bin)" - "$overlay" "$dotted" <<'PY'
+  PYTHONPATH="$GEORELIAB_PROJECT_ROOT/georeliab_mve${PYTHONPATH:+:$PYTHONPATH}" \
+    "$(python_bin)" - "$overlay" "$dotted" <<'PY'
 import sys
 from pathlib import Path
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
+import toml_compat as tomllib
 payload = tomllib.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
 value = payload
 for part in sys.argv[2].split('.'):

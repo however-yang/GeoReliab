@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import tomllib
-from typing import Any, Self
+from typing import Any, TypeVar
+
+from . import toml_compat as tomllib
 
 from .gates import (
     GEOMETRY_DELTA_THRESHOLD,
@@ -20,6 +21,8 @@ from .gates import (
     GEORELIAB_REQUIRED_CORRUPTIONS,
 )
 from .readiness import ResourceGroupRequirement, ResourceSpec
+
+Self = TypeVar('Self')
 
 GEOMETRY_CHECKPOINT_RESOURCES = frozenset(
     {

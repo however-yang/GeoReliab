@@ -15,13 +15,14 @@ import json
 import math
 from pathlib import Path
 import struct
-import tomllib
 from typing import Any
 import urllib.request
 import zipfile
 import zlib
 
 import numpy as np
+
+from . import toml_compat as tomllib
 
 
 TEST_SCENES = (
