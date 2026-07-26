@@ -7,6 +7,7 @@ Status: implemented, locally verified, and ready for independent review.
 - `983b538` — initial resumable runner governance and frozen schedules.
 - `bf68876` — frozen-DTU production audit binding for runner artifacts.
 - `3046b013e6b079f24e45841d3cd9c3b79743c0f9` — final fail-closed orchestration, P3/P5 evidence integration, worker isolation, budget, CLI, and regression fixes.
+- `7157c9c` — independent-review fixes for preflight namespaces, runtime-tree hygiene, and explicit terminal P5 invalid evidence.
 
 ## Files and public surfaces
 
@@ -35,6 +36,8 @@ Status: implemented, locally verified, and ready for independent review.
 - Complete artifacts are skipped only after contract, linkage, stage-fingerprint, and digest validation. Invalid predictions remain explicit schedule completions and retain their failure evidence.
 - Test and zero-update evidence are bound to the immutable P3 stage freeze. The P4 decision is recomputed from current P3 evidence, so a caller cannot inject or edit PASS. Zero-update result and subset NPZ digests are both bound by `stage_item.json`.
 - Claims default to a six-hour stale window. Ledger locks recover only after a 60-second stale threshold; each row records state, attempt, timestamp, runtime, peak memory, reason, artifact digests, and bytes.
+- `preflight-real/repeat-a` and `repeat-b` are the only controlled subdirectories allowed below the frozen runtime root. Runtime `stage`, preflight, prepared/rendered, manifest/evidence, bare-repository, and detached-worktree directories are ignored so runner outputs cannot dirty the source-tree provenance guard.
+- P5 aggregation iterates the exact expected 480-item schedule. Missing uncommitted items remain resumable; digest/linkage conflicts hard-fail; any committed invalid subset creates a digest-bound `P5_INVALID_SUBSET_PREDICTION` terminal artifact and machine-readable FAIL summary.
 - Successful and failed frozen-environment worker stdout/stderr are atomically retained with SHA-256 in machine-readable summaries.
 - Budget estimation uses observed earlier-stage ledgers and materialized output size. Missing estimates block P2/P3/P5, cumulative use is charged, and the 400-run test grid cannot be reduced to fit.
 
@@ -47,8 +50,8 @@ Status: implemented, locally verified, and ready for independent review.
 
 ## Verification
 
-- `python -m pytest tests\test_runner_task5.py tests\test_runner_audit_task5.py -q` → 20 passed in 516.7s; one third-party `pytest-asyncio` deprecation warning.
-- `python -m pytest -q` → 180 passed in 680s; one third-party `pytest-asyncio` deprecation warning.
+- `python -m pytest tests\test_runner_task5.py tests\test_runner_audit_task5.py -q` → 21 passed in 531.1s; one third-party `pytest-asyncio` deprecation warning.
+- `python -m pytest -q --basetemp C:\tmp\georeliab-full-final-20260727-0411` → 181 passed in 655.9s; one third-party `pytest-asyncio` deprecation warning. A prior default-basetemp attempt was discarded after a host/temp-permission process interruption without a pytest traceback; explicit isolated basetemp produced the authoritative result.
 - `python -m compileall -q georeliab_mve tests` → pass.
 - `git diff --check` → pass; only Git LF→CRLF working-copy notices were emitted.
 
@@ -59,3 +62,11 @@ Status: implemented, locally verified, and ready for independent review.
 - Successful worker logs are preserved, but external scheduler logs and detached-worktree lifecycle still need Task 6 scripts and operator documentation.
 - The six-hour claim timeout assumes one model-condition item completes within six hours. If real MASt3R timings violate that assumption, add a claim heartbeat; do not shorten the frozen schedule or silently reclaim a live item.
 - P4 failure must remain terminal for GeoReliab and must continue to short-circuit downstream/zero-update. A GeoReliab PASS remains pending Geometry evidence under the global selector.
+
+## Independent review round 1
+
+Status: `REQUEST_CHANGES`, all three blocking findings addressed in `7157c9c`.
+
+- Fixed P1: repeat contexts now pass the root policy only for the two frozen preflight namespaces; regression tests exercise the actual policy instead of replacing it with a no-op.
+- Fixed resume hygiene: all generated runtime roots are anchored in `.gitignore`, with `git check-ignore` regression coverage.
+- Fixed P5 fail-closed semantics: relevant committed bundles can no longer be skipped on stage/linkage/digest errors, invalid subsets persist an immutable terminal FAIL record, and both tamper and normal 480-subset aggregate paths are tested.
