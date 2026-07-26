@@ -58,3 +58,13 @@ def test_georeliab_pass_pending_geometry_has_explicit_reason_code():
         decision('georeliab', GateStatus.PASS),
     )
     assert selected.reason == 'GEORELIAB_PASS_PENDING_GEOMETRY'
+
+
+def test_smoke_selection_preserves_smoke_validity_and_reason():
+    smoke = ScientificValidity.NON_SCIENTIFIC_SMOKE
+    selected = select_track(
+        decision('geometry', GateStatus.BLOCKED, smoke),
+        decision('georeliab', GateStatus.BLOCKED, smoke),
+    )
+    assert selected.scientific_validity is smoke
+    assert 'smoke' in selected.reason.lower()

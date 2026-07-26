@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from georeliab_mve.cli import _geometry_input, main, run_dry_run
+from georeliab_mve.cli import _geometry_input, _georeliab_input, main, run_dry_run
 from georeliab_mve.contracts import RunMode
 from georeliab_mve.protocol import ProtocolConfig, ProtocolError
 from georeliab_mve.readiness import (
@@ -139,6 +139,8 @@ def test_cli_readiness_returns_blocked_exit_code():
 def test_gate_json_parser_rejects_string_booleans_and_string_lists():
     payload = {
         'scientific_validity': 'SCIENTIFIC',
+        'run_mode': 'real',
+        'evidence_schema_version': '1.1',
         'reproducible_checkpoints': ['Spatial-MLLM', 'SpatialStack'],
         'hookable_models': ['Spatial-MLLM', 'SpatialStack'],
         'required_datasets_ready': 'false',
@@ -184,9 +186,52 @@ def test_gate_json_parser_rejects_string_booleans_and_string_lists():
         raise AssertionError('string evidence boolean was accepted')
 
 
+def test_gate_json_parser_requires_current_real_evidence_metadata():
+    geometry = {
+        'scientific_validity': 'SCIENTIFIC',
+        'reproducible_checkpoints': [],
+        'hookable_models': [],
+        'required_datasets_ready': False,
+        'fixed_inputs_verified': False,
+        'zeroing_effective': False,
+        'matched_intervention_effective': False,
+        'evidence': [],
+    }
+    for key, value in (
+        ('run_mode', None),
+        ('run_mode', 'fixture'),
+        ('run_mode', 'smoke'),
+        ('evidence_schema_version', None),
+        ('evidence_schema_version', '1.0'),
+    ):
+        candidate = dict(geometry)
+        if value is not None:
+            candidate[key] = value
+        try:
+            _geometry_input(candidate)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'{key}={value!r} was accepted')
+    georeliab = {
+        'scientific_validity': 'SCIENTIFIC',
+        'run_mode': 'real',
+        'evidence_schema_version': '1.1',
+        'required_models_ready': [],
+        'required_datasets_ready': False,
+        'tartanair_native_fog_sanity': False,
+        'conditions': [],
+        'downstream_harm': [],
+        'zero_update': [],
+    }
+    assert _georeliab_input(georeliab).run_mode is RunMode.REAL
+
+
 def test_cli_returns_success_when_georeliab_is_selected(tmp_path):
     geometry = {
         'scientific_validity': 'SCIENTIFIC',
+        'run_mode': 'real',
+        'evidence_schema_version': '1.1',
         'reproducible_checkpoints': ['Spatial-MLLM', 'SpatialStack'],
         'hookable_models': ['Spatial-MLLM', 'SpatialStack'],
         'required_datasets_ready': True,
@@ -212,6 +257,8 @@ def test_cli_returns_success_when_georeliab_is_selected(tmp_path):
     ]
     georeliab = {
         'scientific_validity': 'SCIENTIFIC',
+        'run_mode': 'real',
+        'evidence_schema_version': '1.1',
         'required_models_ready': ['VGGT', 'MASt3R'],
         'required_datasets_ready': True,
         'tartanair_native_fog_sanity': True,

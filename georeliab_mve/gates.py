@@ -605,12 +605,24 @@ def select_track(
         geometry.scientific_validity is not ScientificValidity.SCIENTIFIC
         or georeliab.scientific_validity is not ScientificValidity.SCIENTIFIC
     ):
+        validity = (
+            ScientificValidity.NON_SCIENTIFIC_SMOKE
+            if (
+                geometry.scientific_validity is ScientificValidity.NON_SCIENTIFIC_SMOKE
+                or georeliab.scientific_validity is ScientificValidity.NON_SCIENTIFIC_SMOKE
+            )
+            else ScientificValidity.NON_SCIENTIFIC_FIXTURE
+        )
         return SelectionDecision(
             selected_track=SelectedTrack.NON_SCIENTIFIC,
-            reason="fixture evidence cannot select a scientific track",
+            reason=(
+                'smoke evidence cannot select a scientific track'
+                if validity is ScientificValidity.NON_SCIENTIFIC_SMOKE
+                else 'fixture evidence cannot select a scientific track'
+            ),
             geometry_status=geometry.status,
             georeliab_status=georeliab.status,
-            scientific_validity=ScientificValidity.NON_SCIENTIFIC_FIXTURE,
+            scientific_validity=validity,
         )
     if not geometry.status.is_terminal or not georeliab.status.is_terminal:
         pending_georeliab = (

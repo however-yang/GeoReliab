@@ -254,6 +254,8 @@ class RunManifest:
             source_schema = data.get('schema_version', LEGACY_SCHEMA_VERSION)
             if source_schema not in (LEGACY_SCHEMA_VERSION, SCHEMA_VERSION):
                 raise ContractError(f'unsupported schema_version {source_schema!r}')
+            if source_schema == LEGACY_SCHEMA_VERSION and data.get('mode') == RunMode.SMOKE.value:
+                raise ContractError('v1.0 artifacts cannot use smoke mode')
             data['schema_version'] = SCHEMA_VERSION
             data['_legacy_v1_0'] = source_schema == LEGACY_SCHEMA_VERSION
             data['mode'] = RunMode(data['mode'])
@@ -466,7 +468,10 @@ def _local_payload_path(uri: str, field_name: str) -> Path:
     parsed = urlparse(uri)
     if parsed.scheme != 'file' or parsed.netloc not in ('', 'localhost'):
         raise ContractError(f'{field_name} must be a local file URI for validation')
-    return Path(unquote(parsed.path.lstrip('/')))
+    payload_path = unquote(parsed.path)
+    if re.match(r'^/[A-Za-z]:/', payload_path):
+        payload_path = payload_path[1:]
+    return Path(payload_path)
 
 
 def _load_npz(uri: str, field_name: str) -> dict[str, np.ndarray]:
@@ -590,9 +595,23 @@ def validate_artifact_bundle(
         'native_confidence_uri',
         'valid_mask_uri',
     ):
+        expected_digest = prediction.payload_digests.get(field_name, '')
+        if (
+            manifest.scientific_validity is ScientificValidity.SCIENTIFIC
+            and not expected_digest
+        ):
+            raise ContractError(f'{field_name} requires a payload digest for scientific evidence')
         _validate_payload_digest(
             getattr(prediction, field_name),
-            prediction.payload_digests.get(field_name, ''),
+            expected_digest,
             field_name,
         )
+    dense_digest = audit.metadata.get('dense_audit_sha256', '')
+    if manifest.scientific_validity is ScientificValidity.SCIENTIFIC and not dense_digest:
+        raise ContractError('dense_audit_uri requires a payload digest for scientific evidence')
+    if dense_digest and not _SHA256_RE.fullmatch(dense_digest):
+        raise ContractError('dense_audit_sha256 must be a lowercase SHA-256 digest')
+    _validate_payload_digest(
+        audit.metadata['dense_audit_uri'], dense_digest, 'dense_audit_uri'
+    )
 

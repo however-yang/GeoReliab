@@ -135,6 +135,18 @@ def test_mast3r_provenance_requires_dust3r_and_croco():
         RunManifest.from_dict(payload)
 
 
+def test_v1_0_smoke_manifest_cannot_bypass_provenance():
+    payload = fixture_manifest().to_dict()
+    payload.update(
+        schema_version='1.0',
+        mode='smoke',
+        scientific_validity='NON_SCIENTIFIC_SMOKE',
+        checkpoint_hash=SHA256,
+    )
+    with pytest.raises(ContractError, match='v1.0'):
+        RunManifest.from_dict(payload)
+
+
 def _bundle_records(tmp_path, *, digest=''):
     geometry = tmp_path / 'geometry.npz'
     confidence = tmp_path / 'confidence.npz'
@@ -205,6 +217,19 @@ def test_bundle_validator_rejects_payload_and_linkage_failures(tmp_path):
 
     manifest, prediction, audit = _bundle_records(tmp_path, digest=SHA256)
     with pytest.raises(ContractError, match='digest mismatch'):
+        validate_artifact_bundle(manifest, prediction, audit)
+
+    manifest, prediction, audit = _bundle_records(tmp_path)
+    audit = AuditRecord(
+        **{
+            **audit.to_dict(),
+            'metadata': {
+                **audit.metadata,
+                'dense_audit_sha256': SHA256,
+            },
+        }
+    )
+    with pytest.raises(ContractError, match='dense_audit_uri payload digest mismatch'):
         validate_artifact_bundle(manifest, prediction, audit)
 
     audit = AuditRecord(

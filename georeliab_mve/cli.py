@@ -85,9 +85,27 @@ def _require_records(
     return value
 
 
+def _require_scientific_gate_metadata(
+    payload: Mapping[str, Any]
+) -> tuple[RunMode, str]:
+    try:
+        run_mode = RunMode(payload['run_mode'])
+        schema_version = payload['evidence_schema_version']
+    except KeyError as exc:
+        raise ValueError(f'missing required scientific gate field: {exc.args[0]}') from exc
+    if run_mode is not RunMode.REAL:
+        raise ValueError('scientific gate JSON run_mode must be real')
+    if schema_version != '1.1':
+        raise ValueError('scientific gate JSON requires evidence_schema_version 1.1')
+    return run_mode, schema_version
+
+
 def _geometry_input(payload: Mapping[str, Any]) -> GeometryGateInput:
+    run_mode, evidence_schema_version = _require_scientific_gate_metadata(payload)
     return GeometryGateInput(
         scientific_validity=ScientificValidity(payload['scientific_validity']),
+        run_mode=run_mode,
+        evidence_schema_version=evidence_schema_version,
         reproducible_checkpoints=_require_string_list(
             payload, 'reproducible_checkpoints'
         ),
@@ -106,8 +124,11 @@ def _geometry_input(payload: Mapping[str, Any]) -> GeometryGateInput:
 
 
 def _georeliab_input(payload: Mapping[str, Any]) -> GeoReliabGateInput:
+    run_mode, evidence_schema_version = _require_scientific_gate_metadata(payload)
     return GeoReliabGateInput(
         scientific_validity=ScientificValidity(payload['scientific_validity']),
+        run_mode=run_mode,
+        evidence_schema_version=evidence_schema_version,
         required_models_ready=_require_string_list(
             payload, 'required_models_ready'
         ),
