@@ -126,11 +126,18 @@ def test_remote_inventory_rejects_missing_extra_and_misnamed_members():
 
 
 class _FakeHttpResponse:
-    def __init__(self, *, data: bytes = b"", fail_read: bool = False):
+    def __init__(
+        self,
+        *,
+        data: bytes = b"",
+        fail_read: bool = False,
+        read_error: BaseException | None = None,
+    ):
         self.status = 206
         self.headers = {"Content-Range": "bytes 2-5/10", "ETag": '"fixture-etag"'}
         self._data = data
         self._fail_read = fail_read
+        self._read_error = read_error
 
     def __enter__(self):
         return self
@@ -141,6 +148,8 @@ class _FakeHttpResponse:
     def read(self) -> bytes:
         if self._fail_read:
             raise TimeoutError("range read stalled")
+        if self._read_error is not None:
+            raise self._read_error
         return self._data
 
 
@@ -173,10 +182,46 @@ def test_range_request_fails_after_exact_bounded_timeout_attempts(monkeypatch):
         raise TimeoutError("range open stalled")
 
     monkeypatch.setattr(range_module.urllib.request, "urlopen", urlopen)
-    with pytest.raises(PreparationError, match="bytes=2-5.*timed out after 3 attempts"):
+    with pytest.raises(PreparationError, match="bytes=2-5.*failed after 3 transport attempts"):
         range_module._request_range("https://example.test/archive.zip", 2, 5)
     assert len(calls) == range_module._HTTP_MAX_ATTEMPTS
     assert [timeout for _request, timeout in calls] == [range_module._HTTP_TIMEOUT_SECONDS] * range_module._HTTP_MAX_ATTEMPTS
+
+
+def test_range_request_retries_transient_incomplete_read(monkeypatch):
+    import georeliab_mve.tartanair_range as range_module
+
+    calls = []
+
+    def urlopen(request, *, timeout):
+        calls.append((request, timeout))
+        if len(calls) == 1:
+            error = range_module.http.client.IncompleteRead(b"", 4)
+            return _FakeHttpResponse(read_error=error)
+        return _FakeHttpResponse(data=b"cdef")
+
+    monkeypatch.setattr(range_module.urllib.request, "urlopen", urlopen)
+    data, etag, total = range_module._request_range("https://example.test/archive.zip", 2, 5)
+    assert data == b"cdef"
+    assert etag == '"fixture-etag"'
+    assert total == 10
+    assert len(calls) == 2
+
+
+def test_range_request_fails_after_exact_bounded_incomplete_read_attempts(monkeypatch):
+    import georeliab_mve.tartanair_range as range_module
+
+    calls = []
+
+    def urlopen(request, *, timeout):
+        calls.append((request, timeout))
+        error = range_module.http.client.IncompleteRead(b"", 4)
+        return _FakeHttpResponse(read_error=error)
+
+    monkeypatch.setattr(range_module.urllib.request, "urlopen", urlopen)
+    with pytest.raises(PreparationError, match="bytes=2-5.*failed after 3 transport attempts"):
+        range_module._request_range("https://example.test/archive.zip", 2, 5)
+    assert len(calls) == range_module._HTTP_MAX_ATTEMPTS
 
 def test_range_materialization_is_atomic_reusable_and_tamper_closed(monkeypatch, tmp_path):
     import georeliab_mve.tartanair_range as range_module

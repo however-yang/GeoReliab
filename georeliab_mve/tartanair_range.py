@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import http.client
 from pathlib import Path
 import socket
 import struct
@@ -42,28 +43,28 @@ class RemoteZipIndex:
     central_directory_sha256: str
 
 
-def _is_timeout_error(exc: BaseException) -> bool:
-    if isinstance(exc, (TimeoutError, socket.timeout)):
+def _is_retryable_transport_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout, http.client.IncompleteRead)):
         return True
     if isinstance(exc, urllib.error.URLError):
         return isinstance(exc.reason, (TimeoutError, socket.timeout))
     return False
 
 
-def _retry_timeout(label: str, operation: Callable[[], Any]) -> Any:
+def _retry_transport(label: str, operation: Callable[[], Any]) -> Any:
     last: BaseException | None = None
     for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
         try:
             return operation()
         except Exception as exc:
-            if not _is_timeout_error(exc):
+            if not _is_retryable_transport_error(exc):
                 raise
             last = exc
             if attempt == _HTTP_MAX_ATTEMPTS:
                 break
     raise PreparationError(
-        f'{label} timed out after {_HTTP_MAX_ATTEMPTS} attempts '
-        f'with {_HTTP_TIMEOUT_SECONDS}s per attempt'
+        f'{label} failed after {_HTTP_MAX_ATTEMPTS} transport attempts '
+        f'with {_HTTP_TIMEOUT_SECONDS}s timeout per attempt'
     ) from last
 
 
@@ -90,7 +91,7 @@ def _request_range(url: str, start: int, end: int) -> tuple[bytes, str | None, i
                 raise PreparationError(f'HTTP Range response length mismatch: {len(data)} != {expected}')
             return data, response.headers.get('ETag'), total
 
-    return _retry_timeout(label, read_range)
+    return _retry_transport(label, read_range)
 
 
 def _zip64_values(extra: bytes, needs: int) -> tuple[int, ...]:
@@ -117,7 +118,7 @@ def _central_directory_location(url: str) -> tuple[int, int, int, str | None]:
                 raise PreparationError('official archive did not provide Content-Length')
             return int(length_header)
 
-    total = _retry_timeout(f'HTTP HEAD request for {url}', read_length)
+    total = _retry_transport(f'HTTP HEAD request for {url}', read_length)
     tail_start = max(0, total - 65_557)
     tail, etag, checked_total = _request_range(url, tail_start, total - 1)
     if checked_total != total:
