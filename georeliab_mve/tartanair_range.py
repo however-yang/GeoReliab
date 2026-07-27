@@ -11,12 +11,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
+import socket
 import struct
 from typing import Any, Callable, Sequence
+import urllib.error
 import urllib.request
 import zlib
 
 from .preparation import PreparationError
+
+_HTTP_TIMEOUT_SECONDS = 60
+_HTTP_MAX_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -37,25 +42,55 @@ class RemoteZipIndex:
     central_directory_sha256: str
 
 
+def _is_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        return isinstance(exc.reason, (TimeoutError, socket.timeout))
+    return False
+
+
+def _retry_timeout(label: str, operation: Callable[[], Any]) -> Any:
+    last: BaseException | None = None
+    for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            if not _is_timeout_error(exc):
+                raise
+            last = exc
+            if attempt == _HTTP_MAX_ATTEMPTS:
+                break
+    raise PreparationError(
+        f'{label} timed out after {_HTTP_MAX_ATTEMPTS} attempts '
+        f'with {_HTTP_TIMEOUT_SECONDS}s per attempt'
+    ) from last
+
+
 def _request_range(url: str, start: int, end: int) -> tuple[bytes, str | None, int]:
     if start < 0 or end < start:
         raise PreparationError('invalid HTTP byte range')
     request = urllib.request.Request(url, headers={'Range': f'bytes={start}-{end}'})
-    with urllib.request.urlopen(request) as response:
-        if response.status != 206:
-            raise PreparationError('official archive server must honor HTTP Range requests')
-        content_range = response.headers.get('Content-Range', '')
-        if '/' not in content_range:
-            raise PreparationError('HTTP Range response omitted Content-Range total')
-        try:
-            total = int(content_range.rsplit('/', 1)[1])
-        except ValueError as exc:
-            raise PreparationError('HTTP Range response has invalid total length') from exc
-        data = response.read()
-        expected = end - start + 1
-        if len(data) != expected:
-            raise PreparationError(f'HTTP Range response length mismatch: {len(data)} != {expected}')
-        return data, response.headers.get('ETag'), total
+    label = f'HTTP Range request bytes={start}-{end} for {url}'
+
+    def read_range() -> tuple[bytes, str | None, int]:
+        with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT_SECONDS) as response:
+            if response.status != 206:
+                raise PreparationError('official archive server must honor HTTP Range requests')
+            content_range = response.headers.get('Content-Range', '')
+            if '/' not in content_range:
+                raise PreparationError('HTTP Range response omitted Content-Range total')
+            try:
+                total = int(content_range.rsplit('/', 1)[1])
+            except ValueError as exc:
+                raise PreparationError('HTTP Range response has invalid total length') from exc
+            data = response.read()
+            expected = end - start + 1
+            if len(data) != expected:
+                raise PreparationError(f'HTTP Range response length mismatch: {len(data)} != {expected}')
+            return data, response.headers.get('ETag'), total
+
+    return _retry_timeout(label, read_range)
 
 
 def _zip64_values(extra: bytes, needs: int) -> tuple[int, ...]:
@@ -74,11 +109,15 @@ def _zip64_values(extra: bytes, needs: int) -> tuple[int, ...]:
 def _central_directory_location(url: str) -> tuple[int, int, int, str | None]:
     # EOCD is within the final 65,557 bytes unless archive comments are invalid.
     head = urllib.request.Request(url, method='HEAD')
-    with urllib.request.urlopen(head) as response:
-        length_header = response.headers.get('Content-Length')
-        if not length_header:
-            raise PreparationError('official archive did not provide Content-Length')
-        total = int(length_header)
+
+    def read_length() -> int:
+        with urllib.request.urlopen(head, timeout=_HTTP_TIMEOUT_SECONDS) as response:
+            length_header = response.headers.get('Content-Length')
+            if not length_header:
+                raise PreparationError('official archive did not provide Content-Length')
+            return int(length_header)
+
+    total = _retry_timeout(f'HTTP HEAD request for {url}', read_length)
     tail_start = max(0, total - 65_557)
     tail, etag, checked_total = _request_range(url, tail_start, total - 1)
     if checked_total != total:

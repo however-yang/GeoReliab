@@ -125,6 +125,59 @@ def test_remote_inventory_rejects_missing_extra_and_misnamed_members():
         validate_tartanair_indexes(wrong_range_image, depth)
 
 
+class _FakeHttpResponse:
+    def __init__(self, *, data: bytes = b"", fail_read: bool = False):
+        self.status = 206
+        self.headers = {"Content-Range": "bytes 2-5/10", "ETag": '"fixture-etag"'}
+        self._data = data
+        self._fail_read = fail_read
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        return False
+
+    def read(self) -> bytes:
+        if self._fail_read:
+            raise TimeoutError("range read stalled")
+        return self._data
+
+
+def test_range_request_retries_transient_timeout_and_preserves_invariants(monkeypatch):
+    import georeliab_mve.tartanair_range as range_module
+
+    calls = []
+
+    def urlopen(request, *, timeout):
+        calls.append((request, timeout))
+        return _FakeHttpResponse(data=b"cdef", fail_read=len(calls) == 1)
+
+    monkeypatch.setattr(range_module.urllib.request, "urlopen", urlopen)
+    data, etag, total = range_module._request_range("https://example.test/archive.zip", 2, 5)
+    assert data == b"cdef"
+    assert etag == '"fixture-etag"'
+    assert total == 10
+    assert len(calls) == 2
+    assert [timeout for _request, timeout in calls] == [range_module._HTTP_TIMEOUT_SECONDS] * 2
+    assert [request.get_header("Range") for request, _timeout in calls] == ["bytes=2-5"] * 2
+
+
+def test_range_request_fails_after_exact_bounded_timeout_attempts(monkeypatch):
+    import georeliab_mve.tartanair_range as range_module
+
+    calls = []
+
+    def urlopen(request, *, timeout):
+        calls.append((request, timeout))
+        raise TimeoutError("range open stalled")
+
+    monkeypatch.setattr(range_module.urllib.request, "urlopen", urlopen)
+    with pytest.raises(PreparationError, match="bytes=2-5.*timed out after 3 attempts"):
+        range_module._request_range("https://example.test/archive.zip", 2, 5)
+    assert len(calls) == range_module._HTTP_MAX_ATTEMPTS
+    assert [timeout for _request, timeout in calls] == [range_module._HTTP_TIMEOUT_SECONDS] * range_module._HTTP_MAX_ATTEMPTS
+
 def test_range_materialization_is_atomic_reusable_and_tamper_closed(monkeypatch, tmp_path):
     import georeliab_mve.tartanair_range as range_module
 
