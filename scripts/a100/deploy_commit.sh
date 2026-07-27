@@ -13,6 +13,15 @@ worktrees=$(overlay_value "$overlay" runtime.worktrees)
 target="$worktrees/$commit"
 artifacts=$(overlay_value "$overlay" runtime.artifacts)
 
+case "$overlay" in
+  "$GEORELIAB_PROJECT_ROOT"/*) overlay_rel=${overlay#"$GEORELIAB_PROJECT_ROOT"/} ;;
+  /*) die "overlay must be inside deploying project worktree: $overlay" ;;
+  *) overlay_rel=$overlay ;;
+esac
+case "$overlay_rel" in
+  ""|../*|*/../*|./*|*/./*) die "overlay path must be normalized within the project: $overlay_rel" ;;
+esac
+
 mkdir_under_root "$root" "$(dirname "$bare")" "$worktrees" "$artifacts/deploy"
 enforce_storage_cap "$overlay"
 
@@ -36,15 +45,19 @@ else
   git --git-dir="$bare" worktree add --detach "$target" "$commit"
 fi
 
+target_overlay="$target/$overlay_rel"
+[ -r "$target_overlay" ] || die "target worktree overlay is not readable: $target_overlay"
+cmp -s "$overlay" "$target_overlay" || die "source and target worktree overlays differ: $overlay != $target_overlay"
+
 manifest="$artifacts/deploy/$commit.json"
-"$(orchestrator_python "$overlay")" - "$overlay" "$commit" "$bare" "$target" <<'PY' | write_immutable_file "$root" "$manifest"
+"$(orchestrator_python "$target_overlay")" - "$overlay_rel" "$target_overlay" "$commit" "$bare" "$target" <<'PY' | write_immutable_file "$root" "$manifest"
 import json, subprocess, sys
-overlay, commit, bare, worktree = sys.argv[1:]
+overlay_name, overlay_path, commit, bare, worktree = sys.argv[1:]
 def sha(path): return subprocess.check_output(['sha256sum', path], text=True).split()[0]
 payload = {
     'schema_version': 'georeliab-deploy-v1',
-    'overlay': overlay,
-    'overlay_sha256': sha(overlay),
+    'overlay': overlay_name,
+    'overlay_sha256': sha(overlay_path),
     'project_commit': commit,
     'bare_repository': bare,
     'worktree': worktree,

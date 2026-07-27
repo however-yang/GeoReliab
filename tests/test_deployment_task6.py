@@ -170,6 +170,18 @@ def test_deploy_and_verify_are_idempotent_and_reject_correct_dirty_state() -> No
     assert 'mv -f' not in verify
 
 
+def test_deploy_manifest_is_bound_to_target_worktree_overlay() -> None:
+    deploy = (ROOT / 'scripts' / 'a100' / 'deploy_commit.sh').read_text(encoding='utf-8')
+    assert 'target_overlay="$target/$overlay_rel"' in deploy
+    assert 'cmp -s "$overlay" "$target_overlay"' in deploy
+    assert 'source and target worktree overlays differ' in deploy
+    assert 'orchestrator_python "$target_overlay"' in deploy
+    assert '- "$overlay_rel" "$target_overlay" "$commit" "$bare" "$target"' in deploy
+    assert "'overlay': overlay_name" in deploy
+    assert "'overlay_sha256': sha(overlay_path)" in deploy
+    assert '- "$overlay" "$commit" "$bare" "$target"' not in deploy
+
+
 def test_every_stage_is_bound_to_clean_exact_commit_and_resource_budget() -> None:
     launch = (ROOT / 'scripts' / 'a100' / 'launch_stage.sh').read_text(encoding='utf-8')
     common = (ROOT / 'scripts' / 'a100' / 'common.sh').read_text(encoding='utf-8')
