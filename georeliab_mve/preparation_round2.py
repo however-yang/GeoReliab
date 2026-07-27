@@ -140,7 +140,8 @@ def low_light_noise_render(image: np.ndarray, sample_key: str, view_id: int, *, 
     return rendered, _metadata(raw_source_sha256=raw_source_sha256, rendered=rendered,
         gt_digest=gt_digest, calibration=parameter, corruption='low-light-noise', severity=severity,
         seed=seed, exposure=_base._EXPOSURES[index], poisson_peak=_base._POISSON_PEAKS[index],
-        read_sigma=_base._READ_SIGMAS[index], measured_noise=float(np.std(rendered - expected)))
+        read_sigma=_base._READ_SIGMAS[index], pre_noise_brightness=float(expected.mean()),
+        measured_noise=float(np.std(rendered - expected)))
 
 
 def render_defocus(image: np.ndarray, depth: np.ndarray, calibration: _base.CorruptionCalibration, *, severity: int,
@@ -203,10 +204,10 @@ def calibration_qa(calibration: _base.CorruptionCalibration,
         row: dict[str, Any] = {'scene_id': scene_id, 'view_id': view_id, 'fog': [], 'brightness': [], 'noise': [], 'coc': [], 'edge_loss': [], 'fog_correlation': [], 'fog_strength': [], 'gt': []}
         for severity in (1, 2, 3):
             fog, fog_meta = fog_render(image, depth, calibration, severity=severity, gt_digest=gt_digest, raw_source_sha256=raw_digest)
-            low, low_meta = low_light_noise_render(image, f'scan{scene_id}', view_id, severity=severity, gt_digest=gt_digest, calibration=calibration, raw_source_sha256=raw_digest)
+            _, low_meta = low_light_noise_render(image, f'scan{scene_id}', view_id, severity=severity, gt_digest=gt_digest, calibration=calibration, raw_source_sha256=raw_digest)
             _, defocus_meta = render_defocus(image, depth, calibration, severity=severity, gt_digest=gt_digest, raw_source_sha256=raw_digest)
             row['fog'].append(fog_meta['realized_transmittance'])
-            row['brightness'].append(float(low.mean()))
+            row['brightness'].append(low_meta['pre_noise_brightness'])
             row['noise'].append(low_meta['measured_noise'])
             row['coc'].append(defocus_meta['coc_p95'])
             row['edge_loss'].append(defocus_meta['edge_energy_loss'])

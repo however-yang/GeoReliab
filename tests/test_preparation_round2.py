@@ -64,6 +64,35 @@ def test_calibration_qa_rejects_each_required_nonmonotonic_failure():
             calibration_qa(calibration, [(1, 1, image, depth, '0' * 64, '1' * 64)], expected=broken)
 
 
+def test_calibration_qa_uses_pre_noise_brightness(monkeypatch):
+    import georeliab_mve.preparation_round2 as preparation_round2
+
+    image = np.random.default_rng(7).uniform(0.1, 0.9, (64, 64, 3))
+    depth = np.tile(np.linspace(1.0, 8.0, 64), (64, 1))
+    calibration = calibrate_corruptions([depth], [image])
+    actual_render = preparation_round2.low_light_noise_render
+
+    def render_with_nonmonotonic_output(*args, severity, **kwargs):
+        rendered, metadata = actual_render(*args, severity=severity, **kwargs)
+        expected_brightness = float(np.clip(args[0], 0.0, 1.0).mean() * metadata['exposure'])
+        assert metadata['pre_noise_brightness'] == pytest.approx(expected_brightness)
+        return np.full_like(rendered, float(severity)), metadata
+
+    monkeypatch.setattr(
+        preparation_round2,
+        'low_light_noise_render',
+        render_with_nonmonotonic_output,
+    )
+    result = calibration_qa(
+        calibration,
+        [(1, 1, image, depth, '0' * 64, '1' * 64)],
+    )
+
+    assert result['passed'] is True
+    assert result['metrics'][0]['brightness'][0] > result['metrics'][0]['brightness'][1]
+    assert result['metrics'][0]['brightness'][1] > result['metrics'][0]['brightness'][2]
+
+
 def test_calibration_qa_rejects_rank_invariant_fog_fixture():
     '''A severity label cannot substitute for observed contrast degradation.'''
     image = np.dstack([np.tile(np.linspace(0.1, 0.9, 64), (64, 1))] * 3)
