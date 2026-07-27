@@ -266,6 +266,48 @@ def test_georeliab_requires_tartanair_native_fog_sanity():
     assert "TARTANAIR_SANITY_GATE_NOT_MET" in result.reason_codes
 
 
+def test_georeliab_incomplete_p3_is_non_terminal():
+    result = evaluate_georeliab_gate(
+        georeliab_input(
+            schedule_counts={
+                'scheduled': 400,
+                'completed': 399,
+                'missing': 1,
+                'invalid': 0,
+            }
+        )
+    )
+    assert result.status is GateStatus.BLOCKED
+    assert result.status.is_terminal is False
+    assert result.reason_codes == ('P3_SCHEDULE_COUNTS_INVALID',)
+
+
+def test_georeliab_p4_pass_remains_non_terminal_until_p5_evidence():
+    result = evaluate_georeliab_gate(
+        georeliab_input(
+            downstream_harm=(),
+            zero_update=(),
+            downstream_schedule_counts={},
+        )
+    )
+    assert result.status is GateStatus.BLOCKED
+    assert result.status.is_terminal is False
+    assert result.reason_codes == ('P5_DOWNSTREAM_SCHEDULE_COUNTS_INVALID',)
+
+
+def test_tartanair_failure_cannot_be_misclassified_as_p5_pending():
+    result = evaluate_georeliab_gate(
+        georeliab_input(
+            tartanair_native_fog_sanity=False,
+            downstream_harm=(),
+            zero_update=(),
+            downstream_schedule_counts={},
+        )
+    )
+    assert result.status is GateStatus.FAIL
+    assert result.reason_codes == ('TARTANAIR_SANITY_GATE_NOT_MET',)
+
+
 def test_georeliab_rejects_non_monotonic_rho_ramp():
     non_monotonic = tuple(
         replace(item, severity_rhos=(-0.2, -0.7, -0.1))

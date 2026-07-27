@@ -642,6 +642,144 @@ def test_repeatability_and_p5_short_circuit(tmp_path: Path):
     assert blocked["reason_code"] in {"NATIVE_CONFIDENCE_GATE_MISSING", "NATIVE_CONFIDENCE_GATE_INJECTION_FORBIDDEN"}
 
 
+def _write_completed_p0_fixture(root: Path) -> None:
+    artifacts = root / "artifacts"
+    manifests = root / "manifests"
+    evidence = root / "evidence"
+    artifacts.mkdir(parents=True)
+    manifests.mkdir(parents=True)
+    evidence.mkdir(parents=True)
+    calibration = manifests / "corruption_calibration.json"
+    calibration.write_text('{"schema_version":"corruption-calibration-v1"}\n', encoding="utf-8")
+    calibration_sha = runner.sha256_file(calibration)
+    qa = manifests / "corruption_calibration_qa.json"
+    qa.write_text(
+        json.dumps({"passed": True, "parameter_manifest_sha256": calibration_sha}),
+        encoding="utf-8",
+    )
+    sanity = evidence / "tartanair_native_fog_sanity.json"
+    sanity.write_text(
+        json.dumps(
+            {
+                "passed": True,
+                "reason_code": "TARTANAIR_NATIVE_FOG_SANITY",
+                "negative_frames": 80,
+                "evaluated_frames": 100,
+                "calibration_qa_sha256": runner.sha256_file(qa),
+            }
+        ),
+        encoding="utf-8",
+    )
+    specs = (
+        ("download", None),
+        ("verify", None),
+        ("index", None),
+        ("manifests", None),
+        ("prepared", None),
+        ("calibration", None),
+        ("rendering", "smoke"),
+        ("rendering", "test"),
+        ("sanity", None),
+    )
+    for operation, stage in specs:
+        suffix = f"render_{stage}" if operation == "rendering" else operation
+        payload = {
+            "schema_version": "preparation-state-v5",
+            "operation": operation,
+            "stage": stage,
+            "dry_run": False,
+            "scientific_ready": False,
+            "resources_ready": operation == "verify",
+            "state_transition": f"{operation}:completed",
+        }
+        if operation == "calibration":
+            payload.update(
+                {
+                    "qa_passed": True,
+                    "parameter_manifest_sha256": calibration_sha,
+                }
+            )
+        if operation == "rendering":
+            payload.update(
+                {
+                    "rendered_count": 800 if stage == "smoke" else 1600,
+                    "split": "dev" if stage == "smoke" else "test",
+                    "parameter_manifest_sha256": calibration_sha,
+                }
+            )
+        if operation == "sanity":
+            payload.update(
+                {
+                    "passed": True,
+                    "reason_code": "TARTANAIR_NATIVE_FOG_SANITY",
+                    "calibration_qa_sha256": runner.sha256_file(qa),
+                }
+            )
+        (artifacts / f"p0_{suffix}.json").write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+
+
+def test_p0_completion_status_requires_all_non_dry_pass_states(tmp_path: Path):
+    _write_completed_p0_fixture(tmp_path)
+    assert runner.p0_completion_status(tmp_path)["status"] == "PASS"
+    sanity_state = tmp_path / "artifacts" / "p0_sanity.json"
+    payload = json.loads(sanity_state.read_text(encoding="utf-8"))
+    payload["passed"] = False
+    sanity_state.write_text(json.dumps(payload), encoding="utf-8")
+    blocked = runner.p0_completion_status(tmp_path)
+    assert blocked["status"] == "BLOCKED_PENDING_EVIDENCE"
+    assert blocked["reason_code"] == "P0_STATE_INVALID"
+
+
+def test_p1_completion_status_requires_both_models_repeats_and_current_fingerprint(
+    tmp_path: Path,
+    monkeypatch,
+):
+    summary = {
+        "status": "OK",
+        "stage": "preflight",
+        "workers": [
+            {
+                "model_worker": model,
+                "status": "OK",
+                "repeatability": {"passed": True, "reason_code": "OK"},
+                "repeats": [
+                    {"status": "OK", "stage_fingerprint": "current"},
+                    {"status": "OK", "stage_fingerprint": "current"},
+                ],
+            }
+            for model in ("vggt", "mast3r")
+        ],
+    }
+    path = tmp_path / "artifacts" / "p1_preflight.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(summary), encoding="utf-8")
+    monkeypatch.setattr(
+        runner,
+        "_stage_fingerprint",
+        lambda *_args, **_kwargs: {"stage_fingerprint": "current"},
+    )
+    monkeypatch.setattr(runner, "full_schedule", lambda *_args: tuple(range(8)))
+    monkeypatch.setattr(
+        runner,
+        "stage_progress_counts",
+        lambda *_args: {
+            "scheduled": 8,
+            "completed": 8,
+            "missing": 0,
+            "invalid": 0,
+        },
+    )
+    assert runner.p1_completion_status(tmp_path)["status"] == "PASS"
+    summary["workers"][1]["repeatability"]["reason_code"] = "PREFLIGHT_REPEATABILITY_FAILED"
+    path.write_text(json.dumps(summary), encoding="utf-8")
+    blocked = runner.p1_completion_status(tmp_path)
+    assert blocked["status"] == "BLOCKED_PENDING_EVIDENCE"
+    assert blocked["reason_code"] == "P1_REPEATABILITY_NOT_PASSED"
+
+
 def test_native_gate_writer_binds_digest_and_is_immutable(tmp_path: Path, monkeypatch):
     root = _minimal_root(tmp_path)
     out = tmp_path / "out"
@@ -657,7 +795,7 @@ def test_native_gate_writer_binds_digest_and_is_immutable(tmp_path: Path, monkey
             return object()
 
     monkeypatch.setattr(audit_module, "load_stage_evidence_manifest", lambda _path: FakeEvidence())
-    monkeypatch.setattr(gates_module, "evaluate_georeliab_gate", lambda _input: gates_module.GateDecision("georeliab", gates_module.GateStatus.FAIL, ("P5_DOWNSTREAM_SCHEDULE_COUNTS_INVALID",), {}, ScientificValidity.SCIENTIFIC))
+    monkeypatch.setattr(gates_module, "evaluate_georeliab_gate", lambda _input: gates_module.GateDecision("georeliab", gates_module.GateStatus.BLOCKED, ("P5_DOWNSTREAM_SCHEDULE_COUNTS_INVALID",), {}, ScientificValidity.SCIENTIFIC))
     audit_output = {"stage_evidence_path": str(evidence_path), "stage_evidence_sha256": runner.sha256_file(evidence_path), "georeliab_gate": {"reason_codes": ["P5_DOWNSTREAM_SCHEDULE_COUNTS_INVALID"]}, "p5_skip_reason": None}
     gate_path = runner.write_native_phenomenon_gate_from_audit_output(context, audit_output)
     assert json.loads(gate_path.read_text(encoding="utf-8"))["status"] == "PASS"

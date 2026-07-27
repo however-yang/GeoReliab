@@ -208,6 +208,8 @@ $PYTHON -m georeliab_mve prepare-georeliab --operation sanity --data-root "$ROOT
 
 P0 passes only when all required manifests/evidence files exist and the latest status has no blocker. Treat Rectified/TartanAir whole-archive `.partial` files as stale non-authoritative leftovers; the authoritative evidence is the frozen HTTP Range index plus verified selected-member extraction. The prior P0 Torch import failure after `HOME` redirection is resolved only when `verify_prereqs.sh`, materialization provenance, and isolated adapter probes all confirm that `typing_extensions` imports from the frozen site above with the exact SHA-256.
 
+Until all nine `preparation-state-v5` files are complete, calibration QA is passing, both smoke/test render counts are complete, and `TARTANAIR_NATIVE_FOG_SANITY` passes on 100 frames with at least 80 negative correlations, P1 remains locked. P0 contains no model inference and produces no scientific result.
+
 ## P1: repeated preflight
 
 Canonical launch:
@@ -223,10 +225,11 @@ Manual equivalent:
 $PYTHON -m georeliab_mve preflight-real \
   --config "$OVERLAY" \
   --output-root "$ROOT" \
-  --device cuda:0
+  --device cuda:0 \
+  --summary-json "$ROOT/artifacts/p1_preflight.json"
 ```
 
-P1 passes when top-level `status` is `OK`, both repeat roots exist under `preflight-real/repeat-a` and `preflight-real/repeat-b`, and `repeatability.reason_code` is `OK`. If the result is `PREFLIGHT_REPEATABILITY_FAILED`, stop before P2.
+P1 passes when the canonical summary has top-level `status: OK`, both VGGT and MASt3R workers pass, both repeat roots exist under `preflight-real/repeat-a` and `preflight-real/repeat-b`, both repetitions contain all 8 scheduled items with no invalid output, and every `repeatability.reason_code` is `OK`. The repeat fingerprints must match the current project/input freeze. If any condition fails, P2 remains locked.
 
 ## P2: 10-scene smoke
 
@@ -433,7 +436,7 @@ Do not edit evidence JSON to bypass these. Fix the underlying mismatch before sc
 | `INVALID_OUTPUT_IN_VERIFIED_CONDITION` | P3 invalid output in required condition | Terminal gate failure unless protocol changes |
 | `CONFIDENCE_FAILURE_GATE_NOT_MET` | Native-confidence phenomenon failed | Short-circuit P5 |
 | `TARTANAIR_SANITY_GATE_NOT_MET` | Native fog sanity missing/failed | Stop; P4 cannot pass |
-| `P5_DOWNSTREAM_SCHEDULE_COUNTS_INVALID` | P3-only gate reached pre-P5 boundary | In native-gate binding, this is the P4 PASS signal |
+| `P5_DOWNSTREAM_SCHEDULE_COUNTS_INVALID` | P4 passed but P5 evidence is not complete | Non-terminal `BLOCKED`; in native-gate binding this exact sentinel is the P4 PASS signal |
 | `NATIVE_CONFIDENCE_GATE_NOT_PASS` | P5 requested after P4 FAIL | Do not run P5 |
 | `NATIVE_CONFIDENCE_GATE_MISSING` | P5 requested before P4 gate exists | Run P4 first |
 | `NATIVE_CONFIDENCE_GATE_INJECTION_FORBIDDEN` | Supplied gate differs from canonical bound gate | Use on-disk canonical gate |

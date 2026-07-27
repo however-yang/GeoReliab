@@ -116,6 +116,9 @@ def test_launch_script_exposes_p0_to_p6_and_runner_commands() -> None:
     assert '--stage test --model all --device cuda:0 --shard 0/2' in text
     assert '--stage zero-update --model all' in text
     assert 'require_native_gate_pass; enforce_stage_gpu_budget zero-update' in text
+    assert 'require_p0_complete; enforce_stage_gpu_budget preflight' in text
+    assert 'require_p1_complete; enforce_stage_gpu_budget smoke' in text
+    assert "--summary-json '$root/artifacts/p1_preflight.json'" in text
     assert 'SHORT_CIRCUIT_P5' in text
     assert 'require_stage_complete smoke 200' in text
     assert 'require_stage_complete test 400' in text

@@ -45,7 +45,7 @@ class SelectedTrack(str, Enum):
     GEOMETRY = "GEOMETRY_CAUSAL_AUDIT"
     GEORELIAB = "GEORELIAB"
     STOP = "STOP_AND_RETURN_RESOURCES"
-    BLOCKED = "BLOCKED_MISSING_EVIDENCE"
+    BLOCKED = "BLOCKED_PENDING_EVIDENCE"
     BLOCKED_PENDING_GEOMETRY = 'BLOCKED_PENDING_GEOMETRY'
     NON_SCIENTIFIC = "BLOCKED_NON_SCIENTIFIC_FIXTURE"
     NON_SCIENTIFIC_SMOKE = 'BLOCKED_NON_SCIENTIFIC_SMOKE'
@@ -572,10 +572,18 @@ def evaluate_georeliab_gate(value: GeoReliabGateInput) -> GateDecision:
             scientific_validity=value.scientific_validity,
         )
 
-    if value.split != 'test' or not _p3_schedule_counts_valid(value.schedule_counts):
+    if value.split != 'test':
         return GateDecision(
             lane='georeliab',
             status=GateStatus.FAIL,
+            reason_codes=('P3_SCHEDULE_COUNTS_INVALID',),
+            details={'split': value.split, 'schedule_counts': value.schedule_counts or {}},
+            scientific_validity=value.scientific_validity,
+        )
+    if not _p3_schedule_counts_valid(value.schedule_counts):
+        return GateDecision(
+            lane='georeliab',
+            status=GateStatus.BLOCKED,
             reason_codes=('P3_SCHEDULE_COUNTS_INVALID',),
             details={'split': value.split, 'schedule_counts': value.schedule_counts or {}},
             scientific_validity=value.scientific_validity,
@@ -654,10 +662,22 @@ def evaluate_georeliab_gate(value: GeoReliabGateInput) -> GateDecision:
             },
             scientific_validity=value.scientific_validity,
         )
+    if reason_codes:
+        return GateDecision(
+            lane="georeliab",
+            status=GateStatus.FAIL,
+            reason_codes=tuple(reason_codes),
+            details={
+                "confidence_models": sorted(confidence_models),
+                "verified_condition_count": len(verified_conditions),
+                "tartanair_native_fog_sanity": value.tartanair_native_fog_sanity,
+            },
+            scientific_validity=value.scientific_validity,
+        )
     if not _p5_downstream_schedule_counts_valid(value.downstream_schedule_counts):
         return GateDecision(
             lane='georeliab',
-            status=GateStatus.FAIL,
+            status=GateStatus.BLOCKED,
             reason_codes=('P5_DOWNSTREAM_SCHEDULE_COUNTS_INVALID',),
             details={'downstream_schedule_counts': value.downstream_schedule_counts or {}},
             scientific_validity=value.scientific_validity,

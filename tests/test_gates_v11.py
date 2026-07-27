@@ -60,6 +60,15 @@ def test_georeliab_pass_pending_geometry_has_explicit_reason_code():
     assert selected.reason == 'GEORELIAB_PASS_PENDING_GEOMETRY'
 
 
+def test_generic_non_terminal_selection_serializes_pending_evidence():
+    selected = select_track(
+        decision('geometry', GateStatus.FAIL),
+        decision('georeliab', GateStatus.BLOCKED),
+    )
+    assert selected.selected_track is SelectedTrack.BLOCKED
+    assert selected.to_dict()['selected_track'] == 'BLOCKED_PENDING_EVIDENCE'
+
+
 def test_smoke_selection_preserves_smoke_validity_and_reason():
     smoke = ScientificValidity.NON_SCIENTIFIC_SMOKE
     selected = select_track(

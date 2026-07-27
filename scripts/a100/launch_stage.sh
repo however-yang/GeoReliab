@@ -43,6 +43,39 @@ screen_launch() {
   info "launched $name; log=$logfile"
 }
 
+require_p0_complete() {
+  (
+    cd "$worktree"
+    "$python" - "$root" <<'PY'
+import json, sys
+from pathlib import Path
+from georeliab_mve.runner import p0_completion_status
+
+decision = p0_completion_status(Path(sys.argv[1]))
+if decision.get('status') != 'PASS':
+    raise SystemExit('P1_LOCKED: ' + json.dumps(decision, sort_keys=True))
+PY
+  )
+}
+
+require_p1_complete() {
+  (
+    cd "$worktree"
+    "$python" - "$root" "$overlay" <<'PY'
+import json, sys
+from pathlib import Path
+from georeliab_mve.runner import p1_completion_status
+
+decision = p1_completion_status(
+    Path(sys.argv[1]),
+    config_path=Path(sys.argv[2]),
+)
+if decision.get('status') != 'PASS':
+    raise SystemExit('P2_LOCKED: ' + json.dumps(decision, sort_keys=True))
+PY
+  )
+}
+
 require_native_gate_pass() {
   (
     cd "$worktree"
@@ -115,8 +148,8 @@ PY
 }
 
 case "$stage" in
-  p1) enforce_stage_gpu_budget preflight ;;
-  p2) enforce_stage_gpu_budget smoke ;;
+  p1) require_p0_complete; enforce_stage_gpu_budget preflight ;;
+  p2) require_p1_complete; enforce_stage_gpu_budget smoke ;;
   p3) require_stage_complete smoke 200; enforce_stage_gpu_budget test ;;
   p4) require_stage_complete test 400 ;;
   p5) require_native_gate_pass; enforce_stage_gpu_budget zero-update ;;
@@ -128,7 +161,7 @@ case "$stage" in
     screen_launch "$name_base" "$logs/$name_base.log" "$cmd"
     ;;
   p1)
-    screen_launch "$name_base" "$logs/$name_base.log" "$py preflight-real --config '$overlay' --output-root '$root' --device '$device'"
+    screen_launch "$name_base" "$logs/$name_base.log" "$py preflight-real --config '$overlay' --output-root '$root' --device '$device' --summary-json '$root/artifacts/p1_preflight.json'"
     ;;
   p2)
     screen_launch "${name_base}-shard0" "$logs/${name_base}-shard0.log" "$py run-georeliab --stage smoke --model all --device cuda:0 --shard 0/2 --config '$overlay' --output-root '$root'"

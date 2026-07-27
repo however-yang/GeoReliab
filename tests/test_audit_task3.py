@@ -305,7 +305,8 @@ def test_georeliab_evidence_rejects_incomplete_p3_before_p4():
         statistics={'primary_p_values': {'fog': 0.01, 'defocus': 0.04}},
     )
     gate = evaluate_georeliab_gate(payload.to_gate_input())
-    assert gate.status.value == 'FAIL'
+    assert gate.status.value == 'BLOCKED'
+    assert gate.status.is_terminal is False
     assert payload.p5_skip_reason is None
     assert payload.statistics['holm_primary']['fog']['adjusted_p'] == pytest.approx(0.02)
     assert gate.reason_codes == ('P3_SCHEDULE_COUNTS_INVALID',)

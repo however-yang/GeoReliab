@@ -430,10 +430,12 @@ def _derive_native_gate_from_p3(evidence_path: Path) -> tuple[str, tuple[str, ..
         raise RunnerError("native phenomenon gate requires complete P3 evidence")
     evaluated = evaluate_georeliab_gate(evidence.to_gate_input())
     reasons = tuple(str(reason) for reason in evaluated.reason_codes)
+    if evaluated.status is GateStatus.BLOCKED:
+        if reasons == ("P5_DOWNSTREAM_SCHEDULE_COUNTS_INVALID",):
+            return "PASS", reasons
+        raise RunnerError("native phenomenon gate P3 decision remains non-terminal")
     if evaluated.status is not GateStatus.FAIL:
-        raise RunnerError("native phenomenon gate expects a pre-P5 FAIL decision")
-    if reasons == ("P5_DOWNSTREAM_SCHEDULE_COUNTS_INVALID",):
-        return "PASS", reasons
+        raise RunnerError("native phenomenon gate expects a pre-P5 blocked or failed decision")
     if not reasons:
         raise RunnerError("native phenomenon gate P3 failure has no reason code")
     return "FAIL", reasons
@@ -1809,9 +1811,254 @@ def estimate_stage_budget(context: RunnerContext, stage: str, items: Sequence[Sc
     return check_budget(context, stage, next_stage_gpu_hours=next_gpu, next_stage_bytes=next_bytes, completed_gpu_hours=completed_gpu, completed_bytes=completed_bytes)
 
 
+_P0_STATE_SPECS = (
+    ("p0_download.json", "download", None),
+    ("p0_verify.json", "verify", None),
+    ("p0_index.json", "index", None),
+    ("p0_manifests.json", "manifests", None),
+    ("p0_prepared.json", "prepared", None),
+    ("p0_calibration.json", "calibration", None),
+    ("p0_render_smoke.json", "rendering", "smoke"),
+    ("p0_render_test.json", "rendering", "test"),
+    ("p0_sanity.json", "sanity", None),
+)
+
+
+def _pending_stage(reason_code: str, **details: Any) -> dict[str, Any]:
+    return {
+        "status": "BLOCKED_PENDING_EVIDENCE",
+        "reason_code": reason_code,
+        **details,
+    }
+
+
+def p0_completion_status(root: Path) -> dict[str, Any]:
+    """Verify that every non-scientific P0 operation finished and is linked."""
+
+    artifacts = root / "artifacts"
+    states: dict[str, dict[str, Any]] = {}
+    for filename, operation, stage in _P0_STATE_SPECS:
+        path = artifacts / filename
+        if not path.is_file():
+            return _pending_stage("P0_STATE_MISSING", state_path=str(path))
+        try:
+            payload = _load_json(path)
+        except RunnerError:
+            return _pending_stage("P0_STATE_INVALID", state_path=str(path))
+        expected = {
+            "schema_version": "preparation-state-v5",
+            "operation": operation,
+            "stage": stage,
+            "dry_run": False,
+            "scientific_ready": False,
+            "state_transition": f"{operation}:completed",
+        }
+        if any(payload.get(key) != value for key, value in expected.items()):
+            return _pending_stage("P0_STATE_INVALID", state_path=str(path))
+        states[filename] = payload
+
+    if states["p0_verify.json"].get("resources_ready") is not True:
+        return _pending_stage(
+            "P0_STATE_INVALID",
+            state_path=str(artifacts / "p0_verify.json"),
+        )
+
+    calibration_path = root / "manifests" / "corruption_calibration.json"
+    qa_path = root / "manifests" / "corruption_calibration_qa.json"
+    sanity_path = root / "evidence" / "tartanair_native_fog_sanity.json"
+    missing = [
+        str(path)
+        for path in (calibration_path, qa_path, sanity_path)
+        if not path.is_file()
+    ]
+    if missing:
+        return _pending_stage("P0_ARTIFACT_MISSING", missing=missing)
+    try:
+        qa = _load_json(qa_path)
+        sanity = _load_json(sanity_path)
+        calibration_sha = sha256_file(calibration_path)
+        qa_sha = sha256_file(qa_path)
+    except RunnerError:
+        return _pending_stage("P0_ARTIFACT_INVALID")
+    if (
+        qa.get("passed") is not True
+        or qa.get("parameter_manifest_sha256") != calibration_sha
+        or sanity.get("passed") is not True
+        or sanity.get("reason_code") != "TARTANAIR_NATIVE_FOG_SANITY"
+        or sanity.get("evaluated_frames") != 100
+        or not isinstance(sanity.get("negative_frames"), int)
+        or sanity.get("negative_frames", 0) < 80
+        or sanity.get("calibration_qa_sha256") != qa_sha
+    ):
+        return _pending_stage("P0_ARTIFACT_INVALID")
+
+    calibration_state = states["p0_calibration.json"]
+    if (
+        calibration_state.get("qa_passed") is not True
+        or calibration_state.get("parameter_manifest_sha256") != calibration_sha
+    ):
+        return _pending_stage(
+            "P0_STATE_INVALID",
+            state_path=str(artifacts / "p0_calibration.json"),
+        )
+    for filename, expected_stage, expected_split, expected_count in (
+        ("p0_render_smoke.json", "smoke", "dev", 800),
+        ("p0_render_test.json", "test", "test", 1600),
+    ):
+        state = states[filename]
+        if (
+            state.get("stage") != expected_stage
+            or state.get("split") != expected_split
+            or state.get("rendered_count") != expected_count
+            or state.get("parameter_manifest_sha256") != calibration_sha
+        ):
+            return _pending_stage(
+                "P0_STATE_INVALID",
+                state_path=str(artifacts / filename),
+            )
+    sanity_state = states["p0_sanity.json"]
+    if (
+        sanity_state.get("passed") is not True
+        or sanity_state.get("reason_code") != "TARTANAIR_NATIVE_FOG_SANITY"
+        or sanity_state.get("calibration_qa_sha256") != qa_sha
+    ):
+        return _pending_stage(
+            "P0_STATE_INVALID",
+            state_path=str(artifacts / "p0_sanity.json"),
+        )
+    return {
+        "status": "PASS",
+        "reason_code": "P0_COMPLETE",
+        "state_count": len(states),
+        "calibration_sha256": calibration_sha,
+        "calibration_qa_sha256": qa_sha,
+        "tartanair_sanity_sha256": sha256_file(sanity_path),
+    }
+
+
+def p1_completion_status(
+    root: Path,
+    *,
+    config_path: Path | None = None,
+) -> dict[str, Any]:
+    """Verify the canonical dual-model, two-repeat P1 summary and artifacts."""
+
+    summary_path = root / "artifacts" / "p1_preflight.json"
+    if not summary_path.is_file():
+        return _pending_stage("P1_SUMMARY_MISSING", summary_path=str(summary_path))
+    try:
+        summary = _load_json(summary_path)
+    except RunnerError:
+        return _pending_stage("P1_SUMMARY_INVALID", summary_path=str(summary_path))
+    if summary.get("status") != "OK" or summary.get("stage") != "preflight":
+        return _pending_stage("P1_SUMMARY_NOT_PASSED", summary_path=str(summary_path))
+    workers = summary.get("workers")
+    if not isinstance(workers, list):
+        return _pending_stage("P1_SUMMARY_INVALID", summary_path=str(summary_path))
+    by_model = {
+        worker.get("model_worker"): worker
+        for worker in workers
+        if isinstance(worker, dict)
+    }
+    if set(by_model) != {"vggt", "mast3r"} or len(workers) != 2:
+        return _pending_stage("P1_MODEL_GRID_INCOMPLETE")
+    try:
+        schedule = full_schedule(root, "preflight")
+        expected_fingerprint = _stage_fingerprint(
+            RunnerContext(
+                root=root,
+                output_root=root,
+                config_path=config_path,
+                device="cuda:0",
+            ),
+            "preflight",
+            schedule,
+        )["stage_fingerprint"]
+    except (RunnerError, OSError, ValueError):
+        return _pending_stage("P1_FINGERPRINT_UNVERIFIABLE")
+    for model, worker in by_model.items():
+        repeatability = worker.get("repeatability")
+        if (
+            worker.get("status") != "OK"
+            or not isinstance(repeatability, dict)
+            or repeatability.get("passed") is not True
+            or repeatability.get("reason_code") != "OK"
+        ):
+            return _pending_stage(
+                "P1_REPEATABILITY_NOT_PASSED",
+                model=model,
+            )
+        repeats = worker.get("repeats")
+        if (
+            not isinstance(repeats, list)
+            or len(repeats) != 2
+            or any(
+                not isinstance(repeat, dict)
+                or repeat.get("status") != "OK"
+                or repeat.get("stage_fingerprint") != expected_fingerprint
+                for repeat in repeats
+            )
+        ):
+            return _pending_stage("P1_REPEAT_GRID_INVALID", model=model)
+    for label in ("repeat-a", "repeat-b"):
+        counts = stage_progress_counts(
+            root / "preflight-real" / label,
+            "preflight",
+            schedule,
+        )
+        if (
+            counts.get("scheduled") != 8
+            or counts.get("completed") != 8
+            or counts.get("missing") != 0
+            or counts.get("invalid") != 0
+        ):
+            return _pending_stage(
+                "P1_SCHEDULE_INCOMPLETE",
+                repeat=label,
+                schedule_counts=counts,
+            )
+    return {
+        "status": "PASS",
+        "reason_code": "P1_COMPLETE",
+        "summary_path": str(summary_path),
+        "summary_sha256": sha256_file(summary_path),
+        "stage_fingerprint": expected_fingerprint,
+    }
+
+
+def _require_stage_decision(decision: Mapping[str, Any], stage: str) -> None:
+    if decision.get("status") != "PASS":
+        raise RunnerError(
+            f"{stage}_LOCKED: "
+            + json.dumps(dict(decision), sort_keys=True, default=str)
+        )
+
+
 def _verify_stage_readiness(context: RunnerContext, stage: str, model: str) -> None:
     _verify_output_root_policy(context)
     _verify_clean_source_tree()
+    if stage == "preflight":
+        _require_stage_decision(p0_completion_status(context.root), "P1")
+    elif stage == "smoke":
+        _require_stage_decision(
+            p1_completion_status(context.root, config_path=context.config_path),
+            "P2",
+        )
+    elif stage == "test":
+        smoke_counts = stage_progress_counts(
+            context.output_root,
+            "smoke",
+            full_schedule(context.root, "smoke"),
+        )
+        if (
+            smoke_counts.get("scheduled") != 200
+            or smoke_counts.get("completed") != 200
+            or smoke_counts.get("missing") != 0
+        ):
+            raise RunnerError(
+                "P3_LOCKED: "
+                + json.dumps(smoke_counts, sort_keys=True, default=str)
+            )
     required = [
         context.root / "manifests" / "split_view_manifest.json",
         context.root / "manifests" / "corruption_calibration.json",
