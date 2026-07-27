@@ -44,10 +44,10 @@ class RemoteZipIndex:
 
 
 def _is_retryable_transport_error(exc: BaseException) -> bool:
-    if isinstance(exc, (TimeoutError, socket.timeout, http.client.IncompleteRead)):
+    if isinstance(exc, (TimeoutError, socket.timeout, ConnectionResetError, http.client.IncompleteRead)):
         return True
     if isinstance(exc, urllib.error.URLError):
-        return isinstance(exc.reason, (TimeoutError, socket.timeout))
+        return isinstance(exc.reason, (TimeoutError, socket.timeout, ConnectionResetError))
     return False
 
 

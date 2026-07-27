@@ -223,6 +223,45 @@ def test_range_request_fails_after_exact_bounded_incomplete_read_attempts(monkey
         range_module._request_range("https://example.test/archive.zip", 2, 5)
     assert len(calls) == range_module._HTTP_MAX_ATTEMPTS
 
+
+def test_range_request_retries_transient_connection_reset(monkeypatch):
+    import georeliab_mve.tartanair_range as range_module
+
+    calls = []
+
+    def urlopen(request, *, timeout):
+        calls.append((request, timeout))
+        if len(calls) == 1:
+            raise ConnectionResetError(104, "connection reset by peer")
+        if len(calls) == 2:
+            raise range_module.urllib.error.URLError(
+                ConnectionResetError(104, "connection reset by peer")
+            )
+        return _FakeHttpResponse(data=b"cdef")
+
+    monkeypatch.setattr(range_module.urllib.request, "urlopen", urlopen)
+    data, etag, total = range_module._request_range("https://example.test/archive.zip", 2, 5)
+    assert (data, etag, total) == (b"cdef", '"fixture-etag"', 10)
+    assert len(calls) == 3
+
+
+def test_range_request_fails_after_exact_bounded_connection_reset_attempts(monkeypatch):
+    import georeliab_mve.tartanair_range as range_module
+
+    calls = []
+
+    def urlopen(request, *, timeout):
+        calls.append((request, timeout))
+        raise range_module.urllib.error.URLError(
+            ConnectionResetError(104, "connection reset by peer")
+        )
+
+    monkeypatch.setattr(range_module.urllib.request, "urlopen", urlopen)
+    with pytest.raises(PreparationError, match="bytes=2-5.*failed after 3 transport attempts"):
+        range_module._request_range("https://example.test/archive.zip", 2, 5)
+    assert len(calls) == range_module._HTTP_MAX_ATTEMPTS
+
+
 def test_range_materialization_is_atomic_reusable_and_tamper_closed(monkeypatch, tmp_path):
     import georeliab_mve.tartanair_range as range_module
 
