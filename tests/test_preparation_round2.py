@@ -19,6 +19,62 @@ from georeliab_mve.preparation import (
 from georeliab_mve.preparation_round2 import PreparedBatch
 
 
+def _patchwise_depth(values: list[float]) -> np.ndarray:
+    assert len(values) == 4
+    depth = np.zeros((64, 64), dtype=np.float64)
+    for index, value in enumerate(values):
+        y = 32 * (index // 2)
+        x = 32 * (index % 2)
+        depth[y:y + 32, x:x + 32] = value
+    return depth
+
+
+def _patchwise_contrast_image(values: list[float], *, base: float = 0.5) -> np.ndarray:
+    assert len(values) == 4
+    image = np.zeros((64, 64, 3), dtype=np.float64)
+    pattern = ((np.indices((32, 32)).sum(axis=0) % 2) * 2 - 1).astype(np.float64)
+    for index, value in enumerate(values):
+        y = 32 * (index // 2)
+        x = 32 * (index % 2)
+        patch = np.clip(base + float(value) * pattern, 0.0, 1.0)
+        image[y:y + 32, x:x + 32] = patch[..., None]
+    return image
+
+
+def _fake_fog_renderer_by_image(monkeypatch, mapping: dict[tuple[int, int], np.ndarray]) -> None:
+    import georeliab_mve.preparation_round2 as preparation_round2
+
+    def fake_fog(image, depth, calibration, *, severity, gt_digest, raw_source_sha256):
+        rendered = mapping[(id(image), int(severity))]
+        metadata = {
+            'raw_source_sha256': raw_source_sha256,
+            'rendered_png_sha256': hashlib.sha256(rendered.tobytes()).hexdigest(),
+            'gt_digest': gt_digest,
+            'parameter_manifest_sha256': calibration.manifest().sha256,
+            'implementation_version': calibration.implementation_version,
+            'corruption': 'fog',
+            'severity': severity,
+            'beta': calibration.fog_betas[severity - 1],
+            'realized_transmittance': [0.8, 0.5, 0.25][severity - 1],
+        }
+        return rendered, metadata
+
+    monkeypatch.setattr(preparation_round2, 'fog_render', fake_fog)
+
+
+def _passing_synthetic_fog_record(monkeypatch, *, scene_id: int = 1):
+    depth = _patchwise_depth([1.0, 2.0, 3.0, 4.0])
+    image = _patchwise_contrast_image([0.01, 0.02, 0.03, 0.04])
+    calibration = calibrate_corruptions([depth], [image])
+    mapping = {
+        (id(image), 1): _patchwise_contrast_image([0.01, 0.01, 0.02, 0.04]),
+        (id(image), 2): _patchwise_contrast_image([0.04, 0.01, 0.02, 0.03]),
+        (id(image), 3): _patchwise_contrast_image([0.04, 0.03, 0.02, 0.01]),
+    }
+    _fake_fog_renderer_by_image(monkeypatch, mapping)
+    return calibration, (scene_id, 1, image, depth, '0' * 64, '1' * 64)
+
+
 def _overlay(path: Path) -> Path:
     path.write_text(
         "[runtime]\nroot = '/srv/private/smli/GeoReliab'\n"
@@ -50,26 +106,23 @@ def _overlay(path: Path) -> Path:
     return path
 
 
-def test_calibration_qa_rejects_each_required_nonmonotonic_failure():
-    image = np.random.default_rng(7).uniform(0.1, 0.9, (64, 64, 3))
-    depth = np.tile(np.linspace(1.0, 8.0, 64), (64, 1))
-    calibration = calibrate_corruptions([depth], [image])
-    valid = calibration_qa(calibration, [(1, 1, image, depth, '0' * 64, '1' * 64)])
+def test_calibration_qa_rejects_each_required_nonmonotonic_failure(monkeypatch):
+    calibration, record = _passing_synthetic_fog_record(monkeypatch)
+    valid = calibration_qa(calibration, [record])
     assert valid['passed'] is True
     for key in ('fog', 'low_light', 'defocus', 'gt', 'cross_view', 'synthetic_fog'):
         broken = dict(valid)
         broken['checks'] = dict(valid['checks'])
         broken['checks'][key] = False
         with pytest.raises(CalibrationError, match=key):
-            calibration_qa(calibration, [(1, 1, image, depth, '0' * 64, '1' * 64)], expected=broken)
+            calibration_qa(calibration, [record], expected=broken)
 
 
 def test_calibration_qa_uses_pre_noise_brightness(monkeypatch):
     import georeliab_mve.preparation_round2 as preparation_round2
 
-    image = np.random.default_rng(7).uniform(0.1, 0.9, (64, 64, 3))
-    depth = np.tile(np.linspace(1.0, 8.0, 64), (64, 1))
-    calibration = calibrate_corruptions([depth], [image])
+    calibration, record = _passing_synthetic_fog_record(monkeypatch)
+    image = record[2]
     actual_render = preparation_round2.low_light_noise_render
 
     def render_with_nonmonotonic_output(*args, severity, **kwargs):
@@ -85,7 +138,7 @@ def test_calibration_qa_uses_pre_noise_brightness(monkeypatch):
     )
     result = calibration_qa(
         calibration,
-        [(1, 1, image, depth, '0' * 64, '1' * 64)],
+        [record],
     )
 
     assert result['passed'] is True
@@ -103,6 +156,202 @@ def test_calibration_qa_rejects_rank_invariant_fog_fixture():
             calibration,
             [(1, 1, image, depth, '0' * 64, '1' * 64)],
         )
+
+
+def test_synthetic_fog_qa_uses_scene_level_patch_effects(monkeypatch):
+    '''One view can be non-negative when the scene-level multi-view effect is negative and monotone.'''
+    depth = _patchwise_depth([1.0, 2.0, 3.0, 4.0])
+    image_a = _patchwise_contrast_image([0.01, 0.02, 0.03, 0.04])
+    image_b = _patchwise_contrast_image([0.01, 0.02, 0.03, 0.04])
+    image_c = _patchwise_contrast_image([0.01, 0.02, 0.03, 0.04])
+    image_d = _patchwise_contrast_image([0.01, 0.02, 0.03, 0.04])
+    calibration = calibrate_corruptions([depth], [image_a])
+    mapping = {
+        (id(image_a), 1): _patchwise_contrast_image([0.01, 0.02, 0.03, 0.04]),
+        (id(image_a), 2): _patchwise_contrast_image([0.01, 0.02, 0.03, 0.04]),
+        (id(image_a), 3): _patchwise_contrast_image([0.01, 0.02, 0.03, 0.04]),
+    }
+    for image in (image_b, image_c, image_d):
+        mapping[(id(image), 1)] = _patchwise_contrast_image([0.04, 0.035, 0.03, 0.025])
+        mapping[(id(image), 2)] = _patchwise_contrast_image([0.04, 0.03, 0.02, 0.01])
+        mapping[(id(image), 3)] = _patchwise_contrast_image([0.08, 0.06, 0.04, 0.02])
+    _fake_fog_renderer_by_image(monkeypatch, mapping)
+
+    result = calibration_qa(
+        calibration,
+        [
+            (83, 1, image_a, depth, '0' * 64, '1' * 64),
+            (83, 2, image_b, depth, '0' * 64, '1' * 64),
+            (83, 3, image_c, depth, '0' * 64, '1' * 64),
+            (83, 4, image_d, depth, '0' * 64, '1' * 64),
+        ],
+    )
+
+    scene_metric = result['synthetic_fog_metrics'][0]
+    assert result['checks']['synthetic_fog'] is True
+    assert scene_metric['scene_id'] == 83
+    assert scene_metric['view_count'] == 4
+    assert scene_metric['patch_counts']['clean'] == 16
+    assert all(value < 0.0 for value in scene_metric['effects'])
+    assert abs(scene_metric['effects'][0]) < abs(scene_metric['effects'][1]) < abs(scene_metric['effects'][2])
+
+
+def test_synthetic_fog_qa_uses_32x32_patch_local_rms(monkeypatch):
+    depth = _patchwise_depth([1.0, 2.0, 3.0, 4.0])
+    image = _patchwise_contrast_image([0.01, 0.02, 0.03, 0.04])
+    calibration = calibrate_corruptions([depth], [image])
+    mapping = {
+        (id(image), 1): _patchwise_contrast_image([0.01, 0.01, 0.02, 0.04]),
+        (id(image), 2): _patchwise_contrast_image([0.04, 0.01, 0.02, 0.03]),
+        (id(image), 3): _patchwise_contrast_image([0.04, 0.03, 0.02, 0.01]),
+    }
+    _fake_fog_renderer_by_image(monkeypatch, mapping)
+
+    result = calibration_qa(calibration, [(56, 1, image, depth, '0' * 64, '1' * 64)])
+
+    scene_metric = result['synthetic_fog_metrics'][0]
+    assert scene_metric['patch_counts']['clean'] == 4
+    assert scene_metric['clean_rho'] == pytest.approx(1.0)
+    assert scene_metric['fog_rhos'][2] == pytest.approx(-1.0)
+
+
+def test_synthetic_fog_qa_pools_single_patch_views_at_scene_grain(monkeypatch):
+    import georeliab_mve.preparation_round2 as preparation_round2
+
+    records = []
+    mapping = {}
+    clean_images = []
+    for view_id, (depth_value, clean_contrast) in enumerate(
+        [(1.0, 0.01), (2.0, 0.02), (3.0, 0.03), (4.0, 0.04)],
+        start=1,
+    ):
+        depth = np.full((64, 64), np.nan, dtype=np.float64)
+        depth[:32, :32] = depth_value
+        image = _patchwise_contrast_image([clean_contrast, 0.01, 0.01, 0.01])
+        clean_images.append(image)
+        records.append((82, view_id, image, depth, '0' * 64, '1' * 64))
+        fog_values = {
+            1: [0.01, 0.01, 0.02, 0.04][view_id - 1],
+            2: [0.04, 0.01, 0.02, 0.03][view_id - 1],
+            3: [0.04, 0.03, 0.02, 0.01][view_id - 1],
+        }
+        for severity, contrast in fog_values.items():
+            mapping[(id(image), severity)] = _patchwise_contrast_image([contrast, 0.01, 0.01, 0.01])
+    calibration = calibrate_corruptions([np.nan_to_num(records[0][3], nan=1.0)], [clean_images[0]])
+    _fake_fog_renderer_by_image(monkeypatch, mapping)
+    monkeypatch.setattr(
+        preparation_round2,
+        'render_defocus',
+        lambda image, depth, calibration, *, severity, gt_digest, raw_source_sha256: (
+            image,
+            {
+                'gt_digest': gt_digest,
+                'parameter_manifest_sha256': calibration.manifest().sha256,
+                'focus_depth': calibration.d_ref,
+                'inverse_depth_layers': 32,
+                'defocus_scale': severity,
+                'coc_p95': float(severity),
+                'edge_energy_loss': float(severity),
+            },
+        ),
+    )
+
+    result = calibration_qa(calibration, records)
+
+    scene_metric = result['synthetic_fog_metrics'][0]
+    assert scene_metric['view_count'] == 4
+    assert scene_metric['patch_counts']['clean'] == 4
+    assert scene_metric['clean_rho'] == pytest.approx(1.0)
+    assert result['checks']['synthetic_fog'] is True
+
+
+def test_synthetic_fog_qa_rejects_any_nonnegative_scene_effect(monkeypatch):
+    depth = _patchwise_depth([1.0, 2.0, 3.0, 4.0])
+    good = _patchwise_contrast_image([0.01, 0.02, 0.03, 0.04])
+    bad = _patchwise_contrast_image([0.01, 0.02, 0.03, 0.04])
+    calibration = calibrate_corruptions([depth], [good])
+    mapping = {
+        (id(good), 1): _patchwise_contrast_image([0.04, 0.03, 0.02, 0.01]),
+        (id(good), 2): _patchwise_contrast_image([0.04, 0.025, 0.015, 0.01]),
+        (id(good), 3): _patchwise_contrast_image([0.04, 0.02, 0.01, 0.005]),
+        (id(bad), 1): _patchwise_contrast_image([0.01, 0.02, 0.03, 0.04]),
+        (id(bad), 2): _patchwise_contrast_image([0.01, 0.02, 0.03, 0.04]),
+        (id(bad), 3): _patchwise_contrast_image([0.01, 0.02, 0.03, 0.04]),
+    }
+    _fake_fog_renderer_by_image(monkeypatch, mapping)
+
+    with pytest.raises(CalibrationError, match='synthetic_fog'):
+        calibration_qa(
+            calibration,
+            [
+                (45, 1, good, depth, '0' * 64, '1' * 64),
+                (117, 1, bad, depth, '0' * 64, '1' * 64),
+            ],
+        )
+
+
+def test_synthetic_fog_qa_rejects_nonmonotone_scene_strength(monkeypatch):
+    depth = _patchwise_depth([1.0, 2.0, 3.0, 4.0])
+    image = _patchwise_contrast_image([0.01, 0.02, 0.03, 0.04])
+    calibration = calibrate_corruptions([depth], [image])
+    mapping = {
+        (id(image), 1): _patchwise_contrast_image([0.04, 0.03, 0.02, 0.01]),
+        (id(image), 2): _patchwise_contrast_image([0.04, 0.03, 0.02, 0.01]),
+        (id(image), 3): _patchwise_contrast_image([0.04, 0.02, 0.01, 0.005]),
+    }
+    _fake_fog_renderer_by_image(monkeypatch, mapping)
+
+    with pytest.raises(CalibrationError, match='synthetic_fog'):
+        calibration_qa(calibration, [(61, 1, image, depth, '0' * 64, '1' * 64)])
+
+
+def test_synthetic_fog_qa_fails_closed_for_too_few_patches_and_constant_contrast(monkeypatch):
+    import georeliab_mve.preparation_round2 as preparation_round2
+
+    depth = np.full((64, 64), np.nan, dtype=np.float64)
+    depth[:32, :32] = 1.0
+    image = np.full((64, 64, 3), 0.5, dtype=np.float64)
+    calibration = calibrate_corruptions([np.nan_to_num(depth, nan=1.0)], [image])
+    mapping = {
+        (id(image), 1): image,
+        (id(image), 2): image,
+        (id(image), 3): image,
+    }
+    _fake_fog_renderer_by_image(monkeypatch, mapping)
+    monkeypatch.setattr(
+        preparation_round2,
+        'render_defocus',
+        lambda image, depth, calibration, *, severity, gt_digest, raw_source_sha256: (
+            image,
+            {
+                'gt_digest': gt_digest,
+                'parameter_manifest_sha256': calibration.manifest().sha256,
+                'focus_depth': calibration.d_ref,
+                'inverse_depth_layers': 32,
+                'defocus_scale': severity,
+                'coc_p95': float(severity),
+                'edge_energy_loss': float(severity),
+            },
+        ),
+    )
+
+    with pytest.raises(CalibrationError, match='synthetic_fog'):
+        calibration_qa(calibration, [(127, 1, image, depth, '0' * 64, '1' * 64)])
+
+
+def test_synthetic_fog_qa_rejects_unchanged_contrast(monkeypatch):
+    depth = _patchwise_depth([1.0, 2.0, 3.0, 4.0])
+    image = _patchwise_contrast_image([0.01, 0.02, 0.03, 0.04])
+    calibration = calibrate_corruptions([depth], [image])
+    mapping = {
+        (id(image), 1): image.copy(),
+        (id(image), 2): image.copy(),
+        (id(image), 3): image.copy(),
+    }
+    _fake_fog_renderer_by_image(monkeypatch, mapping)
+
+    with pytest.raises(CalibrationError, match='synthetic_fog'):
+        calibration_qa(calibration, [(92, 1, image, depth, '0' * 64, '1' * 64)])
 
 
 def test_non_dry_preparation_calibration_rendering_and_sanity_have_success_paths(monkeypatch, tmp_path):

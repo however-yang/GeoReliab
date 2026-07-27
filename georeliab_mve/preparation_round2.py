@@ -178,18 +178,73 @@ def _spearman(left: np.ndarray, right: np.ndarray) -> float:
     return _base._spearman(np.asarray(left, dtype=np.float64), np.asarray(right, dtype=np.float64))
 
 
-def _synthetic_fog_correlation(image: np.ndarray, depth: np.ndarray, calibration: _base.CorruptionCalibration, severity: int) -> float:
-    rendered, _ = fog_render(image, depth, calibration, severity=severity, gt_digest='0' * 64, raw_source_sha256=_legacy_digest(image))
-    # A stable per-pixel local-contrast proxy: distance from a 3x3 local mean.
-    lum = rendered @ np.asarray((0.2126, 0.7152, 0.0722))
-    padded = np.pad(lum, 1, mode='edge')
-    local = sum(padded[dy:dy + lum.shape[0], dx:dx + lum.shape[1]] for dy in range(3) for dx in range(3)) / 9.0
-    contrast = np.abs(lum - local)
-    valid = np.isfinite(depth) & (depth > 0)
-    # Non-informative observed contrast has no physical-direction evidence.
-    if np.unique(contrast[valid]).size < 2 or float(np.std(contrast[valid])) == 0.0:
-        raise _base.CalibrationError('synthetic fog has non-informative observed contrast')
-    return _spearman(depth[valid].ravel(), contrast[valid].ravel())
+def _patch_depth_contrast(image: np.ndarray, depth: np.ndarray) -> tuple[list[float], list[float]]:
+    rgb, z, valid = _base._require_image_depth(image, depth)
+    luminance = rgb @ np.asarray((0.2126, 0.7152, 0.0722), dtype=np.float64)
+    depth_values: list[float] = []
+    contrast_values: list[float] = []
+    height, width = z.shape
+    for y in range(0, height - 31, 32):
+        for x in range(0, width - 31, 32):
+            patch_valid = valid[y:y + 32, x:x + 32]
+            if not patch_valid.all():
+                continue
+            patch_luminance = luminance[y:y + 32, x:x + 32]
+            depth_values.append(float(np.median(z[y:y + 32, x:x + 32])))
+            mean = float(patch_luminance.mean())
+            contrast_values.append(float(np.sqrt(np.mean((patch_luminance - mean) ** 2))))
+    return depth_values, contrast_values
+
+
+def _scene_synthetic_fog_metrics(scene_patch_data: Mapping[int, dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    scene_metrics: list[dict[str, Any]] = []
+    passed = True
+    for scene_id in sorted(scene_patch_data):
+        data = scene_patch_data[scene_id]
+        errors = list(data['errors'])
+        clean_depth = np.asarray(data['clean_depth'], dtype=np.float64)
+        clean_contrast = np.asarray(data['clean_contrast'], dtype=np.float64)
+        fog_rhos: list[float] = []
+        effects: list[float] = []
+        patch_counts = {'clean': int(clean_depth.size)}
+        clean_rho = float('nan')
+        scene_passed = not errors
+        try:
+            if clean_depth.size < 2 or np.unique(clean_contrast).size < 2 or float(np.std(clean_contrast)) == 0.0:
+                raise _base.CalibrationError('synthetic_fog clean patch evidence is non-informative')
+            clean_rho = _spearman(clean_depth, clean_contrast)
+            if not np.isfinite(clean_rho):
+                raise _base.CalibrationError('synthetic_fog clean rho is undefined')
+            for severity in (1, 2, 3):
+                fog_depth = np.asarray(data['fog_depth'][severity], dtype=np.float64)
+                fog_contrast = np.asarray(data['fog_contrast'][severity], dtype=np.float64)
+                patch_counts[f's{severity}'] = int(fog_depth.size)
+                if fog_depth.size < 2 or np.unique(fog_contrast).size < 2 or float(np.std(fog_contrast)) == 0.0:
+                    raise _base.CalibrationError(f'synthetic_fog severity-{severity} patch evidence is non-informative')
+                rho = _spearman(fog_depth, fog_contrast)
+                if not np.isfinite(rho):
+                    raise _base.CalibrationError(f'synthetic_fog severity-{severity} rho is undefined')
+                fog_rhos.append(float(rho))
+                effects.append(float(rho - clean_rho))
+        except _base.CalibrationError as exc:
+            errors.append(str(exc))
+            scene_passed = False
+        if not (len(fog_rhos) == 3 and all(effect < 0.0 for effect in effects)
+                and abs(effects[0]) < abs(effects[1]) < abs(effects[2])):
+            scene_passed = False
+        if not scene_passed:
+            passed = False
+        scene_metrics.append({
+            'scene_id': int(scene_id),
+            'view_count': len(data['views']),
+            'patch_counts': patch_counts,
+            'clean_rho': clean_rho,
+            'fog_rhos': fog_rhos,
+            'effects': effects,
+            'passed': scene_passed,
+            'errors': errors,
+        })
+    return scene_metrics, passed
 
 
 def calibration_qa(calibration: _base.CorruptionCalibration,
@@ -200,8 +255,24 @@ def calibration_qa(calibration: _base.CorruptionCalibration,
         raise _base.CalibrationError('calibration QA requires calibration records')
     metrics: list[dict[str, Any]] = []
     parameter_vectors: dict[tuple[str, int], set[tuple[Any, ...]]] = {}
+    scene_patch_data: dict[int, dict[str, Any]] = {}
     for scene_id, view_id, image, depth, raw_digest, gt_digest in records:
-        row: dict[str, Any] = {'scene_id': scene_id, 'view_id': view_id, 'fog': [], 'brightness': [], 'noise': [], 'coc': [], 'edge_loss': [], 'fog_correlation': [], 'fog_strength': [], 'gt': []}
+        scene_data = scene_patch_data.setdefault(scene_id, {
+            'views': set(),
+            'clean_depth': [],
+            'clean_contrast': [],
+            'fog_depth': {1: [], 2: [], 3: []},
+            'fog_contrast': {1: [], 2: [], 3: []},
+            'errors': [],
+        })
+        scene_data['views'].add(view_id)
+        try:
+            clean_depth, clean_contrast = _patch_depth_contrast(image, depth)
+            scene_data['clean_depth'].extend(clean_depth)
+            scene_data['clean_contrast'].extend(clean_contrast)
+        except _base.CalibrationError as exc:
+            scene_data['errors'].append(f'view {view_id} clean: {exc}')
+        row: dict[str, Any] = {'scene_id': scene_id, 'view_id': view_id, 'fog': [], 'brightness': [], 'noise': [], 'coc': [], 'edge_loss': [], 'gt': []}
         for severity in (1, 2, 3):
             fog, fog_meta = fog_render(image, depth, calibration, severity=severity, gt_digest=gt_digest, raw_source_sha256=raw_digest)
             _, low_meta = low_light_noise_render(image, f'scan{scene_id}', view_id, severity=severity, gt_digest=gt_digest, calibration=calibration, raw_source_sha256=raw_digest)
@@ -211,11 +282,12 @@ def calibration_qa(calibration: _base.CorruptionCalibration,
             row['noise'].append(low_meta['measured_noise'])
             row['coc'].append(defocus_meta['coc_p95'])
             row['edge_loss'].append(defocus_meta['edge_energy_loss'])
-            correlation = _synthetic_fog_correlation(image, depth, calibration, severity)
-            row['fog_correlation'].append(correlation)
-            # This is the observed depth/contrast association itself; no
-            # transmittance-derived severity multiplier is permitted.
-            row['fog_strength'].append(abs(correlation))
+            try:
+                fog_depth, fog_contrast = _patch_depth_contrast(fog, depth)
+                scene_data['fog_depth'][severity].extend(fog_depth)
+                scene_data['fog_contrast'][severity].extend(fog_contrast)
+            except _base.CalibrationError as exc:
+                scene_data['errors'].append(f'view {view_id} severity {severity}: {exc}')
             row['gt'].extend((fog_meta['gt_digest'], low_meta['gt_digest'], defocus_meta['gt_digest']))
             parameter_vectors.setdefault(('fog', severity), set()).add((
                 fog_meta['parameter_manifest_sha256'], fog_meta['beta'],
@@ -229,6 +301,7 @@ def calibration_qa(calibration: _base.CorruptionCalibration,
                 defocus_meta['inverse_depth_layers'], defocus_meta['defocus_scale'],
             ))
         metrics.append(row)
+    synthetic_fog_metrics, synthetic_fog_passed = _scene_synthetic_fog_metrics(scene_patch_data)
     strict_down = lambda values: values[0] > values[1] > values[2]
     strict_up = lambda values: values[0] < values[1] < values[2]
     checks = {
@@ -237,11 +310,7 @@ def calibration_qa(calibration: _base.CorruptionCalibration,
         'defocus': all(strict_up(row['coc']) and strict_up(row['edge_loss']) for row in metrics),
         'gt': all(len(set(row['gt'])) == 1 for row in metrics),
         'cross_view': all(len(values) == 1 for values in parameter_vectors.values()),
-        'synthetic_fog': all(
-            all(value < 0.0 for value in row['fog_correlation'])
-            and strict_up(row['fog_strength'])
-            for row in metrics
-        ),
+        'synthetic_fog': synthetic_fog_passed,
     }
     if expected is not None:
         supplied = expected.get('checks')
@@ -254,6 +323,7 @@ def calibration_qa(calibration: _base.CorruptionCalibration,
         if not passed:
             raise _base.CalibrationError(f'calibration QA failed {name}')
     return {'schema_version': 'calibration-qa-v1', 'passed': True, 'checks': checks, 'metrics': metrics,
+            'synthetic_fog_metrics': synthetic_fog_metrics,
             'parameter_manifest_sha256': calibration.manifest().sha256}
 
 

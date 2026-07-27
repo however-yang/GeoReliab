@@ -81,7 +81,11 @@ Status: approved for execution on 2026-07-26.
 - Random seed is the first 64 bits of
   `SHA256(sample_key + view_id)`.
 - Calibration QA must verify monotonic fog transmittance, darkness/noise, and
-  CoC/edge-energy before test rendering. GT geometry hashes never change.
+  CoC/edge-energy before test rendering. Synthetic-fog physical direction is
+  checked at scene grain by pooling the already-produced linear-RGB fog renders into
+  depth-defined 32x32 patch median-depth/local-RMS contrast pairs and requiring
+  every calibration scene to have `rho_fog - rho_clean < 0` with strictly
+  increasing absolute effect across severities. GT geometry hashes never change.
 
 ## Frozen model protocol
 

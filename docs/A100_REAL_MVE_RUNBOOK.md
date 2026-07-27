@@ -208,7 +208,9 @@ $PYTHON -m georeliab_mve prepare-georeliab --operation sanity --data-root "$ROOT
 
 P0 passes only when all required manifests/evidence files exist and the latest status has no blocker. Treat Rectified/TartanAir whole-archive `.partial` files as stale non-authoritative leftovers; the authoritative evidence is the frozen HTTP Range index plus verified selected-member extraction. The prior P0 Torch import failure after `HOME` redirection is resolved only when `verify_prereqs.sh`, materialization provenance, and isolated adapter probes all confirm that `typing_extensions` imports from the frozen site above with the exact SHA-256.
 
-Until all nine `preparation-state-v5` files are complete, calibration QA is passing, both smoke/test render counts are complete, and `TARTANAIR_NATIVE_FOG_SANITY` passes on 100 frames with at least 80 negative correlations, P1 remains locked. P0 contains no model inference and produces no scientific result.
+Until all nine `preparation-state-v5` files are complete, calibration QA is passing, both smoke/test render counts are complete, and `TARTANAIR_NATIVE_FOG_SANITY` passes on 100 frames with at least 80 negative correlations, P1 remains locked. The synthetic-fog calibration QA is scene-level: it pools depth-defined 32x32 patch median-depth/local-RMS contrast pairs from the already-produced linear-RGB fog renders, compares each severity against clean as `rho_fog - rho_clean`, and requires all calibration scenes to be negative with strictly increasing absolute effect. P0 contains no model inference and produces no scientific result.
+
+Implementation incident, 2026-07-28: before any smoke/test rendering or model inference, P0 exposed that the previous synthetic-fog QA still used per-view raw 3x3 contrast and could fail on scene texture-depth rank structure. The fix only implements the already-approved scene-grain, 32x32 patch, clean-paired effect semantics above; fog parameters, split manifests, scientific thresholds, and gate rules remain unchanged. This is an experiment-governance correction, not a scientific result.
 
 ## P1: repeated preflight
 
