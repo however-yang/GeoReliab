@@ -306,6 +306,14 @@ def _write_local_dtu_archives(root: Path) -> tuple[Path, Path]:
     return sample, points
 
 
+def _contains_key(value: object, key: str) -> bool:
+    if isinstance(value, dict):
+        return key in value or any(_contains_key(item, key) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_key(item, key) for item in value)
+    return False
+
+
 def test_archive_inventory_reads_real_zip_members_and_official_camera_ids(tmp_path):
     sample, points = _write_local_dtu_archives(tmp_path)
     _, rectified = _zip_index(_rectified_names())
@@ -472,8 +480,19 @@ def test_full_materialization_and_v2_provenance_contracts_fail_closed(monkeypatc
     assert result['tartanair_pair_count'] == 100
     assert frozen['dependencies']['typing_extensions']['path'] == str(typing_file)
     assert frozen['dependencies']['typing_extensions']['sha256'] == resources['typing_extensions_sha256']
+    assert not _contains_key(frozen, 'disposition')
 
     original_materialization = materialization_path.read_text(encoding='utf-8')
+    original_sha256 = hashlib.sha256(materialization_path.read_bytes()).hexdigest()
+    resumed = materialize_frozen_selection(
+        root=tmp_path, resources=resources, split_manifest_path=split_path,
+        dtu_inventory_provenance_path=provenance_path,
+        typing_extensions_site=typing_site,
+        enforce_typing_extensions_home=False,
+    )
+    assert materialization_path.read_text(encoding='utf-8') == original_materialization
+    assert resumed['materialization_sha256'] == original_sha256
+
     camera_swap = json.loads(original_materialization)
     camera_keys = list(camera_swap['dtu'][0]['cameras'])
     first, second = camera_keys[:2]

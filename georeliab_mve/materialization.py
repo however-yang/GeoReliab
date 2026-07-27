@@ -458,6 +458,22 @@ def _remote_archive_evidence(
     }
 
 
+def _frozen_materialization_payload(value: Any) -> Any:
+    """Return a manifest-stable copy without operation-local resume state."""
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _frozen_materialization_payload(item)
+            for key, item in value.items()
+            if key != "disposition"
+        }
+    if isinstance(value, list):
+        return [_frozen_materialization_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [_frozen_materialization_payload(item) for item in value]
+    return value
+
+
 def materialize_frozen_selection(
     *,
     root: Path,
@@ -697,7 +713,7 @@ def materialize_frozen_selection(
         },
     }
     output = root / "manifests" / "frozen_materialization.json"
-    atomic_json(output, payload)
+    atomic_json(output, _frozen_materialization_payload(payload))
     return {
         "materialization_path": str(output),
         "materialization_sha256": sha256_file(output),
