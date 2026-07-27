@@ -219,8 +219,12 @@ def test_non_dry_download_verify_index_and_manifests_have_success_paths(monkeypa
     monkeypatch.setattr(dispatch, 'verify_archive', fake_verify)
     monkeypatch.setattr(dispatch, 'validate_remote_indexes', lambda _resources: (remote_evidence, empty_indexes))
     monkeypatch.setattr(dispatch, 'verify_frozen_overlay_identities', lambda **_kwargs: {'schema_version': 'frozen-runtime-identity-v1'})
-    assert run_prepare_operation(operation='download', data_root=root, state_path=state, dry_run=False, overlay_path=overlay)['resources_ready'] is False
-    assert run_prepare_operation(operation='verify', data_root=root, state_path=state, dry_run=False, overlay_path=overlay)['resources_ready'] is True
+    download = run_prepare_operation(operation='download', data_root=root, state_path=state, dry_run=False, overlay_path=overlay)
+    assert download['resources_ready'] is False
+    assert download['schema_version'] == 'preparation-state-v5'
+    verify = run_prepare_operation(operation='verify', data_root=root, state_path=state, dry_run=False, overlay_path=overlay)
+    assert verify['resources_ready'] is True
+    assert verify['schema_version'] == 'preparation-state-v5'
 
     ids = list(range(1, 78)) + list(range(82, 129))
     scenes = tuple(DtuScene(scene, tuple(f'rect_{view:03d}_3_r5000.png' for view in range(1, 50)),
@@ -238,6 +242,61 @@ def test_non_dry_download_verify_index_and_manifests_have_success_paths(monkeypa
     monkeypatch.setattr(dispatch, 'verify_materialization_manifest', lambda *_args, **_kwargs: {})
     manifest = run_prepare_operation(operation='manifests', data_root=root, state_path=state, dry_run=False, overlay_path=overlay)
     assert len(json.loads(Path(manifest['manifest_path']).read_text())['views']) == 45
+
+
+@pytest.mark.parametrize('operation', ('download', 'verify'))
+def test_prepare_writer_keeps_state_contract_authoritative(monkeypatch, tmp_path, operation):
+    import georeliab_mve.prepare_dispatch_round1 as dispatch
+
+    root = tmp_path / 'data'
+    overlay = _overlay(tmp_path / 'overlay.toml')
+    state = tmp_path / f'{operation}.json'
+    result = {
+        'schema_version': 'remote-zip-evidence-v1',
+        'operation': 'wrong-operation',
+        'stage': 'test',
+        'data_root': '/wrong/root',
+        'dry_run': True,
+        'scientific_ready': True,
+        'resources_ready': 'wrong',
+        'state_transition': 'wrong:completed',
+        'remote_indexes': [
+            {
+                'name': 'Rectified.zip',
+                'url': 'https://example.test/Rectified.zip',
+                'bytes': 2,
+                'etag': 'etag',
+                'central_directory_sha256': 'a' * 64,
+                'member_count': 360,
+                'required_member_count': 360,
+            }
+        ],
+        'tartanair_selected_frame_ids': ['000000'],
+    }
+    monkeypatch.setattr(
+        dispatch,
+        f'_run_{operation}',
+        lambda *_args, **_kwargs: dict(result),
+    )
+
+    payload = run_prepare_operation(
+        operation=operation,
+        data_root=root,
+        state_path=state,
+        dry_run=False,
+        overlay_path=overlay,
+    )
+
+    assert json.loads(state.read_text(encoding='utf-8')) == payload
+    assert payload['schema_version'] == 'preparation-state-v5'
+    assert payload['operation'] == operation
+    assert payload['stage'] is None
+    assert payload['data_root'] == str(root)
+    assert payload['dry_run'] is False
+    assert payload['scientific_ready'] is False
+    assert payload['resources_ready'] is (operation == 'verify')
+    assert payload['state_transition'] == f'{operation}:completed'
+    assert payload['remote_indexes'] == result['remote_indexes']
 
 
 def test_prepared_operation_invokes_production_writer(monkeypatch, tmp_path):

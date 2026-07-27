@@ -642,7 +642,7 @@ def test_repeatability_and_p5_short_circuit(tmp_path: Path):
     assert blocked["reason_code"] in {"NATIVE_CONFIDENCE_GATE_MISSING", "NATIVE_CONFIDENCE_GATE_INJECTION_FORBIDDEN"}
 
 
-def _write_completed_p0_fixture(root: Path) -> None:
+def _write_completed_p0_fixture(root: Path, *, resource_schema: str = "preparation-state-v5") -> None:
     artifacts = root / "artifacts"
     manifests = root / "manifests"
     evidence = root / "evidence"
@@ -692,6 +692,35 @@ def _write_completed_p0_fixture(root: Path) -> None:
             "resources_ready": operation == "verify",
             "state_transition": f"{operation}:completed",
         }
+        if operation in {"download", "verify"}:
+            payload.update(
+                {
+                    "schema_version": resource_schema,
+                    "sample_set": {
+                        "path": "/srv/private/smli/GeoReliab/SampleSet.zip",
+                        "bytes": 448423219,
+                        "sha256": "a" * 64,
+                        "entries": 6,
+                    },
+                    "points": {
+                        "path": "/srv/private/smli/GeoReliab/Points.zip",
+                        "bytes": 1412691903,
+                        "sha256": "b" * 64,
+                        "entries": 248,
+                    },
+                    "remote_indexes": [
+                        {
+                            "name": "Rectified.zip",
+                            "url": "https://roboimagedata.compute.dtu.dk/data/MVS/Rectified.zip",
+                            "bytes": 28165810720,
+                            "etag": "frozen-etag",
+                            "central_directory_sha256": "c" * 64,
+                            "member_count": 6048,
+                        }
+                    ],
+                    "tartanair_selected_frame_ids": [f"{index:06d}" for index in range(100)],
+                }
+            )
         if operation == "calibration":
             payload.update(
                 {
@@ -731,6 +760,45 @@ def test_p0_completion_status_requires_all_non_dry_pass_states(tmp_path: Path):
     blocked = runner.p0_completion_status(tmp_path)
     assert blocked["status"] == "BLOCKED_PENDING_EVIDENCE"
     assert blocked["reason_code"] == "P0_STATE_INVALID"
+
+
+def test_p0_completion_accepts_known_legacy_remote_zip_resource_states(tmp_path: Path):
+    _write_completed_p0_fixture(
+        tmp_path,
+        resource_schema="remote-zip-evidence-v1",
+    )
+
+    result = runner.p0_completion_status(tmp_path)
+
+    assert result["status"] == "PASS"
+    assert result["reason_code"] == "P0_COMPLETE"
+
+
+def test_p0_completion_rejects_unknown_resource_state_schema(tmp_path: Path):
+    _write_completed_p0_fixture(
+        tmp_path,
+        resource_schema="remote-zip-evidence-v2",
+    )
+
+    result = runner.p0_completion_status(tmp_path)
+
+    assert result["status"] == "BLOCKED_PENDING_EVIDENCE"
+    assert result["reason_code"] == "P0_STATE_INVALID"
+    assert result["state_path"].endswith("p0_download.json")
+
+
+def test_p0_completion_rejects_legacy_resource_schema_on_other_operations(tmp_path: Path):
+    _write_completed_p0_fixture(tmp_path)
+    state = tmp_path / "artifacts" / "p0_index.json"
+    payload = json.loads(state.read_text(encoding="utf-8"))
+    payload["schema_version"] = "remote-zip-evidence-v1"
+    state.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = runner.p0_completion_status(tmp_path)
+
+    assert result["status"] == "BLOCKED_PENDING_EVIDENCE"
+    assert result["reason_code"] == "P0_STATE_INVALID"
+    assert result["state_path"].endswith("p0_index.json")
 
 
 def test_p1_completion_status_requires_both_models_repeats_and_current_fingerprint(

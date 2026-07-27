@@ -1845,15 +1845,20 @@ def p0_completion_status(root: Path) -> dict[str, Any]:
             payload = _load_json(path)
         except RunnerError:
             return _pending_stage("P0_STATE_INVALID", state_path=str(path))
+        allowed_schemas = {"preparation-state-v5"}
+        if operation in {"download", "verify"}:
+            allowed_schemas.add("remote-zip-evidence-v1")
         expected = {
-            "schema_version": "preparation-state-v5",
             "operation": operation,
             "stage": stage,
             "dry_run": False,
             "scientific_ready": False,
             "state_transition": f"{operation}:completed",
         }
-        if any(payload.get(key) != value for key, value in expected.items()):
+        if (
+            payload.get("schema_version") not in allowed_schemas
+            or any(payload.get(key) != value for key, value in expected.items())
+        ):
             return _pending_stage("P0_STATE_INVALID", state_path=str(path))
         states[filename] = payload
 

@@ -372,7 +372,7 @@ def run_prepare_operation(*, operation: str, data_root: Path, state_path: Path,
     else:
         result = _run_sanity(data_root)
     readiness = operation == 'verify'
-    payload = {**base, **result, 'resources_ready': readiness,
+    payload = {**result, **base, 'resources_ready': readiness,
                'state_transition': f'{operation}:completed'}
     if operation == 'download':
         payload['pending_reason'] = 'PENDING_RESOURCE_VERIFICATION'
