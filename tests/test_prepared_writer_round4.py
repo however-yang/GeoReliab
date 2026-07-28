@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 import hashlib
 import json
@@ -205,7 +206,7 @@ def _raw_asset(path: Path, member: str) -> dict[str, str]:
     }
 
 
-def test_loader_recomputes_official_bytes_and_rejects_self_rehashed_arrays_and_raw_tamper(
+def test_loader_cross_environment_producer_recipe_recomputes_official_bytes_and_rejects_self_rehashed_arrays_and_raw_tamper(
     monkeypatch, tmp_path,
 ):
     import georeliab_mve.materialization as materialization_module
@@ -286,6 +287,17 @@ def test_loader_recomputes_official_bytes_and_rejects_self_rehashed_arrays_and_r
     prepared_path.write_text(json.dumps(payload), encoding="utf-8")
     assert len(load_prepared_batch(prepared_path, expected_stage="smoke").records) == 1
 
+    expected_record = load_prepared_batch(prepared_path, expected_stage="smoke").records[0]
+    payload["producer"] = copy.deepcopy(payload["producer"])
+    payload["producer"]["dependencies"]["numpy"] = "2.2.6"
+    payload["producer"]["dependencies"]["pillow"] = "12.2.0"
+    prepared_path.write_text(json.dumps(payload), encoding="utf-8")
+    actual_record = load_prepared_batch(prepared_path, expected_stage="smoke").records[0]
+    assert actual_record[:3] == expected_record[:3]
+    np.testing.assert_array_equal(actual_record[3], expected_record[3])
+    np.testing.assert_array_equal(actual_record[4], expected_record[4])
+    assert actual_record[5:] == expected_record[5:]
+    payload["producer"] = prepared.implementation_evidence()
     np.save(rgb_npy, np.zeros_like(image), allow_pickle=False)
     forged_sha = hashlib.sha256(rgb_npy.read_bytes()).hexdigest()
     payload["records"][0]["linear_rgb_npy_sha256"] = forged_sha
@@ -395,13 +407,20 @@ def test_tartanair_loader_recomputes_100_official_pairs_and_rejects_depth_tamper
     prepared_path.write_text(json.dumps(payload), encoding="utf-8")
     assert len(load_tartanair_prepared_pairs(prepared_path)) == 100
 
+    payload["producer"] = copy.deepcopy(payload["producer"])
+    payload["producer"]["dependencies"]["numpy"] = "2.2.6"
+    payload["producer"]["dependencies"]["pillow"] = "12.2.0"
+    prepared_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert len(load_tartanair_prepared_pairs(prepared_path)) == 100
+    payload["producer"] = prepared.implementation_evidence()
+    prepared_path.write_text(json.dumps(payload), encoding="utf-8")
+
     first_depth_raw = Path(records[0]["raw_depth_path"])
     original = first_depth_raw.read_bytes()
     first_depth_raw.write_bytes(original + b"tamper")
     with pytest.raises(PreparationError, match="(raw bytes|digest|tampered)"):
         load_tartanair_prepared_pairs(prepared_path)
     first_depth_raw.write_bytes(original)
-
     first_depth_npy = Path(records[0]["depth_npy"])
     np.save(first_depth_npy, np.zeros((2, 2), dtype="<f4"), allow_pickle=False)
     forged = hashlib.sha256(first_depth_npy.read_bytes()).hexdigest()
@@ -410,3 +429,27 @@ def test_tartanair_loader_recomputes_100_official_pairs_and_rejects_depth_tamper
     prepared_path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(PreparationError, match="does not match official BGRA"):
         load_tartanair_prepared_pairs(prepared_path)
+
+
+@pytest.mark.parametrize('field, value', [
+    ('source_sha256', '0' * 64),
+    ('writer_version', 'incompatible-writer'),
+    ('algorithm', 'incompatible-rgb-decoder'),
+])
+def test_prepared_loader_rejects_producer_recipe_mismatch(tmp_path: Path, field: str, value: str):
+    import georeliab_mve.prepared_inputs as prepared
+
+    producer = copy.deepcopy(prepared.implementation_evidence())
+    if field == 'algorithm':
+        producer['algorithms'] = dict(producer['algorithms'])
+        producer['algorithms']['rgb'] = value
+    else:
+        producer[field] = value
+    prepared_path = tmp_path / 'prepared.json'
+    prepared_path.write_text(json.dumps({
+        'schema_version': 'prepared-input-v2',
+        'producer': producer,
+    }), encoding='utf-8')
+
+    with pytest.raises(PreparationError, match='producer/dependency recipe mismatch'):
+        load_prepared_batch(prepared_path)

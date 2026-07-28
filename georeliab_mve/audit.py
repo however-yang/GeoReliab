@@ -1785,8 +1785,9 @@ def load_official_dtu_evidence(
     )
     if scene_record is None:
         raise AuditError('sample scene/split is not present in materialization manifest')
-    if tuple(map(int, scene_record['cameras'])) != expected_views:
-        raise AuditError('materialized camera views do not match frozen FPS order')
+    camera_ids = {int(view_id) for view_id in scene_record['cameras']}
+    if camera_ids != set(expected_views):
+        raise AuditError('materialized camera IDs do not match frozen FPS views')
     points_asset = scene_record['points']
     mask_asset = scene_record['mask']
     points_path = Path(str(points_asset['path']))

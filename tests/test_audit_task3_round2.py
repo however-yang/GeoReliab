@@ -723,3 +723,38 @@ def test_official_loader_rejects_mask_camera_and_split_view_mismatch(tmp_path: P
     frozen, split, _ = _write_realistic_dtu_materialization(tmp_path / 'split')
     with pytest.raises(AuditError, match='scene/split'):
         load_official_dtu_evidence(sample_key='dtu/dev/scan026/views-0001/clean/0/0', frozen_materialization=frozen, split_manifest=split)
+
+
+def test_official_loader_json_camera_order_and_camera_membership(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _ignore_typing_dependency_for_official_loader_fixture(monkeypatch)
+    frozen, split, _ = _write_realistic_dtu_materialization(tmp_path)
+    split_payload = json.loads(split.read_text(encoding='utf-8'))
+    materialization = json.loads(frozen.read_text(encoding='utf-8'))
+    scene = next(row for row in materialization['dtu'] if row['scene_id'] == 26)
+    scene['cameras'] = dict(reversed(list(scene['cameras'].items())))
+    frozen.write_text(json.dumps(materialization), encoding='utf-8')
+
+    evidence = load_official_dtu_evidence(
+        sample_key='dtu/test/scan026/views-0001/clean/0/0',
+        frozen_materialization=frozen,
+        split_manifest=split,
+    )
+    assert evidence['view_ids'] == tuple(split_payload['views']['26'])
+    assert evidence['gt_camera_centers'][:, 0].tolist() == pytest.approx(
+        [float(view) for view in split_payload['views']['26']]
+    )
+
+    import georeliab_mve.materialization as materialization_module
+
+    scene['cameras'].pop('1')
+    monkeypatch.setattr(
+        materialization_module,
+        'verify_materialization_manifest',
+        lambda *_args, **_kwargs: materialization,
+    )
+    with pytest.raises(AuditError, match='camera IDs do not match frozen FPS views'):
+        load_official_dtu_evidence(
+            sample_key='dtu/test/scan026/views-0001/clean/0/0',
+            frozen_materialization=frozen,
+            split_manifest=split,
+        )

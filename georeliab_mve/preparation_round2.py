@@ -81,6 +81,14 @@ def _sha_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _producer_recipe(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        'writer_version': evidence.get('writer_version'),
+        'source_module': evidence.get('source_module'),
+        'source_sha256': evidence.get('source_sha256'),
+        'algorithms': evidence.get('algorithms'),
+    }
+
 def _edge_energy(value: np.ndarray) -> float:
     return float(np.mean(np.abs(np.diff(value, axis=0))) + np.mean(np.abs(np.diff(value, axis=1))))
 
@@ -406,7 +414,13 @@ def load_prepared_batch(
         DTU_IMAGE_SIZE, DtuPlyCache, decode_dtu_assets,
         implementation_evidence, npy_bytes,
     )
-    if payload.get('producer') != implementation_evidence():
+    producer = payload.get('producer')
+    if (
+        not isinstance(producer, Mapping)
+        or not isinstance(producer.get('dependencies'), Mapping)
+        or not producer['dependencies']
+        or _producer_recipe(producer) != _producer_recipe(implementation_evidence())
+    ):
         raise _base.PreparationError('prepared input producer/dependency recipe mismatch')
     stage = payload.get('stage')
     split = payload.get('split')
@@ -557,7 +571,13 @@ def load_tartanair_prepared_pairs(
         TARTAN_IMAGE_SIZE, decode_tartanair_assets,
         implementation_evidence, npy_bytes,
     )
-    if payload.get('producer') != implementation_evidence():
+    producer = payload.get('producer')
+    if (
+        not isinstance(producer, Mapping)
+        or not isinstance(producer.get('dependencies'), Mapping)
+        or not producer['dependencies']
+        or _producer_recipe(producer) != _producer_recipe(implementation_evidence())
+    ):
         raise _base.PreparationError('TartanAir producer/dependency recipe mismatch')
     try:
         materialization_path = Path(str(payload['materialization_path']))
