@@ -366,6 +366,26 @@ def _squeeze_model_volume(value: Any, name: str) -> np.ndarray:
     return array
 
 
+def _normalize_mast3r_dense_output(
+    points: Any,
+    confidence: Any,
+) -> tuple[np.ndarray, np.ndarray]:
+    points_by_view = _to_numpy(points).astype(np.float64, copy=False)
+    confidence_by_view = _to_numpy(confidence).astype(np.float64, copy=False)
+    if confidence_by_view.ndim != 3:
+        raise AdapterError('MASt3R confidence must have shape (V,H,W)')
+    view_count, height, width = confidence_by_view.shape
+    dense_shape = (view_count, height, width, 3)
+    flattened_shape = (view_count, height * width, 3)
+    if points_by_view.shape == flattened_shape:
+        points_by_view = points_by_view.reshape(dense_shape)
+    elif points_by_view.shape != dense_shape:
+        raise AdapterError(
+            'MASt3R pts3d must match confidence as (V,H,W,3) or (V,H*W,3)'
+        )
+    return points_by_view, confidence_by_view
+
+
 def _file_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -802,13 +822,10 @@ class MASt3RAdapter:
             forbidden = result.get('forbidden_operations', ()) if isinstance(result, Mapping) else ()
             if any(str(item).lower() in {'clean_pointcloud', 'tsdf', 'confidence_threshold'} for item in forbidden):
                 raise AdapterError('MASt3R adapter forbids clean_pointcloud, TSDF, and confidence thresholds')
-            pts_by_view = _to_numpy(result['pts3d']).astype(np.float64, copy=False)
-            conf_by_view = _to_numpy(result['conf']).astype(np.float64, copy=False)
-            if pts_by_view.ndim != 4 or pts_by_view.shape[-1] != 3:
-                raise AdapterError('MASt3R pts3d must have shape (V,H,W,3)')
+            pts_by_view, conf_by_view = _normalize_mast3r_dense_output(
+                result['pts3d'], result['conf']
+            )
             view_count, height, width, _ = pts_by_view.shape
-            if conf_by_view.shape != (view_count, height, width):
-                raise AdapterError('MASt3R confidence shape must match pts3d')
             camera_c2w = _normalize_camera_stack(_to_numpy(result['camera_c2w']), view_count)
             intrinsics = _normalize_intrinsics(_to_numpy(result['intrinsics']), view_count)
             pixels = np.concatenate([source_pixel_grid(height, width, view.height, view.width) for view in batch.views])

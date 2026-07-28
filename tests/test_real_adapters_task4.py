@@ -267,6 +267,16 @@ class FakeMASt3R:
         return {'pts3d': [TensorLike(item) for item in pts], 'conf': [TensorLike(item) for item in np.ones((8, 2, 2))], 'camera_c2w': np.repeat(np.eye(4)[None], 8, axis=0), 'intrinsics': np.repeat(np.eye(3)[None], 8, axis=0), 'raw_pairwise': {'kept': True}, 'forbidden_operations': self.forbidden}
 
 
+class FakeMASt3RFlattenedDenseOutput(FakeMASt3R):
+    def infer(self, paths, images):
+        result = dict(super().infer(paths, images))
+        result['pts3d'] = [
+            TensorLike(item.value.reshape(-1, 3))
+            for item in result['pts3d']
+        ]
+        return result
+
+
 def test_mast3r_exact_alignment_contract_and_clean_depth_false(tmp_path):
     fake = FakeMASt3R()
     runtime = _runtime(tmp_path, mast3r=True)
@@ -283,6 +293,30 @@ def test_mast3r_exact_alignment_contract_and_clean_depth_false(tmp_path):
     assert metadata['raw_pairwise_trace_uri'].startswith('file:')
     assert len(metadata['raw_pairwise_trace_sha256']) == 64
     assert mast3r_risk_from_confidence(np.array([2.0, 0.5]))[0] < mast3r_risk_from_confidence(np.array([2.0, 0.5]))[1]
+
+
+def test_mast3r_accepts_frozen_upstream_flattened_dense_points(tmp_path):
+    runtime = _runtime(tmp_path, mast3r=True)
+    adapter = MASt3RAdapter(
+        runtime,
+        output_root=tmp_path / 'out-flat-dense',
+        device='cpu',
+        upstream=FakeMASt3RFlattenedDenseOutput(),
+        git_probe=_git,
+        env_probe=_env,
+    )
+
+    pred = adapter.predict_sample(
+        _manifest('MASt3R', runtime, mast3r=True),
+        SampleKey.parse('dtu/test/scan001/views-0001/clean/0/0'),
+        _views(tmp_path),
+    )
+
+    assert not pred.invalid_prediction
+    geom = np.load(_file_uri_path(pred.geometry_prediction_uri, 'geometry'))
+    assert geom['points_world'].shape == (32, 3)
+    assert geom['pixel_xy'].shape == (32, 2)
+    assert set(geom['view_id'].tolist()) == set(range(8))
 
 
 def test_mast3r_forbidden_cleaning_thresholds_and_invalid_retention(tmp_path):

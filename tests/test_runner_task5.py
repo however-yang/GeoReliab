@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -1084,6 +1085,28 @@ def test_cli_model_all_uses_frozen_env_workers_and_dry_run_does_not(tmp_path: Pa
         "--shard", "0/1", "--config", str(config), "--output-root", str(root), "--dry-run",
     ]) == 0
     assert calls == []
+
+
+def test_emit_cli_payload_serializes_path_values_to_summary(
+    tmp_path: Path,
+    capsys,
+):
+    summary_path = tmp_path / "worker-summary.json"
+    bundle_dir = tmp_path / "bundle"
+    payload = {
+        "status": "OK",
+        "results": [{"bundle_dir": bundle_dir}],
+    }
+
+    runner._emit_cli_payload(
+        SimpleNamespace(summary_json=summary_path),
+        payload,
+    )
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    stdout = json.loads(capsys.readouterr().out)
+    assert summary["results"][0]["bundle_dir"] == str(bundle_dir)
+    assert stdout == summary
 
 
 def test_real_output_policy_requires_exact_non_home_overlay_root(tmp_path: Path):

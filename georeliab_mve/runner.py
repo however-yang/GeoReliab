@@ -2481,10 +2481,11 @@ def _cli_success(status: Any) -> bool:
 
 
 def _emit_cli_payload(args: argparse.Namespace, payload: Mapping[str, Any]) -> None:
+    raw = json.dumps(payload, indent=2, sort_keys=True, default=str)
     summary_json = getattr(args, "summary_json", None)
     if summary_json is not None:
-        _atomic_json(summary_json, payload)
-    print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        _atomic_text(summary_json, raw + "\n")
+    print(raw)
 
 
 def cli_main(argv: list[str] | None = None) -> int:
