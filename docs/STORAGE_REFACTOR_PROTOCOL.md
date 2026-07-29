@@ -31,19 +31,24 @@ from an earlier run is not reusable.
 
 ## Science lock
 
-The following SHA-256 values are calculated from the exact base commit and are
-validated by `georeliab_mve.science_lock`:
+The following SHA-256 values are calculated from the exact base-commit blobs
+after canonicalizing text line endings to LF. This is equivalent to the Git
+blob content on the A100 checkout and prevents CRLF/LF checkout policy from
+changing the lock. `georeliab_mve.science_lock` validates the canonical text
+while still failing closed on content changes.
 
 | Locked input | SHA-256 |
 | --- | --- |
-| `configs/dual_mve_protocol.toml` | `71069d54ec11dd2fda4c3153a3b2a2ff0b60db5bb1855a39cbe7a7ee5d4f8198` |
-| `configs/a100_real_mve_overlay.toml` | `9dfa1b20aa4fcafb5808b5edafd5e30279b59da0887906472ec20dd804de4400` |
-| `georeliab_mve/splits.py` | `55e79e14b9f6dbe957500cfdf3c04723ebe950de973f66153061ddf89a89dc4e` |
-| `georeliab_mve/preparation_round2.py` | `891c7337d2f8129bddd44efe250e8a7e698f0c683aebb8070369abb38f465f2c` |
+| `configs/dual_mve_protocol.toml` | `91eddc87c3bfdf2a6de413174dc758163c11d7c37e224b1deb4ac23288fafb6c` |
+| `configs/a100_real_mve_overlay.toml` | `c65ef97684adeda6b1bba8d8c152eb559df44367bc35973f549d7e8049136011` |
+| `georeliab_mve/splits.py` | `a270f114a649941abed5123a918e238273b8bc63ee9b9492509d428a6081a213` |
+| `georeliab_mve/preparation_round2.py` | `304e60b50368354fa9623f7145832c140fb45a2d663a26c19f638c22119d3359` |
+| `georeliab_mve/gates.py` | `cb77a1c37f30e813d86097722874cda118b34aa9c9d0bfa084d0950d752d5c51` |
 
 These locks cover the frozen thresholds/budgets, A100 resource overlay,
-scene/view split construction, and corruption calibration implementation.
-Changing any lock requires a new protocol hash and is outside this refactor.
+scene/view split construction, corruption calibration implementation, and
+gate semantics. Changing any lock requires a new protocol hash and is outside
+this refactor.
 
 ## Storage levels
 

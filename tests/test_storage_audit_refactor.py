@@ -40,9 +40,24 @@ def test_science_lock_matches_exact_f539_inputs():
     report = validate_science_lock(SOURCE_ROOT)
     assert report["status"] == "PASS"
     assert report["base_project_commit"] == BASE_PROJECT_COMMIT
+    assert report["hash_algorithm"] == "sha256-canonical-lf-v1"
     assert {
         row["path"]: row["sha256"] for row in report["files"]
     } == dict(LOCKED_SCIENCE_FILES)
+
+
+def test_science_lock_is_checkout_line_ending_invariant(tmp_path: Path):
+    for relative in LOCKED_SCIENCE_FILES:
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        raw = (SOURCE_ROOT / relative).read_bytes()
+        canonical = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        target.write_bytes(canonical)
+
+    report = validate_science_lock(tmp_path)
+
+    assert report["status"] == "PASS"
+    assert report["hash_algorithm"] == "sha256-canonical-lf-v1"
 
 
 def test_science_lock_fails_closed_on_tamper(tmp_path: Path):

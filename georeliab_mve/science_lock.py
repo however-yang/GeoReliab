@@ -8,22 +8,23 @@ from typing import Mapping
 
 
 BASE_PROJECT_COMMIT = "f5397b25806dcbf5b527b83c836b6c5f344122ae"
+SCIENCE_LOCK_HASH_ALGORITHM = "sha256-canonical-lf-v1"
 
 LOCKED_SCIENCE_FILES: Mapping[str, str] = {
     "configs/dual_mve_protocol.toml": (
-        "71069d54ec11dd2fda4c3153a3b2a2ff0b60db5bb1855a39cbe7a7ee5d4f8198"
+        "91eddc87c3bfdf2a6de413174dc758163c11d7c37e224b1deb4ac23288fafb6c"
     ),
     "configs/a100_real_mve_overlay.toml": (
-        "9dfa1b20aa4fcafb5808b5edafd5e30279b59da0887906472ec20dd804de4400"
+        "c65ef97684adeda6b1bba8d8c152eb559df44367bc35973f549d7e8049136011"
     ),
     "georeliab_mve/splits.py": (
-        "55e79e14b9f6dbe957500cfdf3c04723ebe950de973f66153061ddf89a89dc4e"
+        "a270f114a649941abed5123a918e238273b8bc63ee9b9492509d428a6081a213"
     ),
     "georeliab_mve/preparation_round2.py": (
-        "891c7337d2f8129bddd44efe250e8a7e698f0c683aebb8070369abb38f465f2c"
+        "304e60b50368354fa9623f7145832c140fb45a2d663a26c19f638c22119d3359"
     ),
     "georeliab_mve/gates.py": (
-        "9063b624ae5543a3c825d7909749b25c831ba6324358d02db4dc58fefee15239"
+        "cb77a1c37f30e813d86097722874cda118b34aa9c9d0bfa084d0950d752d5c51"
     ),
 }
 
@@ -32,12 +33,10 @@ class ScienceLockError(RuntimeError):
     """Raised when a frozen scientific input no longer matches f539."""
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+def sha256_canonical_text(path: Path) -> str:
+    raw = path.read_bytes()
+    canonical = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def validate_schedule_contract() -> dict[str, object]:
@@ -116,15 +115,16 @@ def validate_science_lock(source_root: Path) -> dict[str, object]:
             raise ScienceLockError(f"science lock escaped source root: {relative}") from exc
         if not path.is_file():
             raise ScienceLockError(f"missing science-locked file: {relative}")
-        actual = sha256_file(path)
+        actual = sha256_canonical_text(path)
         rows.append({"path": relative, "sha256": actual, "expected_sha256": expected})
         if actual != expected:
             raise ScienceLockError(
                 f"science lock mismatch for {relative}: {actual} != {expected}"
             )
     return {
-        "schema_version": "georeliab-storage-science-lock-v1",
+        "schema_version": "georeliab-storage-science-lock-v2",
         "base_project_commit": BASE_PROJECT_COMMIT,
+        "hash_algorithm": SCIENCE_LOCK_HASH_ALGORITHM,
         "status": "PASS",
         "files": rows,
         "schedule_contract": validate_schedule_contract(),
