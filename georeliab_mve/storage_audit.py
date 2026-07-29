@@ -11,6 +11,12 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .science_lock import BASE_PROJECT_COMMIT, validate_science_lock
+from .storage_retention import (
+    StorageRetentionError,
+    apply_retention_actions,
+    build_retention_actions,
+    project_full_path,
+)
 
 
 PLAN_SCHEMA = "georeliab-storage-plan-v1"
@@ -106,7 +112,7 @@ def classify_storage_path(relative: Path) -> tuple[str, str]:
     name = relative.name
     parts = set(relative.parts)
     if (
-        ".partial" in name
+        any(".partial" in part for part in relative.parts)
         or "mast3r_cache" in parts
         or posix.endswith("Rectified.sparse-index.zip")
         or "/debug/" in f"/{posix}/"
@@ -314,57 +320,21 @@ def _bundle_sizes(root: Path, stage: str, model: str) -> list[int]:
     return sizes
 
 
-def _projection(root: Path, current_logical: int, levels: Mapping[str, int]) -> dict[str, Any]:
-    model_rates: dict[str, int] = {}
-    for model in ("vggt", "mast3r"):
-        smoke = _bundle_sizes(root, "smoke", model)
-        preflight: list[int] = []
-        for repeat in ("repeat-a", "repeat-b"):
-            repeat_root = (
-                root
-                / "preflight-real"
-                / repeat
-                / "stage"
-                / "preflight"
-                / "bundles"
-                / model
-            )
-            if repeat_root.exists():
-                for bundle in repeat_root.iterdir():
-                    if bundle.is_dir():
-                        preflight.append(
-                            sum(p.stat().st_size for p in bundle.rglob("*") if p.is_file())
-                        )
-        model_rates[model] = _percentile95(smoke or preflight)
-    completed = {
-        model: len(_bundle_sizes(root, "smoke", model))
-        for model in ("vggt", "mast3r")
-    }
-    p2_remaining = sum(
-        max(0, 100 - completed[model]) * model_rates[model] for model in model_rates
+def _projection(
+    root: Path,
+    current_logical: int,
+    levels: Mapping[str, int],
+    *,
+    source_root: Path,
+    actions: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    return project_full_path(
+        root,
+        source_root=source_root,
+        current_logical=current_logical,
+        levels=levels,
+        actions=actions,
     )
-    p3 = 200 * model_rates["vggt"] + 200 * model_rates["mast3r"]
-    p5 = 240 * model_rates["vggt"] + 240 * model_rates["mast3r"]
-    transient_peak = max(model_rates.values(), default=0)
-    subtotal = current_logical + p2_remaining + p3 + p5 + transient_peak
-    reserve = math.ceil(subtotal * 0.10)
-    projected = subtotal + reserve
-    return {
-        "model_retained_byte_p95": model_rates,
-        "p2_completed_by_model": completed,
-        "p2_remaining_retained_bytes": p2_remaining,
-        "p3_retained_bytes": p3,
-        "conditional_p5_retained_bytes": p5,
-        "single_task_temporary_peak_bytes": transient_peak,
-        "reserve_bytes": reserve,
-        "full_worst_path_bytes": projected,
-        "r1_status": "PASS" if projected < R1_LIMIT_BYTES else "FAIL",
-        "r1_limit_bytes": R1_LIMIT_BYTES,
-        "hard_limit_bytes": HARD_LIMIT_BYTES,
-        "remaining_retained_target_bytes": REMAINING_RETAINED_TARGET_BYTES,
-        "reporting_target_bytes": REPORTING_TARGET_BYTES,
-        "l1_current_bytes": int(levels.get("L1", 0)),
-    }
 
 
 def capture_storage_snapshot(root: Path, *, source_root: Path) -> dict[str, Any]:
@@ -382,10 +352,13 @@ def capture_storage_snapshot(root: Path, *, source_root: Path) -> dict[str, Any]
     allocated = sum(row.allocated_bytes for row in rows)
     runtime = account_runtime(resolved_root)
     science_lock = validate_science_lock(source_root)
+    retention_actions = build_retention_actions(resolved_root, rows)
     projection = _projection(
         resolved_root,
         logical,
         {level: value["logical_bytes"] for level, value in levels.items()},
+        source_root=source_root,
+        actions=retention_actions,
     )
     return {
         "schema_version": SNAPSHOT_SCHEMA,
@@ -412,30 +385,26 @@ def capture_storage_snapshot(root: Path, *, source_root: Path) -> dict[str, Any]
 def build_storage_plan(
     root: Path, snapshot: Mapping[str, Any], files: Iterable[FileUsage]
 ) -> dict[str, Any]:
-    actions: list[dict[str, Any]] = []
-    for row in files:
-        if row.level != "L2":
-            continue
-        actions.append(
-            {
-                "action": "review_ephemeral",
-                "path": row.path,
-                "logical_bytes": row.logical_bytes,
-                "allocated_bytes": row.allocated_bytes,
-                "requires_verified_retention": True,
-            }
-        )
+    actions = build_retention_actions(root.resolve(), files)
+    reclaimable = 0
+    for action in actions:
+        source = int(action.get("source_bytes", 0))
+        if action["action"] == "lossless_reencode_npz":
+            reclaimable += max(
+                0,
+                source - int(action.get("estimated_retained_bytes", source)),
+            )
+        elif str(action["action"]).startswith("delete_"):
+            reclaimable += source
     payload: dict[str, Any] = {
         "schema_version": PLAN_SCHEMA,
         "base_project_commit": BASE_PROJECT_COMMIT,
         "runtime_root": str(root.resolve()),
         "storage_before_sha256": _sha_json(snapshot),
         "actions": actions,
-        "projected_reclaimable_bytes": sum(
-            int(action["logical_bytes"]) for action in actions
-        ),
-        "mutation_enabled": False,
-        "reason": "audit-only-plan-before-retention-implementation",
+        "projected_reclaimable_bytes": reclaimable,
+        "mutation_enabled": True,
+        "reason": "digest-bound-lossless-retention-actions",
     }
     payload["plan_payload_sha256"] = _sha_json(payload)
     return payload
@@ -471,34 +440,77 @@ def apply_storage_plan(
     expected_plan_sha256: str,
     receipt_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Validate a plan binding; mutation is enabled by the retention commit."""
+    """Apply one exact plan with resumable per-action receipts."""
 
-    if len(expected_plan_sha256) != 64:
+    if len(expected_plan_sha256) != 64 or any(
+        value not in "0123456789abcdef" for value in expected_plan_sha256
+    ):
         raise StorageAuditError("expected plan SHA-256 must be 64 lowercase hex chars")
-    actual_file_sha = _sha256_file(plan_path)
+    resolved_root = root.resolve()
+    try:
+        resolved_plan = resolve_under_root(
+            resolved_root, plan_path, must_exist=True
+        )
+    except (OSError, StorageAuditError) as exc:
+        raise StorageAuditError("storage plan must be inside the runtime root") from exc
+    actual_file_sha = _sha256_file(resolved_plan)
     if actual_file_sha != expected_plan_sha256:
         raise StorageAuditError(
             f"storage plan file digest mismatch: {actual_file_sha} != {expected_plan_sha256}"
         )
-    payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    payload = json.loads(resolved_plan.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("schema_version") != PLAN_SCHEMA:
         raise StorageAuditError("unsupported storage plan")
-    if Path(str(payload.get("runtime_root", ""))).resolve() != root.resolve():
+    if Path(str(payload.get("runtime_root", ""))).resolve() != resolved_root:
         raise StorageAuditError("storage plan is bound to another runtime root")
     if payload.get("mutation_enabled") is not True:
         raise StorageAuditError("storage plan is audit-only and cannot be applied")
-    for action in payload.get("actions", []):
+    recorded_payload_sha = payload.get("plan_payload_sha256")
+    without_payload_sha = dict(payload)
+    without_payload_sha.pop("plan_payload_sha256", None)
+    if (
+        not isinstance(recorded_payload_sha, str)
+        or recorded_payload_sha != _sha_json(without_payload_sha)
+    ):
+        raise StorageAuditError("storage plan payload digest mismatch")
+    actions = payload.get("actions", [])
+    if not isinstance(actions, list):
+        raise StorageAuditError("storage plan actions must be a list")
+    for action in actions:
         if not isinstance(action, dict) or not isinstance(action.get("path"), str):
             raise StorageAuditError("storage plan contains an invalid action")
-        resolve_under_root(root, root / action["path"])
+        resolve_under_root(resolved_root, resolved_root / action["path"])
+    before_rows, before_errors = scan_storage(resolved_root)
+    if before_errors:
+        raise StorageAuditError("storage scan failed before apply")
+    before_logical = sum(row.logical_bytes for row in before_rows)
+    try:
+        action_receipts = apply_retention_actions(
+            resolved_root,
+            actions,
+            plan_file_sha256=actual_file_sha,
+        )
+    except StorageRetentionError as exc:
+        raise StorageAuditError(str(exc)) from exc
+    after_rows, after_errors = scan_storage(resolved_root)
+    if after_errors:
+        raise StorageAuditError("storage scan failed after apply")
+    after_logical = sum(row.logical_bytes for row in after_rows)
     receipt = {
         "schema_version": RECEIPT_SCHEMA,
-        "runtime_root": str(root.resolve()),
+        "runtime_root": str(resolved_root),
         "plan_file_sha256": actual_file_sha,
         "status": "PASS",
-        "actions_applied": 0,
+        "actions_applied": len(action_receipts),
+        "action_receipts": action_receipts,
+        "logical_bytes_before": before_logical,
+        "logical_bytes_after": after_logical,
+        "logical_bytes_reclaimed": max(0, before_logical - after_logical),
     }
-    destination = receipt_path or root / "artifacts" / "storage_apply_receipt.json"
-    resolve_under_root(root, destination)
+    destination = (
+        receipt_path
+        or resolved_root / "artifacts" / "storage_apply_receipt.json"
+    )
+    resolve_under_root(resolved_root, destination)
     _atomic_json(destination, receipt)
     return receipt

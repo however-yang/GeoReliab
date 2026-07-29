@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
-import os
 from pathlib import Path
 from typing import Mapping
 from urllib.parse import unquote, urlparse
@@ -17,6 +15,11 @@ from .audit import (
     load_official_dtu_evidence,
     model_risk_from_confidence,
 )
+from .artifact_storage import (
+    sha256_file as _sha256_file,
+    write_deterministic_npz,
+    write_shared_gt,
+)
 from .contracts import AuditRecord, PredictionArtifact, RunManifest, validate_artifact_bundle
 
 
@@ -28,14 +31,6 @@ _DENSE_AUDIT_KEYS = (
     "failure_label",
     "provenance_count",
 )
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _local_file_uri_path(uri: str, field_name: str) -> Path:
@@ -55,19 +50,6 @@ def _load_npz_uri(uri: str, field_name: str) -> dict[str, np.ndarray]:
             return {name: payload[name] for name in payload.files}
     except (OSError, ValueError) as exc:
         raise AuditError(f"cannot read {field_name} NPZ payload: {exc}") from exc
-
-
-def _atomic_savez(path: Path, payload: Mapping[str, np.ndarray]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.with_name(path.name + ".partial")
-    with partial.open("wb") as handle:
-        np.savez(handle, **dict(payload))
-        handle.flush()
-        try:
-            os.fsync(handle.fileno())
-        except OSError:
-            pass
-    partial.replace(path)
 
 
 def _dense_payload(result, *, invalid_prediction: bool) -> dict[str, np.ndarray]:
@@ -163,9 +145,12 @@ def audit_prediction_with_frozen_dtu(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     dense_path = output_dir / "dense_audit.npz"
-    gt_points_path = output_dir / "gt_points.npz"
-    _atomic_savez(dense_path, _dense_payload(result, invalid_prediction=prediction.invalid_prediction))
-    _atomic_savez(gt_points_path, {"gt_points": np.asarray(evidence["gt_points"])})
+    write_deterministic_npz(
+        dense_path,
+        _dense_payload(result, invalid_prediction=prediction.invalid_prediction),
+        member_order=_DENSE_AUDIT_KEYS,
+    )
+    gt_points_path = write_shared_gt(root, evidence["gt_points"]).path
     metadata = _audit_metadata(dense_path, gt_points_path, result, evidence)
 
     if prediction.invalid_prediction:

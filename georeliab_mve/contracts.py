@@ -645,3 +645,25 @@ def validate_artifact_bundle(
     _validate_payload_digest(
         audit.metadata['dense_audit_uri'], dense_digest, 'dense_audit_uri'
     )
+    gt_uri = audit.metadata.get('gt_points_uri')
+    gt_digest = audit.metadata.get('gt_points_sha256')
+    if (gt_uri is None) != (gt_digest is None):
+        raise ContractError(
+            'GT artifact metadata requires both gt_points_uri and gt_points_sha256'
+        )
+    if gt_uri is not None:
+        if not isinstance(gt_uri, str) or not isinstance(gt_digest, str):
+            raise ContractError('GT artifact URI and digest must be strings')
+        if not _SHA256_RE.fullmatch(gt_digest):
+            raise ContractError(
+                'gt_points_sha256 must be a lowercase SHA-256 digest'
+            )
+        gt_payload = _load_npz(gt_uri, 'gt_points_uri')
+        _require_payload_keys(gt_payload, ('gt_points',), 'gt_points_uri')
+        gt_points = gt_payload['gt_points']
+        if gt_points.ndim != 2 or gt_points.shape[1] != 3:
+            raise ContractError('GT points must have shape (N, 3)')
+        _require_finite_array(gt_points, 'gt_points_uri:gt_points')
+        _validate_payload_digest(
+            gt_uri, gt_digest, 'gt_points_uri'
+        )

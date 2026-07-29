@@ -272,8 +272,11 @@ def test_invalid_bundle_writes_contract_valid_empty_dense(tmp_path: Path):
     validate_artifact_bundle(manifest, prediction, audit)
     dense = np.load(out / 'dense_audit.npz')
     assert dense['voxel_points'].shape == (0, 3)
-    assert audit.metadata['gt_points_uri'] == gt_points.resolve().as_uri()
-    assert audit.metadata['gt_points_sha256'] == _sha256(gt_points)
+    shared_gt = Path(audit.metadata['gt_points_uri'].replace('file:///', ''))
+    assert shared_gt.parent.name == 'shared_gt'
+    assert audit.metadata['gt_points_sha256'] == _sha256(shared_gt)
+    with np.load(shared_gt, allow_pickle=False) as payload:
+        assert np.array_equal(payload['gt_points'], np.load(gt_points))
     assert audit.failure_label is True
     assert audit.accepted is False
     assert audit.downstream_outcome == 0.0

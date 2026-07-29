@@ -40,7 +40,7 @@ def test_storage_audit_cli_writes_digest_bound_dry_run(
         plan_path.read_bytes()
     ).hexdigest()
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    assert plan["mutation_enabled"] is False
+    assert plan["mutation_enabled"] is True
 
 
 def test_storage_audit_cli_requires_expected_digest_for_apply(

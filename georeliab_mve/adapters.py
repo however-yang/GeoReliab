@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-import io
 from dataclasses import asdict, dataclass, field
 import hashlib
 import importlib
@@ -13,11 +12,11 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-import zipfile
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
+from .artifact_storage import write_deterministic_npz as _write_deterministic_npz
 from .contracts import PredictionArtifact, RunManifest, SampleKey, write_json_artifact
 from .materialization import (
     FROZEN_TYPING_EXTENSIONS_DIST_INFO,
@@ -632,17 +631,23 @@ def _validate_manifest_matches_runtime(model: str, manifest: RunManifest, runtim
         if manifest.provenance.croco_source_commit != preflight.croco_source_commit:
             raise AdapterError('manifest CroCo source commit does not match frozen source')
 
-def collect_mast3r_cache_trace(cache_dir: Path) -> tuple[dict[str, str], ...]:
+def collect_mast3r_cache_trace(cache_dir: Path) -> tuple[dict[str, Any], ...]:
     if not cache_dir.exists():
         return ()
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, Any]] = []
     for child in sorted(cache_dir.rglob('*.pth')):
         try:
             relative = child.relative_to(cache_dir).as_posix()
         except ValueError:
             relative = child.name
         if relative.startswith('forward/') or relative.startswith('corres_'):
-            rows.append({'relative_path': relative, 'uri': child.as_uri(), 'path': str(child), 'sha256': _file_digest(child), 'format': 'mast3r-sparse-ga-torch-pth'})
+            rows.append({
+                'relative_path': relative,
+                'sha256': _file_digest(child),
+                'bytes': child.stat().st_size,
+                'status': 'verified',
+                'format': 'mast3r-sparse-ga-torch-pth',
+            })
     return tuple(rows)
 
 def _write_pairwise_trace(result: Mapping[str, Any], output_dir: Path, prefix: str) -> tuple[str, str, list[dict[str, str]]] | None:
@@ -672,18 +677,6 @@ def _write_pairwise_trace(result: Mapping[str, Any], output_dir: Path, prefix: s
     path = output_dir / f'{prefix}_raw_pairwise_trace.npz'
     _write_deterministic_npz(path, arrays)
     return path.as_uri(), _file_digest(path), skipped
-def _write_deterministic_npz(path: Path, arrays: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(str(path), mode='w', compression=zipfile.ZIP_STORED) as archive:
-        for name in sorted(arrays):
-            buffer = io.BytesIO()
-            np.save(buffer, np.asarray(arrays[name]), allow_pickle=False)
-            info = zipfile.ZipInfo(f'{name}.npy', date_time=(1980, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_STORED
-            info.external_attr = 0o600 << 16
-            archive.writestr(info, buffer.getvalue())
-
-
 def _write_output_payloads(output: AdapterOutput, output_dir: Path, prefix: str) -> tuple[Path, Path, Path, Mapping[str, str]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     geometry_path = output_dir / f'{prefix}_geometry.npz'

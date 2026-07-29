@@ -195,6 +195,18 @@ class FakeAdapter:
         return _fake_prediction(manifest, sample_key, Path(rendered_views[0].png_path).parent / "adapter", invalid=self.invalid)
 
 
+class Mast3RCacheFakeAdapter(FakeAdapter):
+    def __init__(self, output_root: Path, invalid: bool = False):
+        super().__init__(invalid=invalid)
+        self.output_root = output_root
+
+    def predict_sample(self, manifest, sample_key, rendered_views):
+        cache = self.output_root / "mast3r_cache" / "forward"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "trace.pth").write_bytes(b"test-only-mast3r-cache")
+        return super().predict_sample(manifest, sample_key, rendered_views)
+
+
 class SixViewAdapter:
     def __init__(self, *, invalid: bool = False):
         self.seen: list[tuple[int, ...]] = []
@@ -216,6 +228,12 @@ class ContextOutputAdapter:
         self.output_root = output_root
 
     def predict_sample(self, manifest, sample_key, rendered_views):
+        if manifest.model == "MASt3R":
+            cache = self.output_root / "mast3r_cache" / "forward"
+            cache.mkdir(parents=True, exist_ok=True)
+            (cache / "trace.pth").write_bytes(
+                b"test-only-context-mast3r-cache"
+            )
         prediction = _fake_prediction(manifest, sample_key, self.output_root)
         _write_json(self.output_root / "adapter_prediction.json", {"geometry_prediction_uri": prediction.geometry_prediction_uri})
         return prediction
@@ -358,7 +376,15 @@ def test_atomic_run_skip_partial_conflict_invalid_and_claim(tmp_path: Path):
     with pytest.raises(runner.RunnerError, match="provenance-conflict"):
         runner.execute_item(context, item, adapter_factory=lambda _model, _ctx: FakeAdapter(), audit_factory=_audit_factory)
     invalid_item = runner.build_schedule(root, "smoke", model="mast3r")[0]
-    invalid = runner.execute_item(context, invalid_item, adapter_factory=lambda _model, _ctx: FakeAdapter(invalid=True), audit_factory=_audit_factory)
+    invalid = runner.execute_item(
+        context,
+        invalid_item,
+        adapter_factory=lambda _model, ctx: Mast3RCacheFakeAdapter(
+            ctx.output_root,
+            invalid=True,
+        ),
+        audit_factory=_audit_factory,
+    )
     assert invalid.invalid_prediction is True
     assert invalid.reason_code == "INVALID_PREDICTION"
     resumed_invalid = runner.execute_item(context, invalid_item, adapter_factory=lambda _model, _ctx: FakeAdapter(), audit_factory=_audit_factory)
@@ -922,7 +948,17 @@ def test_zero_update_executes_six_view_subsets_with_parent_linkage(tmp_path: Pat
     artifact.write_bytes(original_artifact)
 
     invalid_parent = next(item for item in runner.build_schedule(root, "test", model="mast3r") if item.condition == "fog" and item.severity == 2)
-    runner.execute_item(context, invalid_parent, adapter_factory=lambda _m, _c: FakeAdapter(), audit_factory=_audit_factory, stage_fingerprint=runner.ensure_stage_freeze(context, "test", dry_run=True))
+    runner.execute_item(
+        context,
+        invalid_parent,
+        adapter_factory=lambda _m, ctx: Mast3RCacheFakeAdapter(ctx.output_root),
+        audit_factory=_audit_factory,
+        stage_fingerprint=runner.ensure_stage_freeze(
+            context,
+            "test",
+            dry_run=True,
+        ),
+    )
     invalid_subset = next(item for item in runner.build_zero_update_schedule(root, gate, model="mast3r") if item.parent_identity == invalid_parent.identity)
     invalid_result = runner.execute_zero_update_item(context, invalid_subset, adapter_factory=lambda _m, _c: SixViewAdapter(invalid=True), stage_fingerprint=runner.ensure_stage_freeze(context, "test", dry_run=True))
     assert invalid_result.invalid_prediction is True
@@ -1030,11 +1066,140 @@ def test_budget_observes_nested_preflight_repeats(tmp_path: Path):
     out = tmp_path / "out"
     ledger = out / "preflight-real" / "repeat-a" / "stage" / "preflight" / "ledger.jsonl"
     ledger.parent.mkdir(parents=True, exist_ok=True)
-    ledger.write_text(json.dumps({"state": "completed", "item_identity": "a", "runtime_seconds": 360.0, "artifact_bytes": 123}) + "\n", encoding="utf-8")
+    ledger.write_text(
+        json.dumps(
+            {
+                "state": "completed",
+                "item_identity": "a",
+                "runtime_seconds": 360.0,
+                "gpu_inference_seconds": 360.0,
+                "artifact_bytes": 123,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     context = runner.RunnerContext(root=root, output_root=out, config_path=None, device="cuda:0")
     budget = runner.estimate_stage_budget(context, "smoke", runner.build_schedule(root, "smoke", model="vggt"))
     assert budget["status"] == "OK"
     assert budget["remaining_gpu_hours"] < runner.GPU_HOUR_LIMIT
+
+
+def test_budget_estimates_only_remaining_items_with_latest_stage_rows(tmp_path: Path):
+    root = _minimal_root(tmp_path)
+    out = tmp_path / "out"
+    context = runner.RunnerContext(root=root, output_root=out, config_path=None, device="cuda:0")
+    items = runner.build_schedule(root, "smoke", model="all")
+    ledger = out / "stage" / "smoke" / "ledger.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for item in items[:75]:
+        rows.append(
+            {
+                "state": "completed",
+                "item_identity": item.identity,
+                "model": item.model.lower(),
+                "gpu_inference_seconds": 10.0,
+                "runtime_seconds": 999.0,
+                "artifact_bytes": 100,
+                "temporary_peak_bytes": 1000,
+            }
+        )
+    rows.append(
+        {
+            "state": "skipped",
+            "item_identity": items[0].identity,
+            "model": items[0].model.lower(),
+            "gpu_inference_seconds": 0.0,
+            "runtime_seconds": 0.0,
+            "artifact_bytes": 100,
+            "temporary_peak_bytes": 0,
+        }
+    )
+    ledger.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    budget = runner.estimate_stage_budget(context, "smoke", items)
+
+    assert budget["status"] == "OK"
+    assert budget["completed"] == 75
+    assert budget["remaining_items"] == 125
+    assert budget["remaining_gpu_hours"] == pytest.approx(runner.GPU_HOUR_LIMIT - (750.0 / 3600.0))
+    assert budget["estimated_gpu_hours"] == pytest.approx(1250.0 / 3600.0)
+    assert budget["estimated_retained_bytes"] == 12_500
+    assert budget["estimated_temporary_peak_bytes"] == 1_000
+    assert budget["estimated_bytes"] == 13_500
+
+
+def test_failed_post_inference_attempt_is_charged_and_remains_missing(
+    tmp_path: Path,
+):
+    root = _minimal_root(tmp_path)
+    out = tmp_path / "out"
+    context = runner.RunnerContext(
+        root=root,
+        output_root=out,
+        config_path=None,
+        device="cuda:0",
+    )
+    item = runner.build_schedule(root, "smoke", model="vggt")[0]
+
+    def broken_audit(_manifest, _prediction, _output):
+        raise RuntimeError("post-inference audit failed")
+
+    with pytest.raises(RuntimeError, match="post-inference"):
+        runner.execute_item(
+            context,
+            item,
+            adapter_factory=lambda _model, _ctx: FakeAdapter(),
+            audit_factory=broken_audit,
+        )
+
+    ledger = runner.read_stage_ledger(out, "smoke")
+    failed = [row for row in ledger["rows"] if row["state"] == "failed"]
+    assert len(failed) == 1
+    assert failed[0]["gpu_inference_seconds"] == pytest.approx(1.0)
+    assert runner._observed_usage(out)[0] == pytest.approx(1.0 / 3600.0)
+    counts = runner.stage_progress_counts(out, "smoke", [item])
+    assert counts["completed"] == 0
+    assert counts["missing"] == 1
+
+
+def test_p3_mast3r_temporary_peak_counts_live_cache_and_archive(tmp_path: Path):
+    root = _minimal_root(tmp_path)
+    out = tmp_path / "out"
+    context = runner.RunnerContext(
+        root=root,
+        output_root=out,
+        config_path=None,
+        device="cuda:0",
+    )
+    item = runner.build_schedule(root, "test", model="mast3r")[0]
+    result = runner.execute_item(
+        context,
+        item,
+        adapter_factory=lambda _model, ctx: Mast3RCacheFakeAdapter(
+            ctx.output_root
+        ),
+        audit_factory=_audit_factory,
+        stage_fingerprint=runner.ensure_stage_freeze(
+            context,
+            "test",
+            dry_run=True,
+        ),
+    )
+
+    ledger = runner.read_stage_ledger(out, "test")
+    row = ledger["rows"][-1]
+    receipt = json.loads(
+        (result.bundle_dir / "cache_retention_receipt.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    cache_bytes = sum(member["bytes"] for member in receipt["members"])
+    archive_bytes = (
+        result.bundle_dir / "mast3r_pairwise_cache.tar.gz"
+    ).stat().st_size
+    assert row["temporary_peak_bytes"] >= cache_bytes + archive_bytes
 
 
 def test_cli_model_all_uses_frozen_env_workers_and_dry_run_does_not(tmp_path: Path, monkeypatch, capsys):

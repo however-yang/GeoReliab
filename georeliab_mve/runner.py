@@ -24,6 +24,13 @@ import sys
 import numpy as np
 
 from . import toml_compat as tomllib
+from .artifact_storage import (
+    ArtifactStorageError,
+    finalize_mast3r_cache,
+    finalize_zero_update_adapter,
+    validate_retention_receipt,
+    write_deterministic_npz,
+)
 from .adapters import RenderedView
 from .materialization import (
     FROZEN_TYPING_EXTENSIONS_DIST_INFO,
@@ -69,6 +76,7 @@ PREFLIGHT_CONDITIONS = (
 ZERO_UPDATE_SUBSETS = ((0, 4), (1, 5), (2, 6), (3, 7))
 GPU_HOUR_LIMIT = 50.0
 STORAGE_BYTE_LIMIT = 1_000_000_000_000
+ZERO_UPDATE_SUBSET_RETAINED_BYTE_FALLBACK = 64_000_000
 CLAIM_STALE_SECONDS = 6 * 60 * 60
 LEDGER_LOCK_STALE_SECONDS = 60.0
 
@@ -686,22 +694,41 @@ def make_manifest(item: ScheduleItem, root: Path, model_specs: Mapping[str, Mode
     )
 
 
-def _empty_invalid_prediction(manifest: RunManifest, sample_key: SampleKey, output_dir: Path, reason: str) -> PredictionArtifact:
+def _empty_invalid_prediction(
+    manifest: RunManifest,
+    sample_key: SampleKey,
+    output_dir: Path,
+    reason: str,
+    *,
+    runtime_seconds: float,
+) -> PredictionArtifact:
     output_dir.mkdir(parents=True, exist_ok=True)
     geo = output_dir / "geometry_prediction.npz"
     conf = output_dir / "native_confidence.npz"
     mask = output_dir / "valid_mask.npz"
-    np.savez(
+    write_deterministic_npz(
         geo,
-        points_world=np.empty((0, 3)),
-        camera_c2w=np.empty((0, 4, 4)),
-        intrinsics=np.empty((0, 3, 3)),
-        pixel_xy=np.empty((0, 2)),
-        view_id=np.empty((0,), dtype=np.int64),
-        metadata=json.dumps({"invalid_reason": reason, "reason_code": "ADAPTER_EXCEPTION"}),
+        {
+            "points_world": np.empty((0, 3)),
+            "camera_c2w": np.empty((0, 4, 4)),
+            "intrinsics": np.empty((0, 3, 3)),
+            "pixel_xy": np.empty((0, 2)),
+            "view_id": np.empty((0,), dtype=np.int64),
+            "metadata": json.dumps(
+                {"invalid_reason": reason, "reason_code": "ADAPTER_EXCEPTION"}
+            ),
+        },
+        member_order=(
+            "points_world",
+            "camera_c2w",
+            "intrinsics",
+            "pixel_xy",
+            "view_id",
+            "metadata",
+        ),
     )
-    np.savez(conf, raw_confidence=np.empty((0,)))
-    np.savez(mask, valid_mask=np.empty((0,), dtype=bool))
+    write_deterministic_npz(conf, {"raw_confidence": np.empty((0,))})
+    write_deterministic_npz(mask, {"valid_mask": np.empty((0,), dtype=bool)})
     return PredictionArtifact(
         manifest.run_id,
         str(sample_key),
@@ -709,7 +736,7 @@ def _empty_invalid_prediction(manifest: RunManifest, sample_key: SampleKey, outp
         conf.as_uri(),
         mask.as_uri(),
         None,
-        0.0,
+        runtime_seconds,
         0.0,
         True,
         {"geometry_prediction_uri": sha256_file(geo), "native_confidence_uri": sha256_file(conf), "valid_mask_uri": sha256_file(mask)},
@@ -874,6 +901,10 @@ def load_completed_bundle(bundle_dir: Path) -> tuple[RunManifest, PredictionArti
     prediction = read_json_artifact(bundle_dir / "prediction_artifact.json", PredictionArtifact)
     audit = read_json_artifact(bundle_dir / "audit_record.json", AuditRecord)
     validate_artifact_bundle(manifest, prediction, audit)
+    try:
+        validate_retention_receipt(bundle_dir)
+    except ArtifactStorageError as exc:
+        raise RunnerError(f"invalid bundle retention receipt: {exc}") from exc
     return manifest, prediction, audit
 
 
@@ -1214,6 +1245,36 @@ def stage_progress_counts(output_root: Path, stage: str, items: Sequence[Schedul
     return counts
 
 
+def _result_ledger_payload(
+    output_root: Path,
+    item: ScheduleItem,
+    result: RunResult,
+    *,
+    gpu_inference_seconds: float,
+    temporary_peak_bytes: int,
+    artifact_names: Sequence[str],
+    retried: bool = False,
+) -> dict[str, Any]:
+    return {
+        **asdict(result),
+        "item_identity": item.identity,
+        "model": item.model.lower(),
+        "timestamp": _utc_now(),
+        "attempt": _next_ledger_attempt(
+            output_root, item.stage, item.identity
+        ),
+        "retried": retried,
+        "wall_runtime_seconds": float(result.runtime_seconds),
+        "gpu_inference_seconds": float(gpu_inference_seconds),
+        "temporary_peak_bytes": int(temporary_peak_bytes),
+        "artifact_digests": _artifact_digest_map(
+            result.bundle_dir, artifact_names
+        ),
+        "artifact_bytes": _dir_size(result.bundle_dir),
+        "peak_memory_mb": float(result.peak_memory_mb),
+    }
+
+
 def execute_item(
     context: RunnerContext,
     item: ScheduleItem,
@@ -1231,7 +1292,22 @@ def execute_item(
         invalid_existing = bool(existing_prediction.invalid_prediction)
         reason_code = "INVALID_PREDICTION" if invalid_existing else "EXISTING_VALID_ARTIFACT"
         result = RunResult(item.identity, "skipped", bundle_dir, invalid_existing, reason_code, 0.0, existing_prediction.peak_memory_mb)
-        _append_ledger(context.output_root, item.stage, {**asdict(result), "item_identity": item.identity, "timestamp": _utc_now(), "attempt": _next_ledger_attempt(context.output_root, item.stage, item.identity), "artifact_digests": _artifact_digest_map(bundle_dir, ("run_manifest.json", "prediction_artifact.json", "audit_record.json", "stage_item.json", "scene_summary.json")), "artifact_bytes": _dir_size(bundle_dir)})
+        _append_ledger(
+            context.output_root,
+            item.stage,
+            _result_ledger_payload(
+                context.output_root,
+                item,
+                result,
+                gpu_inference_seconds=0.0,
+                temporary_peak_bytes=0,
+                artifact_names=(
+                    "run_manifest.json", "prediction_artifact.json",
+                    "audit_record.json", "stage_item.json", "scene_summary.json",
+                    "cache_retention_receipt.json", "mast3r_pairwise_cache.tar.gz",
+                ),
+            ),
+        )
         return result
     claim = claim_item(context.output_root / "stage" / item.stage / "claims", item)
     if not claim.acquired:
@@ -1239,6 +1315,11 @@ def execute_item(
     partial = bundle_dir.with_name(bundle_dir.name + ".partial")
     retried = partial.exists()
     start = time.perf_counter()
+    prediction: PredictionArtifact | None = None
+    gpu_inference_seconds = 0.0
+    temporary_peak_bytes = 0
+    reason_code = "RUNNER_EXCEPTION"
+    peak_memory_mb = 0.0
     try:
         if partial.exists():
             shutil.rmtree(partial)
@@ -1246,13 +1327,17 @@ def execute_item(
         specs = _model_specs(context.config_path)
         manifest = make_manifest(item, context.root, specs, device=context.device)
         reason_code = "OK"
+        adapter_start = time.perf_counter()
         try:
             item_context = RunnerContext(root=context.root, output_root=partial / "adapter", config_path=context.config_path, device=context.device)
             adapter = adapter_factory(item.model, item_context)
             prediction = adapter.predict_sample(manifest, item.sample_key, item.rendered_views)
+            gpu_inference_seconds = float(prediction.runtime_seconds)
+            peak_memory_mb = float(prediction.peak_memory_mb)
             if prediction.invalid_prediction:
                 reason_code = "INVALID_PREDICTION"
         except Exception as exc:
+            adapter_runtime_seconds = time.perf_counter() - adapter_start
             reason_code = "ADAPTER_EXCEPTION"
             exception_payload = {
                 "schema_version": "georeliab-adapter-exception-v1",
@@ -1261,13 +1346,36 @@ def execute_item(
                 "message": str(exc),
             }
             _atomic_json(partial / "adapter_exception.json", exception_payload)
-            prediction = _empty_invalid_prediction(manifest, item.sample_key, partial, f"{type(exc).__name__}: {exc}")
+            gpu_inference_seconds = adapter_runtime_seconds
+            prediction = _empty_invalid_prediction(
+                manifest,
+                item.sample_key,
+                partial,
+                f"{type(exc).__name__}: {exc}",
+                runtime_seconds=adapter_runtime_seconds,
+            )
+            peak_memory_mb = float(prediction.peak_memory_mb)
         audit = audit_factory(manifest, prediction, partial)
         write_json_artifact(partial / "run_manifest.json", manifest)
         write_json_artifact(partial / "prediction_artifact.json", prediction)
         write_json_artifact(partial / "audit_record.json", audit)
         _atomic_json(partial / "stage_item.json", _stage_item_payload_for_context(item, fingerprint))
         validate_artifact_bundle(manifest, prediction, audit)
+        pre_retention_bytes = _dir_size(partial)
+        temporary_peak_bytes = pre_retention_bytes
+        if item.model == "MASt3R" and item.stage in {"smoke", "test"}:
+            finalize_mast3r_cache(
+                partial,
+                stage=item.stage,
+                allow_empty=(reason_code == "ADAPTER_EXCEPTION"),
+            )
+            archive = partial / "mast3r_pairwise_cache.tar.gz"
+            archive_bytes = archive.stat().st_size if archive.is_file() else 0
+            temporary_peak_bytes = max(
+                temporary_peak_bytes,
+                pre_retention_bytes + archive_bytes,
+                _dir_size(partial),
+            )
         _rewrite_bundle_uri_payloads(bundle_dir, partial, work_dir=partial)
         final_manifest = read_json_artifact(partial / "run_manifest.json", RunManifest)
         final_prediction = read_json_artifact(partial / "prediction_artifact.json", PredictionArtifact)
@@ -1279,8 +1387,58 @@ def execute_item(
         load_completed_bundle(bundle_dir)
         runtime = time.perf_counter() - start
         result = RunResult(item.identity, "completed", bundle_dir, prediction.invalid_prediction, reason_code, runtime, prediction.peak_memory_mb)
-        _append_ledger(context.output_root, item.stage, {**asdict(result), "item_identity": item.identity, "timestamp": _utc_now(), "attempt": _next_ledger_attempt(context.output_root, item.stage, item.identity), "retried": retried, "artifact_digests": _artifact_digest_map(bundle_dir, ("run_manifest.json", "prediction_artifact.json", "audit_record.json", "stage_item.json", "scene_summary.json")), "artifact_bytes": _dir_size(bundle_dir)})
+        _append_ledger(
+            context.output_root,
+            item.stage,
+            _result_ledger_payload(
+                context.output_root,
+                item,
+                result,
+                gpu_inference_seconds=gpu_inference_seconds,
+                temporary_peak_bytes=temporary_peak_bytes,
+                artifact_names=(
+                    "run_manifest.json", "prediction_artifact.json",
+                    "audit_record.json", "stage_item.json", "scene_summary.json",
+                    "cache_retention_receipt.json", "mast3r_pairwise_cache.tar.gz",
+                ),
+                retried=retried,
+            ),
+        )
         return result
+    except Exception as exc:
+        runtime = time.perf_counter() - start
+        if prediction is not None and gpu_inference_seconds <= 0.0:
+            gpu_inference_seconds = float(prediction.runtime_seconds)
+            peak_memory_mb = float(prediction.peak_memory_mb)
+        temporary_peak_bytes = _dir_size(partial)
+        result = RunResult(
+            item.identity,
+            "failed",
+            partial,
+            True,
+            f"RUNNER_EXCEPTION_{type(exc).__name__}",
+            runtime,
+            peak_memory_mb,
+        )
+        _append_ledger(
+            context.output_root,
+            item.stage,
+            _result_ledger_payload(
+                context.output_root,
+                item,
+                result,
+                gpu_inference_seconds=gpu_inference_seconds,
+                temporary_peak_bytes=temporary_peak_bytes,
+                artifact_names=(
+                    "run_manifest.json", "prediction_artifact.json",
+                    "audit_record.json", "stage_item.json", "scene_summary.json",
+                    "adapter_exception.json", "cache_retention_receipt.json",
+                    "mast3r_pairwise_cache.tar.gz",
+                ),
+                retried=retried,
+            ),
+        )
+        raise
     finally:
         _release_claim(claim)
 
@@ -1311,9 +1469,29 @@ def execute_zero_update_item(
                 _validate_zero_subset_npz(artifact, item, parent_manifest=parent_manifest, parent_prediction=parent_prediction)
             if zero_result.get("subset_prediction_sha256") != sha256_file(artifact):
                 raise RunnerError("provenance-conflict: zero-update artifact digest mismatch")
+            try:
+                validate_retention_receipt(bundle_dir)
+            except ArtifactStorageError as exc:
+                raise RunnerError(
+                    f"provenance-conflict: invalid zero-update retention receipt: {exc}"
+                ) from exc
             reason_code = "INVALID_PREDICTION" if invalid_existing else "EXISTING_VALID_ARTIFACT"
             result = RunResult(item.identity, "skipped", bundle_dir, invalid_existing, reason_code, 0.0, 0.0)
-            _append_ledger(context.output_root, item.stage, {**asdict(result), "item_identity": item.identity, "timestamp": _utc_now(), "attempt": _next_ledger_attempt(context.output_root, item.stage, item.identity), "artifact_digests": _artifact_digest_map(bundle_dir, ("subset_prediction.npz", "zero_update_result.json", "stage_item.json")), "artifact_bytes": _dir_size(bundle_dir)})
+            _append_ledger(
+                context.output_root,
+                item.stage,
+                _result_ledger_payload(
+                    context.output_root,
+                    item,
+                    result,
+                    gpu_inference_seconds=0.0,
+                    temporary_peak_bytes=0,
+                    artifact_names=(
+                        "subset_prediction.npz", "zero_update_result.json",
+                        "stage_item.json", "retention_receipt.json",
+                    ),
+                ),
+            )
             return result
         raise RunnerError("provenance-conflict: existing zero-update artifact does not match stage fingerprint")
     _parent_bundle_for_zero_update(context, item)
@@ -1322,6 +1500,9 @@ def execute_zero_update_item(
         raise RunnerError(f"zero-update item is already claimed: {item.identity}")
     partial = bundle_dir.with_name(bundle_dir.name + ".partial")
     start = time.perf_counter()
+    gpu_inference_seconds = 0.0
+    temporary_peak_bytes = 0
+    peak_memory = 0.0
     try:
         if partial.exists():
             shutil.rmtree(partial)
@@ -1333,10 +1514,12 @@ def execute_zero_update_item(
         invalid = False
         peak_memory = 0.0
         ordinal_ids = np.asarray([index for index in range(8) if item.subset is None or index not in set(item.subset)], dtype=np.int64)
+        adapter_start = time.perf_counter()
         try:
             item_context = RunnerContext(root=context.root, output_root=partial / "adapter", config_path=context.config_path, device=context.device)
             adapter = adapter_factory(item.model, item_context)
             prediction = adapter.predict_sample(manifest, item.sample_key, subset_views)
+            gpu_inference_seconds = float(prediction.runtime_seconds)
             geometry = _load_npz_uri(prediction.geometry_prediction_uri)
             valid_payload = _load_npz_uri(prediction.valid_mask_uri)
             points = np.asarray(geometry["points_world"], dtype=np.float64)
@@ -1359,6 +1542,8 @@ def execute_zero_update_item(
                 invalid = True
                 reason_code = "EMPTY_SUBSET_PREDICTION"
         except Exception as exc:
+            if gpu_inference_seconds <= 0.0:
+                gpu_inference_seconds = time.perf_counter() - adapter_start
             reason_code = "ADAPTER_EXCEPTION"
             invalid = True
             _atomic_json(partial / "adapter_exception.json", {"schema_version": "georeliab-adapter-exception-v1", "reason_code": reason_code, "exception_type": type(exc).__name__, "message": str(exc)})
@@ -1366,15 +1551,26 @@ def execute_zero_update_item(
             camera_centers = np.empty((0, 3), dtype=np.float64)
         _parent_dir, parent_manifest, parent_prediction, _parent_audit = _parent_bundle_for_zero_update(context, item)
         subset_path = partial / "subset_prediction.npz"
-        np.savez(
+        write_deterministic_npz(
             subset_path,
-            points=points,
-            camera_centers=camera_centers,
-            view_ids=ordinal_ids,
-            parent_model=np.asarray(parent_manifest.model),
-            parent_sample_key=np.asarray(parent_prediction.sample_key),
-            parent_project_commit=np.asarray(parent_manifest.provenance.project_commit if parent_manifest.provenance else ""),
-            parent_run_id=np.asarray(parent_manifest.run_id),
+            {
+                "points": points,
+                "camera_centers": camera_centers,
+                "view_ids": ordinal_ids,
+                "parent_model": np.asarray(parent_manifest.model),
+                "parent_sample_key": np.asarray(parent_prediction.sample_key),
+                "parent_project_commit": np.asarray(parent_manifest.provenance.project_commit if parent_manifest.provenance else ""),
+                "parent_run_id": np.asarray(parent_manifest.run_id),
+            },
+            member_order=(
+                "points",
+                "camera_centers",
+                "view_ids",
+                "parent_model",
+                "parent_sample_key",
+                "parent_project_commit",
+                "parent_run_id",
+            ),
         )
         if not invalid:
             _validate_zero_subset_npz(subset_path, item, parent_manifest=parent_manifest, parent_prediction=parent_prediction)
@@ -1388,14 +1584,60 @@ def execute_zero_update_item(
             }
         )
         _atomic_json(partial / "stage_item.json", stage_payload)
+        temporary_peak_bytes = _dir_size(partial)
+        finalize_zero_update_adapter(partial, subset_path=subset_path)
         _rewrite_bundle_uri_payloads(bundle_dir, partial, work_dir=partial)
         if bundle_dir.exists():
             raise RunnerError("provenance-conflict: zero-update destination appeared before atomic commit")
         partial.replace(bundle_dir)
+        validate_retention_receipt(bundle_dir)
         runtime = time.perf_counter() - start
         result = RunResult(item.identity, "completed", bundle_dir, invalid, reason_code, runtime, peak_memory)
-        _append_ledger(context.output_root, item.stage, {**asdict(result), "item_identity": item.identity, "timestamp": _utc_now(), "attempt": _next_ledger_attempt(context.output_root, item.stage, item.identity), "artifact_digests": _artifact_digest_map(bundle_dir, ("subset_prediction.npz", "zero_update_result.json", "stage_item.json")), "artifact_bytes": _dir_size(bundle_dir)})
+        _append_ledger(
+            context.output_root,
+            item.stage,
+            _result_ledger_payload(
+                context.output_root,
+                item,
+                result,
+                gpu_inference_seconds=gpu_inference_seconds,
+                temporary_peak_bytes=temporary_peak_bytes,
+                artifact_names=(
+                    "subset_prediction.npz", "zero_update_result.json",
+                    "stage_item.json", "retention_receipt.json",
+                ),
+            ),
+        )
         return result
+    except Exception as exc:
+        runtime = time.perf_counter() - start
+        temporary_peak_bytes = _dir_size(partial)
+        result = RunResult(
+            item.identity,
+            "failed",
+            partial,
+            True,
+            f"RUNNER_EXCEPTION_{type(exc).__name__}",
+            runtime,
+            peak_memory,
+        )
+        _append_ledger(
+            context.output_root,
+            item.stage,
+            _result_ledger_payload(
+                context.output_root,
+                item,
+                result,
+                gpu_inference_seconds=gpu_inference_seconds,
+                temporary_peak_bytes=temporary_peak_bytes,
+                artifact_names=(
+                    "subset_prediction.npz", "zero_update_result.json",
+                    "stage_item.json", "retention_receipt.json",
+                    "adapter_exception.json",
+                ),
+            ),
+        )
+        raise
     finally:
         _release_claim(claim)
 
@@ -1711,6 +1953,49 @@ def build_zero_update_evidence(context: RunnerContext) -> list[Path] | None:
     return written
 
 
+def _p95(values: Sequence[float]) -> float:
+    finite = sorted(float(value) for value in values if float(value) >= 0.0)
+    if not finite:
+        return 0.0
+    index = int(np.ceil(0.95 * len(finite))) - 1
+    return finite[max(0, min(index, len(finite) - 1))]
+
+
+def _row_model(row: Mapping[str, Any]) -> str:
+    return str(row.get("model", "")).lower()
+
+
+def _row_gpu_seconds(row: Mapping[str, Any]) -> float:
+    if "gpu_inference_seconds" not in row:
+        raise RunnerError(
+            "legacy GPU time requires validated PredictionArtifact backfill"
+        )
+    return float(row.get("gpu_inference_seconds", 0.0))
+
+
+def _row_retained_bytes_for_stage(row: Mapping[str, Any], target_stage: str) -> float:
+    if target_stage == "zero-update" and row.get("_ledger_stage") != "zero-update":
+        return float(ZERO_UPDATE_SUBSET_RETAINED_BYTE_FALLBACK)
+    return float(row.get("artifact_bytes", 0))
+
+
+def _all_ledger_rows(output_root: Path) -> list[dict[str, Any]]:
+    roots = [output_root / "stage"] if (output_root / "stage").exists() else []
+    roots.extend(output_root.glob("preflight-real/*/stage"))
+    rows: list[dict[str, Any]] = []
+    for root in roots:
+        for ledger in root.glob("*/ledger.jsonl"):
+            source_stage = ledger.parent.name
+            for index, line in enumerate(ledger.read_text(encoding="utf-8").splitlines()):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                row.setdefault("item_identity", row.get("identity", index))
+                row["_ledger_stage"] = source_stage
+                rows.append(row)
+    return rows
+
+
 def check_budget(
     context: RunnerContext,
     stage: str,
@@ -1719,32 +2004,37 @@ def check_budget(
     next_stage_bytes: int,
     completed_gpu_hours: float,
     completed_bytes: int,
+    temporary_peak_bytes: int = 0,
+    details: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     remaining_gpu = GPU_HOUR_LIMIT - float(completed_gpu_hours)
     remaining_bytes = STORAGE_BYTE_LIMIT - int(completed_bytes)
-    if next_stage_gpu_hours > remaining_gpu or next_stage_bytes > remaining_bytes:
-        return {
-            "status": "BLOCKED_RESOURCE_BUDGET",
-            "stage": stage,
-            "remaining_gpu_hours": remaining_gpu,
-            "remaining_bytes": remaining_bytes,
-            "estimated_gpu_hours": next_stage_gpu_hours,
-            "estimated_bytes": next_stage_bytes,
-        }
-    return {"status": "OK", "stage": stage, "remaining_gpu_hours": remaining_gpu, "remaining_bytes": remaining_bytes}
+    storage_need = int(next_stage_bytes) + int(temporary_peak_bytes)
+    payload = {
+        "stage": stage,
+        "remaining_gpu_hours": remaining_gpu,
+        "remaining_bytes": remaining_bytes,
+        "estimated_gpu_hours": float(next_stage_gpu_hours),
+        "estimated_retained_bytes": int(next_stage_bytes),
+        "estimated_temporary_peak_bytes": int(temporary_peak_bytes),
+        "estimated_bytes": storage_need,
+    }
+    if details:
+        payload.update(dict(details))
+    if next_stage_gpu_hours > remaining_gpu or storage_need > remaining_bytes:
+        return {"status": "BLOCKED_RESOURCE_BUDGET", **payload}
+    return {"status": "OK", **payload}
 
 
 def _observed_usage(output_root: Path) -> tuple[float, int]:
-    gpu = 0.0
-    ledger_roots = [output_root / "stage"] if (output_root / "stage").exists() else []
-    ledger_roots.extend(output_root.glob("preflight-real/*/stage"))
-    for root in ledger_roots:
-        for ledger in root.glob("*/ledger.jsonl"):
-            for line in ledger.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                gpu += float(row.get("runtime_seconds", 0.0)) / 3600.0
+    from .storage_audit import account_runtime
+
+    accounting = account_runtime(output_root)
+    if accounting["status"] != "OK":
+        raise RunnerError(
+            "resource accounting is unavailable: "
+            + json.dumps(accounting["issues"], sort_keys=True)
+        )
     bytes_used = 0
     if output_root.exists():
         for path in output_root.rglob("*"):
@@ -1753,35 +2043,41 @@ def _observed_usage(output_root: Path) -> tuple[float, int]:
                     bytes_used += path.stat().st_size
                 except OSError:
                     pass
-    return gpu, bytes_used
+    return float(accounting["gpu_inference_hours"]), bytes_used
+
+
+def _budget_allowed_stages(stage: str) -> set[str]:
+    if stage == "smoke":
+        return {"smoke", "preflight"}
+    if stage == "test":
+        return {"test", "smoke", "preflight"}
+    if stage == "zero-update":
+        return {"zero-update", "test", "smoke", "preflight"}
+    return {stage}
 
 
 def _budget_observation_rows(context: RunnerContext, stage: str) -> list[dict[str, Any]]:
-    if stage == "smoke":
-        allowed = {"preflight"}
-    elif stage == "test":
-        allowed = {"smoke", "preflight"}
-    elif stage == "zero-update":
-        allowed = {"test", "smoke", "preflight"}
-    else:
-        allowed = {stage}
-    rows: dict[str, dict[str, Any]] = {}
-    stage_root = context.output_root / "stage"
-    roots = [stage_root] if stage_root.exists() else []
-    roots.extend(context.output_root.glob("preflight-real/*/stage"))
-    for root in roots:
-        for ledger in root.glob("*/ledger.jsonl"):
-            source_stage = ledger.parent.name
-            if source_stage not in allowed:
-                continue
-            for line in ledger.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                if row.get("state") in {"completed", "skipped"}:
-                    key = f"{source_stage}:{row.get('item_identity', row.get('identity', len(rows)))}"
-                    rows[key] = row
-    return list(rows.values())
+    allowed = _budget_allowed_stages(stage)
+    latest: dict[str, dict[str, Any]] = {}
+    for row in _all_ledger_rows(context.output_root):
+        source_stage = str(row.get("_ledger_stage", ""))
+        if source_stage not in allowed or row.get("state") not in {"completed", "skipped"}:
+            continue
+        key = f"{source_stage}:{row.get('item_identity')}"
+        latest[key] = row
+    return list(latest.values())
+
+
+def _budget_gpu_observation_rows(context: RunnerContext, stage: str) -> list[dict[str, Any]]:
+    allowed = _budget_allowed_stages(stage)
+    return [
+        row
+        for row in _all_ledger_rows(context.output_root)
+        if str(row.get("_ledger_stage", "")) in allowed
+        and row.get("state") in {"completed", "skipped", "failed"}
+        and "gpu_inference_seconds" in row
+        and _row_gpu_seconds(row) > 0.0
+    ]
 
 
 def estimate_stage_budget(context: RunnerContext, stage: str, items: Sequence[ScheduleItem], override: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -1789,26 +2085,85 @@ def estimate_stage_budget(context: RunnerContext, stage: str, items: Sequence[Sc
     if override is not None:
         next_gpu = float(override.get("next_stage_gpu_hours", 0.0))
         next_bytes = int(override.get("next_stage_bytes", 0))
-    else:
-        observation_rows = _budget_observation_rows(context, stage)
-        if not observation_rows and stage != "preflight":
-            return {
-                "status": "BLOCKED_RESOURCE_BUDGET",
-                "stage": stage,
-                "reason_code": "BUDGET_ESTIMATE_UNAVAILABLE",
-                "scheduled": len(items),
-                "completed_gpu_hours": completed_gpu,
-                "completed_bytes": completed_bytes,
-            }
-        completed = max(1, len(observation_rows))
-        observed_stage_gpu = sum(float(row.get("runtime_seconds", 0.0)) for row in observation_rows) / 3600.0
-        next_gpu = observed_stage_gpu / completed * len(items) if observation_rows else 0.0
-        stage_dir = context.output_root / "stage" / stage
-        observed_stage_bytes = sum(path.stat().st_size for path in stage_dir.rglob("*") if path.is_file()) if stage_dir.exists() else 0
-        if observed_stage_bytes == 0 and observation_rows:
-            observed_stage_bytes = int(sum(int(row.get("artifact_bytes", 0)) for row in observation_rows))
-        next_bytes = int(observed_stage_bytes / completed * len(items)) if observation_rows else 0
-    return check_budget(context, stage, next_stage_gpu_hours=next_gpu, next_stage_bytes=next_bytes, completed_gpu_hours=completed_gpu, completed_bytes=completed_bytes)
+        temporary_peak = int(override.get("temporary_peak_bytes", 0))
+        return check_budget(
+            context,
+            stage,
+            next_stage_gpu_hours=next_gpu,
+            next_stage_bytes=next_bytes,
+            completed_gpu_hours=completed_gpu,
+            completed_bytes=completed_bytes,
+            temporary_peak_bytes=temporary_peak,
+            details={"source": "override"},
+        )
+
+    observation_rows = _budget_observation_rows(context, stage)
+    gpu_observation_rows = _budget_gpu_observation_rows(context, stage)
+    current_rows = _latest_stage_rows(context.output_root, stage)
+    completed_identities = {
+        identity
+        for identity, row in current_rows.items()
+        if row.get("state") in {"completed", "skipped"}
+    }
+    remaining_items = [item for item in items if item.identity not in completed_identities]
+    if not observation_rows and stage != "preflight" and remaining_items:
+        return {
+            "status": "BLOCKED_RESOURCE_BUDGET",
+            "stage": stage,
+            "reason_code": "BUDGET_ESTIMATE_UNAVAILABLE",
+            "scheduled": len(items),
+            "completed": len(completed_identities),
+            "remaining_items": len(remaining_items),
+            "completed_gpu_hours": completed_gpu,
+            "completed_bytes": completed_bytes,
+        }
+
+    retained_p95_by_model: dict[str, int] = {}
+    gpu_p95_by_model: dict[str, float] = {}
+    model_order = sorted({item.model.lower() for item in items} | { _row_model(row) for row in observation_rows if _row_model(row) })
+    all_bytes = [_row_retained_bytes_for_stage(row, stage) for row in observation_rows]
+    all_gpu = [_row_gpu_seconds(row) for row in gpu_observation_rows]
+    fallback_bytes = int(_p95(all_bytes))
+    fallback_gpu = _p95(all_gpu)
+    for model in model_order:
+        model_rows = [row for row in observation_rows if _row_model(row) == model]
+        model_gpu_rows = [row for row in gpu_observation_rows if _row_model(row) == model]
+        retained_p95_by_model[model] = int(_p95([_row_retained_bytes_for_stage(row, stage) for row in model_rows]) or fallback_bytes)
+        gpu_p95_by_model[model] = float(_p95([_row_gpu_seconds(row) for row in model_gpu_rows]) or fallback_gpu)
+
+    remaining_by_model: dict[str, int] = {}
+    next_bytes = 0
+    next_gpu_seconds = 0.0
+    for item in remaining_items:
+        model = item.model.lower()
+        remaining_by_model[model] = remaining_by_model.get(model, 0) + 1
+        next_bytes += retained_p95_by_model.get(model, fallback_bytes)
+        next_gpu_seconds += gpu_p95_by_model.get(model, fallback_gpu)
+
+    temporary_peak = int(_p95([float(row.get("temporary_peak_bytes", 0)) for row in observation_rows]))
+    if temporary_peak <= 0:
+        temporary_peak = max(retained_p95_by_model.values(), default=0)
+    details = {
+        "scheduled": len(items),
+        "completed": len(completed_identities),
+        "remaining_items": len(remaining_items),
+        "remaining_by_model": remaining_by_model,
+        "model_retained_byte_p95": retained_p95_by_model,
+        "model_gpu_second_p95": gpu_p95_by_model,
+        "observation_rows": len(observation_rows),
+        "gpu_observation_rows": len(gpu_observation_rows),
+        "source": "latest-stage-and-model-p95",
+    }
+    return check_budget(
+        context,
+        stage,
+        next_stage_gpu_hours=next_gpu_seconds / 3600.0,
+        next_stage_bytes=next_bytes,
+        completed_gpu_hours=completed_gpu,
+        completed_bytes=completed_bytes,
+        temporary_peak_bytes=temporary_peak,
+        details=details,
+    )
 
 
 _P0_STATE_SPECS = (

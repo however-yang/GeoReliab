@@ -13,6 +13,10 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .artifact_storage import (
+    write_deterministic_npz,
+    write_shared_gt,
+)
 from .contracts import AuditRecord, ContractError, PredictionArtifact, RunManifest, RunMode, SampleKey, ScientificValidity, read_json_artifact, validate_artifact_bundle, write_json_artifact
 from .gates import (
     DownstreamHarmEvidence,
@@ -1663,17 +1667,31 @@ def write_dense_audit_bundle(
             observability_res=obs_res,
         )
     output_dir.mkdir(parents=True, exist_ok=True)
+    shared_gt = write_shared_gt(
+        output_dir.parent,
+        gt_points,
+    )
     dense_path = output_dir / 'dense_audit.npz'
     dense_gt_error = result.gt_error if not prediction.invalid_prediction else np.empty((0,), dtype=np.float64)
     dense_failure = result.failure_label if not prediction.invalid_prediction else np.empty((0,), dtype=bool)
-    np.savez(
+    write_deterministic_npz(
         dense_path,
-        voxel_points=result.voxel_points,
-        raw_confidence=result.raw_confidence,
-        risk=result.risk,
-        gt_error=dense_gt_error,
-        failure_label=dense_failure,
-        provenance_count=result.provenance_count,
+        {
+            'voxel_points': result.voxel_points,
+            'raw_confidence': result.raw_confidence,
+            'risk': result.risk,
+            'gt_error': dense_gt_error,
+            'failure_label': dense_failure,
+            'provenance_count': result.provenance_count,
+        },
+        member_order=(
+            'voxel_points',
+            'raw_confidence',
+            'risk',
+            'gt_error',
+            'failure_label',
+            'provenance_count',
+        ),
     )
     audit = AuditRecord(
         run_id=manifest.run_id,
@@ -1688,8 +1706,8 @@ def write_dense_audit_bundle(
         metadata={
             'dense_audit_uri': dense_path.resolve().as_uri(),
             'dense_audit_sha256': _file_sha256(dense_path),
-            'gt_points_uri': gt_points_path.resolve().as_uri(),
-            'gt_points_sha256': _file_sha256(gt_points_path),
+            'gt_points_uri': shared_gt.path.resolve().as_uri(),
+            'gt_points_sha256': shared_gt.sha256,
         },
     )
     audit_path = output_dir / 'audit_record.json'
@@ -1702,7 +1720,7 @@ def write_dense_audit_bundle(
         'sample_key': prediction.sample_key,
         'audit_sha256': _file_sha256(audit_path),
         'dense_audit_uri': dense_path.resolve().as_uri(),
-        'gt_points_uri': gt_points_path.resolve().as_uri(),
+        'gt_points_uri': shared_gt.path.resolve().as_uri(),
         'audit_record': str(audit_path),
         'summary': result.summary,
         'corruption_severity_monotonic': False,
