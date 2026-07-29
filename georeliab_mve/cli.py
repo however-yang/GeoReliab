@@ -44,6 +44,11 @@ from .audit import (
     load_stage_evidence_manifest,
     write_dense_audit_bundle,
 )
+from .storage_audit import (
+    StorageAuditError,
+    apply_storage_plan,
+    storage_audit,
+)
 
 
 DEFAULT_PROTOCOL = Path('configs/dual_mve_protocol.toml')
@@ -346,6 +351,12 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument('--obs-res', type=float)
     audit.add_argument('--output-dir', type=Path)
 
+    storage = subparsers.add_parser('storage-audit')
+    storage.add_argument('--root', type=Path, default=Path('.'))
+    storage.add_argument('--output-dir', type=Path)
+    storage.add_argument('--apply-plan', type=Path)
+    storage.add_argument('--expected-plan-sha256')
+
     return parser
 
 
@@ -463,7 +474,35 @@ def main(argv: list[str] | None = None) -> int:
             if args.input is not None:
                 raise ValueError('scientific GeoReliab audit requires --stage-evidence; aggregate --input is disabled')
             raise ValueError('GeoReliab audit requires --stage-evidence or bundle audit arguments')
-    except (KeyError, TypeError, ValueError, AuditError, OSError, json.JSONDecodeError) as exc:
+        if args.command == 'storage-audit':
+            source_root = Path(__file__).resolve().parents[1]
+            if args.apply_plan is not None:
+                if not args.expected_plan_sha256:
+                    raise ValueError('--apply-plan requires --expected-plan-sha256')
+                payload = apply_storage_plan(
+                    args.root,
+                    args.apply_plan,
+                    expected_plan_sha256=args.expected_plan_sha256,
+                )
+            else:
+                snapshot, plan = storage_audit(
+                    args.root,
+                    source_root=source_root,
+                    output_dir=args.output_dir,
+                )
+                output_dir = args.output_dir or args.root / 'artifacts'
+                payload = {
+                    'status': snapshot['status'],
+                    'storage_before': str(output_dir / 'storage_before.json'),
+                    'storage_plan': str(output_dir / 'storage_plan.json'),
+                    'logical_bytes': snapshot['logical_bytes'],
+                    'allocated_bytes': snapshot['allocated_bytes'],
+                    'projection': snapshot['projection'],
+                    'plan_file_sha256': plan['plan_file_sha256'],
+                }
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0 if payload.get('status') == 'PASS' else 2
+    except (KeyError, TypeError, ValueError, AuditError, StorageAuditError, OSError, json.JSONDecodeError) as exc:
         print(f'ERROR: {exc}', file=sys.stderr)
         return 2
     raise AssertionError('unreachable command')
