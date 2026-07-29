@@ -73,6 +73,64 @@ Required result:
 
 Do not force-push, reset, or overwrite an existing worktree with a different commit.
 
+## Storage-refactor rollout before model execution
+
+For the storage-refactor commit, model execution remains locked until the
+following CPU-only rollout is complete:
+
+| P2-A smoke canary | 50 | first 25 per model selected from, and counted within, the frozen P2 grid |
+```bash
+cd "$WORKTREE"
+
+# Read-only snapshot and bound retention plan.
+$PYTHON -m georeliab_mve storage-audit \
+  --root "$ROOT" \
+  --output-dir "$ROOT/artifacts"
+PLAN_SHA=$(sha256sum "$ROOT/artifacts/storage_plan.json" | cut -d' ' -f1)
+
+# Apply only the exact audited plan.
+$PYTHON -m georeliab_mve storage-audit \
+  --root "$ROOT" \
+  --output-dir "$ROOT/artifacts" \
+  --apply-plan "$ROOT/artifacts/storage_plan.json" \
+  --expected-plan-sha256 "$PLAN_SHA"
+
+# Verify storage, science lock, artifact equivalence, and controller policy.
+$PYTHON -m georeliab_mve validate-storage-refactor \
+  --root "$ROOT" \
+  --output "$ROOT/artifacts/storage_refactor_validation.json"
+
+# Preserve the superseded f539 P1/P2 engineering run before clearing its
+# canonical paths. The archive must validate 16 P1 and 75 P2 members.
+$PYTHON -m georeliab_mve archive-superseded \
+  --root "$ROOT" \
+  --expected-project-commit f5397b25806dcbf5b527b83c836b6c5f344122ae \
+  --expected-p1-items 16 \
+  --expected-p2-items 75
+```
+
+The retention apply is fail-closed: an absent/mismatched plan digest, an
+out-of-root target, failed semantic equivalence, or incomplete superseded
+archive leaves the original bytes intact. R1 must remain below 900 GB; the
+1 TB hard cap is unchanged.
+
+After CPU-only validation and read-only P0 revalidation, stop with
+`GPU_SELECTION_REQUIRED`. Ask the user to choose exactly one of `cuda:0` or
+`cuda:1` for this exact commit. Do not inherit a prior choice. Only after that
+answer may an operator create the bound receipt:
+
+```bash
+$PYTHON -m georeliab_mve record-gpu-selection \
+  --root "$ROOT" \
+  --project-commit "$COMMIT" \
+  --device REPLACE_WITH_EXPLICIT_USER_SELECTION \
+  --explicit-user-selection
+```
+
+All P1/P2-A/P2/P3/P5 model stages use this one GPU sequentially. A second
+GeoReliab GPU process, a different device, a stale receipt, or a concurrent
+stage lock is a policy violation and must fail closed.
+
 ## Schedule counts
 
 | Stage | Count | Notes |
@@ -218,20 +276,47 @@ Canonical launch:
 
 ```bash
 cd "$WORKTREE"
-./scripts/a100/launch_stage.sh "$OVERLAY" "$COMMIT" p1 cuda:0
+export DEVICE=REPLACE_WITH_EXPLICIT_USER_SELECTION
+./scripts/a100/launch_stage.sh "$OVERLAY" "$COMMIT" p1 "$DEVICE"
 ```
 
 Manual equivalent:
+
+export CUDA_VISIBLE_DEVICES=${DEVICE#cuda:}
+export GEORELIAB_PHYSICAL_GPU_DEVICE=$DEVICE
+export LOGICAL_DEVICE=cuda:0
 
 ```bash
 $PYTHON -m georeliab_mve preflight-real \
   --config "$OVERLAY" \
   --output-root "$ROOT" \
-  --device cuda:0 \
+  --device "$LOGICAL_DEVICE" \
   --summary-json "$ROOT/artifacts/p1_preflight.json"
 ```
 
+The launcher validates the exact-commit GPU receipt and exclusive stage lock
+before model import. P1 cannot create or infer the receipt.
+
 P1 passes when the canonical summary has top-level `status: OK`, both VGGT and MASt3R workers pass, both repeat roots exist under `preflight-real/repeat-a` and `preflight-real/repeat-b`, both repetitions contain all 8 scheduled items with no invalid output, and every `repeatability.reason_code` is `OK`. The repeat fingerprints must match the current project/input freeze. If any condition fails, P2 remains locked.
+
+## P2-A: bound 50-item smoke canary
+
+P2-A is not a new experiment. It is exactly 50 members of the frozen 200-item
+P2 schedule, selected deterministically as 25 VGGT and 25 MASt3R items. It
+cannot be used for P3/P5 or any scientific gate.
+
+```bash
+cd "$WORKTREE"
+./scripts/a100/launch_stage.sh "$OVERLAY" "$COMMIT" p2a "$DEVICE"
+```
+
+The launcher writes `artifacts/p2a_selection_manifest.json`, executes the
+selected items with `--shard 0/1`, and writes
+`artifacts/p2a_completion.json`. PASS requires 50/50 complete, no missing
+bundle or retention receipt, retained-byte prediction error at most 10%, and
+a full-path projection below 900 GB. A legitimate model-invalid output is
+retained; an adapter exception, contract/linkage failure, or missing item
+fails P2-A.
 
 ## P2: 10-scene smoke
 
@@ -239,18 +324,21 @@ Canonical launch:
 
 ```bash
 cd "$WORKTREE"
-./scripts/a100/launch_stage.sh "$OVERLAY" "$COMMIT" p2 cuda:0
+./scripts/a100/launch_stage.sh "$OVERLAY" "$COMMIT" p2 "$DEVICE"
 ```
 
 Manual equivalent:
 
 ```bash
 $PYTHON -m georeliab_mve run-georeliab \
-  --stage smoke --model all --device cuda:0 --shard 0/1 \
+  --stage smoke --model all --device "$LOGICAL_DEVICE" --shard 0/1 \
   --config "$OVERLAY" --output-root "$ROOT"
 ```
 
-P2 passes when the smoke ledger/summary reports `scheduled: 200`, `completed: 200`, and `missing: 0`. Smoke is real-model evidence but permanently non-scientific; never feed it to `evaluate-gates` or P4.
+P2 resumes the full frozen schedule and skips the 50 valid P2-A bundles; it
+does not create a separate grid. P2 passes when the smoke ledger/summary
+reports `scheduled: 200`, `completed: 200`, and `missing: 0`. Smoke is
+permanently non-scientific; never feed it to `evaluate-gates` or P4.
 
 ## P3: frozen 20-scene test
 
@@ -258,25 +346,21 @@ Canonical launch:
 
 ```bash
 cd "$WORKTREE"
-./scripts/a100/launch_stage.sh "$OVERLAY" "$COMMIT" p3
+./scripts/a100/launch_stage.sh "$OVERLAY" "$COMMIT" p3 "$DEVICE"
 ```
-
-The script launches two screen shards:
-
-- `cuda:0`, `--shard 0/2`
-- `cuda:1`, `--shard 1/2`
 
 Manual equivalent:
 
 ```bash
-$PYTHON -m georeliab_mve run-georeliab --stage test --model all --device cuda:0 --shard 0/2 --config "$OVERLAY" --output-root "$ROOT"
-$PYTHON -m georeliab_mve run-georeliab --stage test --model all --device cuda:1 --shard 1/2 --config "$OVERLAY" --output-root "$ROOT"
+$PYTHON -m georeliab_mve run-georeliab --stage test --model all --device "$LOGICAL_DEVICE" --shard 0/1 --config "$OVERLAY" --output-root "$ROOT"
 ```
 
 P3 completes when:
 
 - `stage/test/stage_freeze.json` exists;
 - `stage/test/stage_evidence_p3.json` exists and has a matching SHA-256 in the runner summary;
+
+P3 runs sequentially on the same selected GPU. No second shard is allowed.
 - schedule counts are `scheduled: 400`, `completed: 400`, `missing: 0`.
 
 Invalid outputs remain in evidence and count as failures. Do not remove them to pass a gate.
@@ -287,7 +371,7 @@ Canonical launch:
 
 ```bash
 cd "$WORKTREE"
-./scripts/a100/launch_stage.sh "$OVERLAY" "$COMMIT" p4 cuda:0
+./scripts/a100/launch_stage.sh "$OVERLAY" "$COMMIT" p4
 ```
 
 Manual equivalent:
@@ -304,7 +388,7 @@ from georeliab_mve.runner import RunnerContext, write_native_phenomenon_gate_fro
 root = Path('/srv/private/smli/GeoReliab')
 overlay = root / 'worktrees' / 'REPLACE_WITH_FULL_PROJECT_COMMIT' / 'configs/a100_real_mve_overlay.toml'
 audit = json.loads((root / 'stage/test/native_phenomenon_audit.json').read_text(encoding='utf-8'))
-print(write_native_phenomenon_gate_from_audit_output(RunnerContext(root=root, output_root=root, config_path=overlay, device='cuda:0'), audit))
+print(write_native_phenomenon_gate_from_audit_output(RunnerContext(root=root, output_root=root, config_path=overlay, device='cpu'), audit))
 PY
 ```
 
@@ -324,19 +408,13 @@ Canonical launch:
 
 ```bash
 cd "$WORKTREE"
-./scripts/a100/launch_stage.sh "$OVERLAY" "$COMMIT" p5
+./scripts/a100/launch_stage.sh "$OVERLAY" "$COMMIT" p5 "$DEVICE"
 ```
-
-The script launches two zero-update shards:
-
-- `cuda:0`, `--shard 0/2`
-- `cuda:1`, `--shard 1/2`
 
 Manual equivalent:
 
 ```bash
-$PYTHON -m georeliab_mve run-georeliab --stage zero-update --model all --device cuda:0 --shard 0/2 --config "$OVERLAY" --output-root "$ROOT"
-$PYTHON -m georeliab_mve run-georeliab --stage zero-update --model all --device cuda:1 --shard 1/2 --config "$OVERLAY" --output-root "$ROOT"
+$PYTHON -m georeliab_mve run-georeliab --stage zero-update --model all --device "$LOGICAL_DEVICE" --shard 0/1 --config "$OVERLAY" --output-root "$ROOT"
 ```
 
 P5 completes when downstream evidence count is 6, zero-update schedule counts are `scheduled: 480`, `completed: 480`, `missing: 0`, and full `$ROOT/stage/test/stage_evidence.json` exists.
@@ -345,11 +423,13 @@ If `$ROOT/stage/zero-update/terminal_failure.json` exists with `reason_code: P5_
 
 ## P6: final evidence bundle and one-page table
 
+
+P5 stays sequential on the selected GPU and holds the exclusive stage lock.
 Canonical launch:
 
 ```bash
 cd "$WORKTREE"
-./scripts/a100/launch_stage.sh "$OVERLAY" "$COMMIT" p6 cuda:0
+./scripts/a100/launch_stage.sh "$OVERLAY" "$COMMIT" p6
 ```
 
 The canonical launcher runs `status.sh` and `finalize_p6.sh` itself. Do not hand-write,

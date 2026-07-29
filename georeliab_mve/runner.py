@@ -677,6 +677,14 @@ def make_manifest(item: ScheduleItem, root: Path, model_specs: Mapping[str, Mode
         corruption_version="georeliab-c-v1",
         environment={
             "device": device,
+            **(
+                {
+                    "physical_gpu_device": os.environ["GEORELIAB_PHYSICAL_GPU_DEVICE"],
+                    "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
+                }
+                if "GEORELIAB_PHYSICAL_GPU_DEVICE" in os.environ
+                else {}
+            ),
             "python": spec.python,
             "torch": spec.torch,
             "typing_extensions_site": spec.typing_extensions_site,
@@ -2474,8 +2482,19 @@ def run_stage(
     audit_factory: AuditFactory = production_audit_factory,
     budget_override: Mapping[str, Any] | None = None,
     native_gate: Mapping[str, Any] | None = None,
+    selection_manifest: Path | None = None,
+    allow_selection_subset: bool = False,
 ) -> dict[str, Any]:
     shard_index, shard_total = _parse_shard(shard)
+    if selection_manifest is not None and stage != "smoke":
+        raise RunnerError("selection manifests are forbidden for P3/P5")
+    if (
+        selection_manifest is not None
+        and model != "all"
+        and not allow_selection_subset
+    ):
+        raise RunnerError("P2-A selection manifest requires model all")
+    selection_payload: dict[str, Any] | None = None
     if stage == "zero-update":
         canonical_gate = load_native_phenomenon_gate(context)
         if not dry_run:
@@ -2493,6 +2512,31 @@ def run_stage(
     else:
         full = full_schedule(context.root, "preflight" if stage == "preflight" else stage)
         selected = build_schedule(context.root, "preflight" if stage == "preflight" else stage, model=model)
+    if selection_manifest is not None:
+        if shard != "0/1":
+            raise RunnerError("P2-A selection manifest requires sequential shard 0/1")
+        from .execution_governance import (
+            ExecutionGovernanceError,
+            load_p2a_selection_manifest,
+        )
+
+        try:
+            p2a_items, selection_payload = load_p2a_selection_manifest(
+                context.root,
+                selection_manifest,
+            )
+        except ExecutionGovernanceError as exc:
+            raise RunnerError(str(exc)) from exc
+        selected_models = set(_selected_models(model))
+        selected = tuple(item for item in p2a_items if item.model in selected_models)
+        expected_selected = (
+            25 if allow_selection_subset and model in {"vggt", "mast3r"} else 50
+        )
+        if len(selected) != expected_selected:
+            raise RunnerError(
+                "P2-A selection dispatch count mismatch: "
+                f"{len(selected)} != {expected_selected}"
+            )
     if stage == "test" and refuse_shrunk_test_grid(full) != "OK":
         raise RunnerError("refusing to shrink frozen P3 test grid")
     if not dry_run:
@@ -2529,7 +2573,26 @@ def run_stage(
     if budget["status"] != "OK" and not dry_run:
         return {"status": budget["status"], "stage": stage, "dry_run": dry_run, "budget": budget, "schedule_counts": stage_progress_counts(context.output_root, stage, full)}
     work = shard_schedule(selected, index=shard_index, total=shard_total)
-    summary = {"status": "DRY_RUN" if dry_run else "OK", "stage": stage, "dry_run": dry_run, "shard": shard, "schedule_counts": stage_counts(full), "selected_count": len(selected), "dispatch_count": len(work), "budget": budget, "stage_fingerprint": fingerprint.get("stage_fingerprint"), "freeze": freeze}
+    summary = {
+        "status": "DRY_RUN" if dry_run else "OK",
+        "stage": stage,
+        "dry_run": dry_run,
+        "shard": shard,
+        "schedule_counts": stage_counts(full),
+        "selected_count": len(selected),
+        "dispatch_count": len(work),
+        "budget": budget,
+        "stage_fingerprint": fingerprint.get("stage_fingerprint"),
+        "freeze": freeze,
+    }
+    if selection_payload is not None:
+        summary.update(
+            {
+                "selection_manifest_path": str(selection_manifest),
+                "selection_manifest_sha256": sha256_file(selection_manifest),
+                "selection_manifest_selected_count": selection_payload["selected_count"],
+            }
+        )
     if dry_run:
         return summary
     if stage == "zero-update":
@@ -2689,6 +2752,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--config", type=Path, required=True)
     run.add_argument("--output-root", type=Path, required=True)
     run.add_argument("--summary-json", type=Path, help=argparse.SUPPRESS)
+    run.add_argument("--selection-manifest", type=Path)
+    run.add_argument(
+        "--isolated-selection-worker",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     run.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -2802,6 +2871,9 @@ def _run_isolated_model_workers(args: argparse.Namespace, context: RunnerContext
                 "--shard", args.shard, "--config", str(args.config), "--output-root", str(args.output_root),
                 "--summary-json", str(summary_path),
             ]
+            if args.selection_manifest is not None:
+                child_argv.extend(["--selection-manifest", str(args.selection_manifest)])
+                child_argv.append("--isolated-selection-worker")
         result = subprocess.run(
             [str(python), "-I", "-B", "-c", bootstrap, typing_site, str(source_root), *child_argv],
             cwd=str(source_root), capture_output=True, text=True, timeout=None, env=env,
@@ -2827,8 +2899,22 @@ def _run_isolated_model_workers(args: argparse.Namespace, context: RunnerContext
     status = "OK" if all(item.get("status") == "OK" for item in payloads) else "WORKER_FAILED"
     if args.command == "preflight-real" and all(item.get("status") == "OK" for item in payloads):
         status = "OK"
-    scheduled = 8 if args.command == "preflight-real" else (400 if args.stage == "test" else 200 if args.stage == "smoke" else 480)
-    return {"status": status, "stage": "preflight" if args.command == "preflight-real" else args.stage, "dry_run": False, "model_isolation": "per-frozen-env-python", "schedule_counts": {"scheduled": scheduled}, "workers": payloads}
+    selection_manifest = getattr(args, "selection_manifest", None)
+    scheduled = (
+        8
+        if args.command == "preflight-real"
+        else 50
+        if selection_manifest is not None
+        else 400
+        if args.stage == "test"
+        else 200
+        if args.stage == "smoke"
+        else 480
+    )
+    payload = {"status": status, "stage": "preflight" if args.command == "preflight-real" else args.stage, "dry_run": False, "model_isolation": "per-frozen-env-python", "schedule_counts": {"scheduled": scheduled}, "workers": payloads}
+    if selection_manifest is not None:
+        payload.update({"selection_manifest_path": str(selection_manifest), "selection_manifest_sha256": sha256_file(selection_manifest)})
+    return payload
 
 
 def _cli_success(status: Any) -> bool:
@@ -2846,7 +2932,19 @@ def _emit_cli_payload(args: argparse.Namespace, payload: Mapping[str, Any]) -> N
 def cli_main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        context = RunnerContext(root=args.output_root, output_root=args.output_root, config_path=args.config, device=args.device)
+        context = RunnerContext(
+            root=args.output_root,
+            output_root=args.output_root,
+            config_path=args.config,
+            device=args.device,
+        )
+        if (
+            args.command == "run-georeliab"
+            and args.selection_manifest is not None
+            and args.model != "all"
+            and not args.isolated_selection_worker
+        ):
+            raise RunnerError("P2-A selection manifest requires model all")
         if not args.dry_run and getattr(args, "model", None) == "all":
             payload = _run_isolated_model_workers(args, context)
             _emit_cli_payload(args, payload)
@@ -2854,9 +2952,19 @@ def cli_main(argv: list[str] | None = None) -> int:
         if not args.dry_run and getattr(args, "model", None) in {"vggt", "mast3r"}:
             _verify_current_worker_runtime(context, args.model)
         if args.command == "preflight-real":
-            payload = run_preflight_real(context, dry_run=args.dry_run, model=args.model)
+            payload = run_preflight_real(
+                context, dry_run=args.dry_run, model=args.model
+            )
         else:
-            payload = run_stage(context, stage=args.stage, model=args.model, shard=args.shard, dry_run=args.dry_run)
+            payload = run_stage(
+                context,
+                stage=args.stage,
+                model=args.model,
+                shard=args.shard,
+                dry_run=args.dry_run,
+                selection_manifest=args.selection_manifest,
+                allow_selection_subset=args.isolated_selection_worker,
+            )
         _emit_cli_payload(args, payload)
         return 0 if _cli_success(payload.get("status")) else 2
     except (RunnerError, OSError, ValueError, ContractError, json.JSONDecodeError) as exc:

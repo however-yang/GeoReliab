@@ -92,7 +92,7 @@ assert torch.__version__ == expected_torch
 PY
 
 gpu_count=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | awk '{print $1}')
-required_devices=$(overlay_value "$overlay" execution.devices | wc -l | awk '{print $1}')
+required_devices=1
 [ "$gpu_count" -ge "$required_devices" ] || die "insufficient GPUs: $gpu_count < $required_devices"
 available_kb=$(df -Pk "$root" | awk 'NR==2 {print $4}')
 [ "${available_kb:-0}" -gt 10485760 ] || die "less than 10 GiB available under $root"

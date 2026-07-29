@@ -291,13 +291,46 @@ def _validate_inventory(
         raise ArtifactStorageError(f"retention inventory mismatch under {root}")
 
 
-def write_deterministic_tar_gz(
-    source_dir: Path,
+def write_deterministic_tar_gz_inventory(
+    source_root: Path,
     destination: Path,
+    inventory: Iterable[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Archive a cache with fixed ordering and metadata, then verify members."""
+    """Archive an explicit digest inventory without staging a second copy."""
 
-    inventory = file_inventory(source_dir)
+    resolved_root = source_root.resolve()
+    rows = sorted(
+        (dict(row) for row in inventory),
+        key=lambda row: str(row.get("relative_path", "")),
+    )
+    if not rows:
+        raise ArtifactStorageError("deterministic archive inventory may not be empty")
+    for row in rows:
+        relative = Path(str(row.get("relative_path", "")))
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or ".." in relative.parts
+        ):
+            raise ArtifactStorageError(
+                f"unsafe deterministic archive member: {relative}"
+            )
+        member_path = (resolved_root / relative).resolve()
+        try:
+            member_path.relative_to(resolved_root)
+        except ValueError as exc:
+            raise ArtifactStorageError(
+                f"deterministic archive member escaped source root: {relative}"
+            ) from exc
+        if (
+            member_path.is_symlink()
+            or not member_path.is_file()
+            or member_path.stat().st_size != int(row.get("bytes", -1))
+            or sha256_file(member_path) != row.get("sha256")
+        ):
+            raise ArtifactStorageError(
+                f"deterministic archive source does not match inventory: {relative}"
+            )
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(destination.name + ".partial")
     try:
@@ -314,8 +347,8 @@ def write_deterministic_tar_gz(
                     mode="w",
                     format=tarfile.PAX_FORMAT,
                 ) as archive:
-                    for row in inventory:
-                        member_path = source_dir / str(row["relative_path"])
+                    for row in rows:
+                        member_path = resolved_root / str(row["relative_path"])
                         info = tarfile.TarInfo(str(row["relative_path"]))
                         info.size = member_path.stat().st_size
                         info.mode = 0o600
@@ -332,7 +365,7 @@ def write_deterministic_tar_gz(
                 os.fsync(raw.fileno())
             except OSError:
                 pass
-        validate_tar_gz_inventory(partial, inventory)
+        validate_tar_gz_inventory(partial, rows)
         partial.replace(destination)
     except Exception:
         try:
@@ -340,7 +373,21 @@ def write_deterministic_tar_gz(
         except FileNotFoundError:
             pass
         raise
-    return inventory
+    return rows
+
+
+def write_deterministic_tar_gz(
+    source_dir: Path,
+    destination: Path,
+) -> list[dict[str, Any]]:
+    """Archive a cache with fixed ordering and metadata, then verify members."""
+
+    inventory = file_inventory(source_dir)
+    return write_deterministic_tar_gz_inventory(
+        source_dir,
+        destination,
+        inventory,
+    )
 
 
 def validate_tar_gz_inventory(

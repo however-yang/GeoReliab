@@ -49,6 +49,16 @@ from .storage_audit import (
     apply_storage_plan,
     storage_audit,
 )
+from .execution_governance import (
+    ExecutionGovernanceError,
+    archive_superseded_results,
+    create_p2a_selection_manifest,
+    evaluate_p2a_completion,
+    record_gpu_selection,
+    validate_gpu_selection,
+    validate_storage_refactor_rollout,
+)
+from .science_lock import BASE_PROJECT_COMMIT
 
 
 DEFAULT_PROTOCOL = Path('configs/dual_mve_protocol.toml')
@@ -357,6 +367,38 @@ def build_parser() -> argparse.ArgumentParser:
     storage.add_argument('--apply-plan', type=Path)
     storage.add_argument('--expected-plan-sha256')
 
+    archive = subparsers.add_parser('archive-superseded')
+    archive.add_argument('--root', type=Path, required=True)
+    archive.add_argument('--expected-project-commit', default=BASE_PROJECT_COMMIT)
+    archive.add_argument('--expected-p1-items', type=int, default=16)
+    archive.add_argument('--expected-p2-items', type=int, default=75)
+
+    p2a = subparsers.add_parser('prepare-p2a')
+    p2a.add_argument('--root', type=Path, required=True)
+    p2a.add_argument('--storage-before', type=Path)
+    p2a.add_argument('--storage-plan', type=Path)
+    p2a.add_argument('--output', type=Path)
+
+    validate_p2a = subparsers.add_parser('validate-p2a')
+    validate_p2a.add_argument('--root', type=Path, required=True)
+    validate_p2a.add_argument('--selection', type=Path)
+    validate_p2a.add_argument('--output', type=Path)
+
+    record_gpu = subparsers.add_parser('record-gpu-selection')
+    record_gpu.add_argument('--root', type=Path, required=True)
+    record_gpu.add_argument('--project-commit', required=True)
+    record_gpu.add_argument('--device', choices=('cuda:0', 'cuda:1'), required=True)
+    record_gpu.add_argument('--explicit-user-selection', action='store_true')
+
+    validate_gpu = subparsers.add_parser('validate-gpu-selection')
+    validate_gpu.add_argument('--root', type=Path, required=True)
+    validate_gpu.add_argument('--project-commit', required=True)
+    validate_gpu.add_argument('--device', choices=('cuda:0', 'cuda:1'), required=True)
+
+    rollout = subparsers.add_parser('validate-storage-refactor')
+    rollout.add_argument('--root', type=Path, required=True)
+    rollout.add_argument('--output', type=Path)
+
     return parser
 
 
@@ -474,8 +516,63 @@ def main(argv: list[str] | None = None) -> int:
             if args.input is not None:
                 raise ValueError('scientific GeoReliab audit requires --stage-evidence; aggregate --input is disabled')
             raise ValueError('GeoReliab audit requires --stage-evidence or bundle audit arguments')
+        source_root = Path(__file__).resolve().parents[1]
+        if args.command == 'archive-superseded':
+            payload = archive_superseded_results(
+                args.root,
+                expected_commit=args.expected_project_commit,
+                expected_p1_items=args.expected_p1_items,
+                expected_p2_items=args.expected_p2_items,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0 if payload.get('status') == 'PASS' else 2
+        if args.command == 'prepare-p2a':
+            payload = create_p2a_selection_manifest(
+                args.root,
+                source_root=source_root,
+                storage_before_path=args.storage_before,
+                storage_plan_path=args.storage_plan,
+                output_path=args.output,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == 'validate-p2a':
+            payload = evaluate_p2a_completion(
+                args.root,
+                selection_path=args.selection,
+                source_root=source_root,
+                output_path=args.output,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0 if payload.get('status') == 'PASS' else 2
+        if args.command == 'record-gpu-selection':
+            payload = record_gpu_selection(
+                args.root,
+                source_root=source_root,
+                project_commit=args.project_commit,
+                device=args.device,
+                explicit_user_selection=args.explicit_user_selection,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == 'validate-gpu-selection':
+            payload = validate_gpu_selection(
+                args.root,
+                source_root=source_root,
+                project_commit=args.project_commit,
+                device=args.device,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == 'validate-storage-refactor':
+            payload = validate_storage_refactor_rollout(
+                args.root,
+                source_root=source_root,
+                output_path=args.output,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0 if payload.get('status') == 'PASS' else 2
         if args.command == 'storage-audit':
-            source_root = Path(__file__).resolve().parents[1]
             if args.apply_plan is not None:
                 if not args.expected_plan_sha256:
                     raise ValueError('--apply-plan requires --expected-plan-sha256')
@@ -502,7 +599,7 @@ def main(argv: list[str] | None = None) -> int:
                 }
             print(json.dumps(payload, indent=2, sort_keys=True))
             return 0 if payload.get('status') == 'PASS' else 2
-    except (KeyError, TypeError, ValueError, AuditError, StorageAuditError, OSError, json.JSONDecodeError) as exc:
+    except (KeyError, TypeError, ValueError, AuditError, StorageAuditError, ExecutionGovernanceError, OSError, json.JSONDecodeError) as exc:
         print(f'ERROR: {exc}', file=sys.stderr)
         return 2
     raise AssertionError('unreachable command')

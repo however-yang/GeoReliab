@@ -233,7 +233,7 @@ def test_apply_resumes_after_atomic_npz_swap(tmp_path: Path):
     geometry = (
         tmp_path
         / "stage"
-        / "smoke"
+        / "test"
         / "bundles"
         / "vggt"
         / "sample"

@@ -107,17 +107,38 @@ def test_a100_scripts_fail_closed_on_paths_and_disallowed_git_operations() -> No
 
 def test_launch_script_exposes_p0_to_p6_and_runner_commands() -> None:
     text = (ROOT / 'scripts' / 'a100' / 'launch_stage.sh').read_text(encoding='utf-8')
-    for stage in ('p0)', 'p1)', 'p2)', 'p3)', 'p4)', 'p5)', 'p6)'):
+    for stage in ('p0)', 'p1)', 'p2a)', 'p2)', 'p3)', 'p4)', 'p5)', 'p6)'):
         assert stage in text
     for command in ('prepare-georeliab', 'preflight-real', 'run-georeliab', 'audit-georeliab'):
         assert command in text
     assert 'write_native_phenomenon_gate_from_audit_output' in text
-    assert '--stage smoke --model all --device cuda:0 --shard 0/2' in text
-    assert '--stage test --model all --device cuda:0 --shard 0/2' in text
-    assert '--stage zero-update --model all' in text
-    assert 'require_native_gate_pass; enforce_stage_gpu_budget zero-update' in text
-    assert 'require_p0_complete; enforce_stage_gpu_budget preflight' in text
-    assert 'require_p1_complete; enforce_stage_gpu_budget smoke' in text
+    assert "--stage smoke --model all --device '$logical_device' --shard 0/1" in text
+    assert "--stage test --model all --device '$logical_device' --shard 0/1" in text
+    assert "--stage zero-update --model all --device '$logical_device' --shard 0/1" in text
+    assert '--shard 0/2' not in text
+    assert '--shard 1/2' not in text
+    assert 'require_native_gate_pass; require_gpu_selection; enforce_stage_gpu_budget zero-update' in text
+    assert 'require_p0_complete; require_superseded_archive; require_gpu_selection; enforce_stage_gpu_budget preflight' in text
+    assert 'require_p1_complete; require_gpu_selection; enforce_stage_gpu_budget smoke' in text
+    assert 'require_p1_complete; require_p2a_complete; require_gpu_selection; enforce_stage_gpu_budget smoke' in text
+    assert 'GPU_SELECTION_REQUIRED' in text
+    assert 'validate-gpu-selection' in text
+    assert 'prepare-p2a' in text
+    assert 'validate-p2a' in text
+    assert '--selection-manifest' in text
+    assert 'georeliab-gpu-execution.lock' in text
+    assert 'gpu_screen_launch' in text
+    assert "CUDA_VISIBLE_DEVICES='$gpu_index'" in text
+    assert "GEORELIAB_PHYSICAL_GPU_DEVICE='$device'" in text
+    assert 'assert_no_active_georeliab_execution' in text
+    assert '*run-georeliab*' in text
+    assert '*preflight-real*' in text
+    assert '*launch_stage.sh*' in text
+    assert '*georeliab_mve*' not in text
+    assert '/proc/[0-9]*/cmdline' in text
+    assert 'selected physical GPU is unavailable' in text
+    assert 'P6 canonical stage evidence missing' in text
+    assert 'screen_launch "${name_base}-shard' not in text
     assert "--summary-json '$root/artifacts/p1_preflight.json'" in text
     assert 'SHORT_CIRCUIT_P5' in text
     assert 'require_stage_complete smoke 200' in text
@@ -250,6 +271,7 @@ def test_prereqs_enforce_storage_cap_device_count_and_frozen_env_orchestrator() 
     common = (ROOT / 'scripts' / 'a100' / 'common.sh').read_text(encoding='utf-8')
     assert 'enforce_storage_cap' in verify
     assert 'gpu_count' in verify and 'required_devices' in verify
+    assert 'required_devices=1' in verify
     assert 'orchestrator_python' in common
     assert 'runtime.vggt_env' in common
     assert 'die "frozen VGGT environment Python is required' in common

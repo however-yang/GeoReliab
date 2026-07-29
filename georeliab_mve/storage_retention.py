@@ -255,14 +255,36 @@ def verify_sparse_index_preconditions(
     }
 
 
+def _superseded_archive_is_complete(root: Path) -> bool:
+    from .execution_governance import (
+        ExecutionGovernanceError,
+        validate_superseded_archive,
+    )
+
+    try:
+        return validate_superseded_archive(root).get("status") == "PASS"
+    except (ExecutionGovernanceError, OSError):
+        return False
+
+
 def build_retention_actions(root: Path, files: Iterable[Any]) -> list[dict[str, Any]]:
     """Build deterministic, conservative actions from storage classifications."""
 
     resolved_root = root.resolve()
     tokens = _reference_tokens(resolved_root)
+    superseded_archive_complete = _superseded_archive_is_complete(resolved_root)
     actions: list[dict[str, Any]] = []
     for row in sorted(files, key=lambda value: value.path):
         path = _resolve_member(resolved_root, row.path, must_exist=True)
+        if (
+            not superseded_archive_complete
+            and (
+                row.path.startswith("preflight-real/")
+                or row.path.startswith("stage/smoke/")
+            )
+        ):
+            # f539 member bytes must be archived before any lossless re-encode.
+            continue
         if row.level == "L1" and path.suffix == ".npz":
             if not _is_fixed_deflated_npz(path):
                 actions.append(

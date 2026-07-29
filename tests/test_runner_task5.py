@@ -526,14 +526,22 @@ def test_test_stage_freeze_and_budget_refuse_mutation(tmp_path: Path):
     assert runner.refuse_shrunk_test_grid(runner.build_schedule(root, "test", model="vggt")) == "TEST_GRID_SHRINK_FORBIDDEN"
 
 
-def test_model_spec_records_mast3r_config_sha_and_preflight_device_default(tmp_path: Path, capsys):
+def test_model_spec_records_mast3r_config_sha_and_preflight_device_default(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+):
     root = _minimal_root(tmp_path)
     config = _overlay(root / "overlay.toml")
     spec = runner.frozen_model_spec("MASt3R", config)
     assert spec.config_sha256 == "4" * 64
     item = runner.build_schedule(root, "test", model="mast3r")[0]
+    monkeypatch.setenv("GEORELIAB_PHYSICAL_GPU_DEVICE", "cuda:1")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
     manifest = runner.make_manifest(item, root, {"MASt3R": spec}, device="cuda:7")
     assert manifest.environment["config_sha256"] == "4" * 64
+    assert manifest.environment["physical_gpu_device"] == "cuda:1"
+    assert manifest.environment["cuda_visible_devices"] == "1"
     assert runner.cli_main(["preflight-real", "--config", str(config), "--output-root", str(root), "--dry-run"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["dry_run"] is True
