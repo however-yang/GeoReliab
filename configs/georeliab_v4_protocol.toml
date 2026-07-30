@@ -1,0 +1,274 @@
+schema_version = "georeliab-v4-protocol-1.0"
+protocol_id = "georeliab-v4-ranking-warning"
+protocol_version = "4.0"
+generated = "2026-07-30"
+hash_algorithm = "sha256-canonical-lf-v1"
+title = "GeoReliab: Ranking Is Not Warning — Paired Counterfactual Reliability and Task Transfer in Geometric Foundation Models"
+core_proposition = "Point-level confidence may rank geometry errors correctly within a fixed condition, yet fail to warn when the same scene becomes harder and fail to transfer into a reliable warning of relative-pose failure."
+venue = "CVPR 2027"
+official_deadline = "TBA"
+main_line = "v4"
+sole_main_line = true
+protocol_status = "GEORELIAB_V4_PROTOCOL_READY"
+execution_status = "GPU_SELECTION_REQUIRED"
+scientific_result_status = "NO_SCIENTIFIC_RESULT"
+
+[route]
+v4 = "SOLE_CVPR_2027_MAIN_LINE"
+v1 = "SUPERSEDED_BY_PRIOR_ART_CHANGE"
+v1_scientific_result = "NO_SCIENTIFIC_RESULT"
+v1_fail_classification_forbidden = true
+geometry_causal_audit = "INDEPENDENT_BACKLOG_NON_BLOCKING"
+deformable_world = "INDEPENDENT_BACKLOG_NON_BLOCKING"
+
+[claims]
+c1 = "Paired counterfactual protocol: hold scene, geometry, cameras and view identities fixed while changing only illumination or synthetic fog."
+c2 = "Ranking–warning separation: distinguish static point-level ranking from cross-condition task-level warning."
+c3 = "Point-to-pose transfer: measure whether native point confidence transfers to warning relative-pose failure."
+c4 = "Reliability boundary map: identify model-, task- and condition-specific silent-failure boundaries."
+c5 = "Conditional method contribution: only after MVE GO, create a separate protocol for View-Set Admission Control."
+
+[claim_boundaries]
+excluded = [
+  "first GFM UQ",
+  "first corruption benchmark",
+  "universal confidence failure",
+  "conformal guarantees",
+  "non-rejection means robustness",
+  "synthetic-only extrapolation to real deployment",
+]
+
+[[novelty_boundary]]
+work = "Trust3R"
+url = "https://arxiv.org/abs/2605.19539"
+boundary = "covers probabilistic point UQ/ranking/risk-coverage/downstream weighting"
+
+[[novelty_boundary]]
+work = "VGGT-UQ"
+url = "https://arxiv.org/abs/2606.16479"
+secondary_url = "https://doi.org/10.5194/isprs-annals-XI-2-2026-665-2026"
+boundary = "covers static VGGT uncertainty on DTU"
+
+[[novelty_boundary]]
+work = "E3D-Bench"
+url = "https://arxiv.org/abs/2506.01933"
+boundary = "is a breadth-first benchmark"
+
+[[novelty_boundary]]
+work = "Can These Views Be One Scene?"
+url = "https://arxiv.org/abs/2605.18754"
+boundary = "covers invalid-view-set hallucination"
+
+[[novelty_boundary]]
+work = "Ovadia et al."
+url = "https://arxiv.org/abs/1906.02530"
+boundary = "is shift-UQ precedent"
+
+[[novelty_boundary]]
+work = "UAVLight"
+url = "https://arxiv.org/abs/2511.21565"
+boundary = "is post-GO external paired illumination"
+
+[[novelty_boundary]]
+work = "RL3DEdit"
+url = "https://arxiv.org/abs/2603.03143"
+boundary = "uses VGGT confidence and pose error jointly as rewards for 3D-consistent editing; do not claim first confidence-to-pose use"
+
+[[novelty_boundary]]
+work = "DTU official dataset"
+url = "https://roboimagedata.compute.dtu.dk/?page_id=36"
+boundary = "provides 7 lighting configurations, not an ordered severity ladder"
+
+[mve]
+models = ["VGGT", "MASt3R"]
+model_count = 2
+dataset = "DTU"
+views_per_scene = 8
+test_scene_ids = [1, 9, 10, 11, 12, 13, 23, 24, 29, 32, 33, 34, 48, 49, 62, 75, 77, 110, 114, 118]
+test_scene_count = 20
+states = ["L1", "L2", "L3", "L4", "L5", "L6", "L7", "fog-s1", "fog-s2", "fog-s3"]
+unique_state_count = 10
+scientific_unit_count = 400
+schedule_formula = "20 scenes x 10 unique states x 2 models = 400"
+lighting_conditions = ["L1", "L2", "L3", "L4", "L5", "L6", "L7"]
+lighting_axis = "UNORDERED_DISCRETE"
+lighting_severity_order_forbidden = true
+fog_states = ["L3", "fog-s1", "fog-s2", "fog-s3"]
+fog_axis = "ORDERED"
+fog_clean_reference = "L3"
+boundary_lag_legal_sequence = ["L3", "fog-s1", "fog-s2", "fog-s3"]
+real_paired_dtu_required_for_go = true
+synthetic_only_decision = "MVE_SCIENTIFIC_NO_GO"
+tartanair_role = "PHYSICAL_SANITY_ONLY"
+
+[splits]
+names = ["dev", "reference", "calibration", "test"]
+deterministic = true
+complete = true
+scene_disjoint = true
+excluded_scene_ids = [4, 15]
+assignment_hash = "SHA256(\"GeoReliab-v4:scan<ID>\")"
+
+[reuse]
+allowed = [
+  "existing frozen model I/O adapters",
+  "checkpoints",
+  "DTU geometry",
+  "DTU cameras",
+  "DTU masks",
+  "DTU FPS",
+  "PredictionArtifact v1.1 source data via a new v4 record",
+  "provenance",
+  "deterministic lossless storage",
+  "atomic commits",
+  "resource accounting",
+]
+v1_runtime_artifacts_in_v4_scientific_evidence = false
+v1_1_source_reuse_requires_new_v4_record = true
+v4_record_requires_exact_protocol_origin = true
+v4_record_requires_source_uri_and_sha256 = true
+raw_v1_runtime_objects_in_v4_records = false
+prior_gpu_selection_receipts_reusable = false
+
+[scope]
+allowed = [
+  "VGGT",
+  "MASt3R",
+  "DTU paired lighting",
+  "one synthetic fog family",
+  "TartanAir physical sanity",
+]
+forbidden = [
+  "UAVLight before GO",
+  "third model",
+  "learned heads",
+  "fine-tuning",
+  "new or learned scientific adapters",
+  "threshold search",
+  "seed search",
+  "feature-map retention",
+  "post-test tuning",
+]
+
+[point_task]
+main_loss = "1 - F-score@2mm"
+diagnostics = ["median GT error", "F-score@1mm sensitivity", "F-score@5mm sensitivity"]
+static_rank = "within-scene static Spearman"
+
+[pose_task]
+view_count = 8
+unordered_pair_count = 28
+pair_error = "max(rotation geodesic error, translation-direction error)"
+main_loss = "1 - AUC@10deg"
+diagnostics = ["AUC@5deg", "AUC@20deg"]
+scene_failure = "median pair error >10deg"
+endpoint_blocker = "fewer than 8 distinct test scenes have pose failures"
+
+[native_warning]
+score = "median_over_views(Q90(higher-is-worse native point risk))"
+threshold = "model-specific calibration-L3 90th percentile"
+threshold_application = "apply unchanged to every test state"
+learned_task_specific_head_forbidden = true
+
+[metrics]
+paired_reference = "L3"
+static_rank = "within-scene point confidence/error ranking"
+crr = "scene-block bootstrap counterfactual rank response"
+rwg = "relative warning gap"
+sfr = "silent-failure rate"
+boundary_lag = "virtual alarm level 4; exclude no-failure scenes from main lag"
+naurc = "(AURC_signal-AURC_oracle)/(AURC_random-AURC_oracle)"
+ttg_pose = "nAURC_pose-nAURC_point"
+
+[statistics]
+bootstrap_resamples = 10000
+bootstrap_unit = "scene"
+multiple_testing = "Holm"
+holm_scope = "within the two models and two main gate families"
+repeats_are_independent_observations = false
+invalid_outputs = "retain and count as failures"
+
+[gate]
+ranking_warning_branch = "StaticRank lower >=0.35, CRR-pose upper <=0.15, RWG lower >=0.20"
+transfer_branch = "nAURC-point upper <=0.50, TTG-pose lower >=0.20"
+shared_requirement = "SFR-pose lower >=0.30"
+cross_model_rule = "one-strong-one-directional; second model point estimate same direction and corrected CI excludes a reverse effect below -0.10"
+real_paired_dtu_required = true
+synthetic_only_status = "MVE_SCIENTIFIC_NO_GO"
+
+[execution]
+initial_status = "GPU_SELECTION_REQUIRED"
+selected_physical_gpu_count = 1
+models_sequential = true
+items_sequential = true
+fallback_forbidden = true
+automatic_device_switch_forbidden = true
+automatic_retry_forbidden = true
+automatic_grid_reduction_forbidden = true
+automatic_downstream_advance_forbidden = true
+resume = "FAIL_CLOSED"
+
+[budgets]
+authorization_stop_gpu_hours = 35
+authorization_stop_logical_gb = 150
+authorization_stop_allocated_gb = 150
+hard_catastrophe_gpu_hours = 50
+hard_catastrophe_storage_gb = 1000
+extra_gpu_hours_not_automatic = 15
+extra_storage_gb_not_automatic = 850
+
+[repeats]
+trigger_distance_to_main_threshold = 0.02
+maximum_exact_recipe_repeats = 2
+purpose = "NUMERICAL_REPRODUCIBILITY_ONLY"
+included_in_ci_sample_size = false
+
+[decisions]
+go = "MVE_GO_TO_EXTERNAL_VALIDATION"
+no_go = "MVE_SCIENTIFIC_NO_GO"
+blocked_endpoint = "MVE_BLOCKED_ENDPOINT"
+other_blocked = "specific MVE_BLOCKED_*"
+automatic_v4_1_forbidden = true
+automatic_uavlight_forbidden = true
+automatic_p3_style_continuation_forbidden = true
+automatic_other_paper_route_forbidden = true
+automatic_plot_generation_forbidden = true
+automatic_claim_generation_forbidden = true
+
+[post_go_v4_1]
+enabled_only_after = "MVE_GO_TO_EXTERNAL_VALIDATION"
+requires_separate_protocol = true
+method = "native warning + preregistered cross-view residual => admit/defer/refuse"
+fallback = "fixed classical geometry fallback"
+comparators = [
+  "always-admit",
+  "native-only",
+  "residual-only",
+  "matched-random",
+  "oracle",
+]
+expansions_requiring_new_protocol_budget_and_gpu_authorization = [
+  "UAVLight",
+  "Trust3R",
+  "third model",
+  "fallback",
+]
+writes_back_into_v4_mve = false
+
+[figures]
+figure_1 = "same-scene trajectory"
+figure_2 = "DTU paired silent failure"
+figure_3 = "fog Boundary Lag"
+figure_4 = "point-to-pose nAURC/TTG"
+figure_5 = "admission utility-coverage only after GO"
+
+[dates]
+claim_reset_novelty_protocol = "2026-07-30/2026-08-04"
+pair_identity_lighting_metric_tests = "2026-08-05/2026-08-10"
+gpu_request_then_dual_model_sanity = "2026-08-11/2026-08-13"
+mve_400_units = "2026-08-14/2026-08-21"
+statistics_and_gate = "2026-08-22/2026-08-24"
+post_go_v4_1_uavlight = "2026-08-25/2026-09-15"
+internal_evidence_freeze = "2026-09-15"
+cvpr_2027_deadline = "TBA"
+cvpr_2026_extrapolation_forbidden = true
