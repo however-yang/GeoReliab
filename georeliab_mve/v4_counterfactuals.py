@@ -1473,7 +1473,7 @@ def validate_dataset_admission(
     decision_status: str = NO_SCIENTIFIC_RESULT,
     protocol_line: str = "v4",
 ) -> DatasetRole:
-    """Keep TartanAir non-scientific and UAVLight behind post-GO v4.1."""
+    """Keep TartanAir non-scientific and UAVLight outside the v4 runtime."""
 
     if not isinstance(role, DatasetRole) or not isinstance(scientific, bool):
         raise CounterfactualContractError(
@@ -1493,17 +1493,10 @@ def validate_dataset_admission(
             )
         return role
     if dataset == "UAVLight":
-        if decision_status != MVE_GO_TO_EXTERNAL_VALIDATION or protocol_line != "v4.1":
-            raise CounterfactualContractError(
-                "UAVLight is rejected before a separately preregistered "
-                "post-GO v4.1 protocol"
-            )
-        if not scientific or role is not DatasetRole.SCIENTIFIC:
-            raise CounterfactualContractError(
-                "UAVLight post-GO v4.1 admission requires scientific=True "
-                "and the SCIENTIFIC role"
-            )
-        return role
+        raise CounterfactualContractError(
+            "UAVLight requires a separate future protocol implementation; "
+            "the v4 runtime cannot admit it scientifically"
+        )
     raise CounterfactualContractError(
         f"dataset is outside the frozen v4/v4.1 admission boundary: {dataset!r}"
     )

@@ -660,7 +660,7 @@ def test_schedule_rejects_extra_models_scenes_and_states(
         parse_scientific_schedule(payload)
 
 
-def test_tartanair_is_non_scientific_and_uavlight_is_post_go_v4_1_only() -> None:
+def test_tartanair_is_non_scientific_and_uavlight_requires_future_protocol() -> None:
     assert (
         validate_dataset_admission(
             "TartanAir",
@@ -680,7 +680,7 @@ def test_tartanair_is_non_scientific_and_uavlight_is_post_go_v4_1_only() -> None
             protocol_line="v4",
         )
 
-    with pytest.raises(CounterfactualContractError, match="post-GO v4.1"):
+    with pytest.raises(CounterfactualContractError, match="separate future protocol"):
         validate_dataset_admission(
             "UAVLight",
             DatasetRole.SCIENTIFIC,
@@ -688,7 +688,7 @@ def test_tartanair_is_non_scientific_and_uavlight_is_post_go_v4_1_only() -> None
             decision_status=NO_SCIENTIFIC_RESULT,
             protocol_line="v4",
         )
-    assert (
+    with pytest.raises(CounterfactualContractError, match="separate future protocol"):
         validate_dataset_admission(
             "UAVLight",
             DatasetRole.SCIENTIFIC,
@@ -696,8 +696,6 @@ def test_tartanair_is_non_scientific_and_uavlight_is_post_go_v4_1_only() -> None
             decision_status=MVE_GO_TO_EXTERNAL_VALIDATION,
             protocol_line="v4.1",
         )
-        is DatasetRole.SCIENTIFIC
-    )
 
 
 @pytest.mark.parametrize(
@@ -708,13 +706,13 @@ def test_tartanair_is_non_scientific_and_uavlight_is_post_go_v4_1_only() -> None
     ],
     ids=["scientific-boolean-required", "scientific-role-required"],
 )
-def test_uavlight_post_go_v4_1_requires_scientific_role_and_flag(
+def test_uavlight_cannot_be_admitted_by_v4_even_with_post_go_arguments(
     role: DatasetRole,
     scientific: bool,
 ) -> None:
     with pytest.raises(
         CounterfactualContractError,
-        match=r"scientific=True.*SCIENTIFIC",
+        match="separate future protocol",
     ):
         validate_dataset_admission(
             "UAVLight",

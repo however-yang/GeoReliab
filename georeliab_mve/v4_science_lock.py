@@ -572,16 +572,18 @@ def _validate_v4_artifact_record(
     )
 
 
-def validate_v4_scientific_bundle(
+def validate_v4_scientific_bundle_structure(
     source_root: Path,
     bundle: Mapping[str, Any],
 ) -> dict[str, object]:
-    """Fail closed unless every offered artifact is explicitly v4-bound.
+    """Validate v4 envelope structure without granting scientific admission.
 
     Existing v1 artifact schemas remain readable by the historical code, but a
     raw v1 artifact/evidence object cannot pass this boundary.  Historical
     source bytes may be reused only through a new v4 record that binds their
-    URI and digest to the exact v4 record origin and protocol hash.
+    URI and digest to the exact v4 record origin and protocol hash. A
+    structural success is never a scientific PASS; only the canonical v4
+    finalizer may admit an exact 400-record bundle.
     """
 
     if not isinstance(bundle, Mapping):
@@ -646,8 +648,28 @@ def validate_v4_scientific_bundle(
             location=location,
         )
     return {
-        "status": "PASS",
+        "status": "V4_BUNDLE_STRUCTURE_VALID_ONLY",
         "protocol_id": V4_PROTOCOL_ID,
         "protocol_sha256": V4_PROTOCOL_SHA256,
         "artifact_count": len(artifacts),
+        "scientific_admission": False,
     }
+
+
+def validate_v4_scientific_bundle(
+    source_root: Path,
+    bundle: Mapping[str, Any],
+) -> dict[str, object]:
+    """Reject direct scientific admission outside the canonical finalizer.
+
+    The public legacy name remains fail-closed so callers cannot turn a
+    structurally valid, undersized bundle into a scientific PASS. The
+    canonical finalizer validates structure, verifies source files, rebuilds
+    evidence from exactly 400 TaskAuditRecords, evaluates the frozen gate, and
+    publishes atomically.
+    """
+
+    validate_v4_scientific_bundle_structure(source_root, bundle)
+    raise V4ScienceLockError(
+        "scientific admission requires the canonical finalizer and its exact 400-record recomputation"
+    )

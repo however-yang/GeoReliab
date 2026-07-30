@@ -24,6 +24,7 @@ from georeliab_mve.v4_science_lock import (
     v4_record_origin,
     validate_v4_science_lock,
     validate_v4_scientific_bundle,
+    validate_v4_scientific_bundle_structure,
 )
 
 
@@ -559,26 +560,33 @@ def test_nested_non_v4_route_or_protocol_markers_fail_closed(
         validate_v4_scientific_bundle(SOURCE_ROOT, bundle)
 
 
-def test_v1_1_data_is_reusable_only_as_digest_bound_new_v4_record() -> None:
+def test_v1_1_data_is_reusable_only_as_non_admitting_digest_bound_record() -> None:
     raw_old_artifact = _old_prediction_artifact()
 
     with pytest.raises(V4ScienceLockError, match="closed schema"):
         validate_v4_scientific_bundle(SOURCE_ROOT, raw_old_artifact)
 
-    admitted = validate_v4_scientific_bundle(
-        SOURCE_ROOT,
-        _v4_bundle(
-            _v4_record(
-                data={
-                    "reuse_mode": "source-bytes-only",
-                    "source_contract": "PredictionArtifact v1.1",
-                }
-            )
-        ),
+    bundle = _v4_bundle(
+        _v4_record(
+            data={
+                "reuse_mode": "source-bytes-only",
+                "source_contract": "PredictionArtifact v1.1",
+            }
+        )
     )
-    assert admitted == {
-        "status": "PASS",
+    structural = validate_v4_scientific_bundle_structure(
+        SOURCE_ROOT,
+        bundle,
+    )
+    assert structural == {
+        "status": "V4_BUNDLE_STRUCTURE_VALID_ONLY",
         "protocol_id": V4_PROTOCOL_ID,
         "protocol_sha256": V4_PROTOCOL_SHA256,
         "artifact_count": 1,
+        "scientific_admission": False,
     }
+    with pytest.raises(
+        V4ScienceLockError,
+        match="canonical finalizer.*exact 400",
+    ):
+        validate_v4_scientific_bundle(SOURCE_ROOT, bundle)
