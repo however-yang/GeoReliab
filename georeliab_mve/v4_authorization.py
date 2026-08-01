@@ -49,6 +49,7 @@ V4_EXECUTION_AUTHORIZATION_SCHEMA_VERSION = "georeliab-v4-execution-authorizatio
 V4_PREFLIGHT_DECISION_SCHEMA_VERSION = "georeliab-v4-preflight-decision-1.0"
 AUTHORIZED_GPU_MODEL = "NVIDIA A100 80GB PCIe"
 MIN_FREE_MEMORY_BYTES = 16 * 1024 * 1024 * 1024
+FORMAL_SAMPLE_INTERVAL_SECONDS = 5.0
 AUTHORIZED_FINALIZER = "georeliab_mve.v4_execution:finalize_v4_scientific_bundle"
 AUTHORIZED_RESOURCE_KEYS = (
     "raw_data",
@@ -147,6 +148,10 @@ def _runtime_proven(value: object) -> bool:
     return isinstance(value, str) and value.strip() != "" and value.strip().lower() != "unknown"
 
 
+def _driver_proven(value: object) -> bool:
+    return isinstance(value, str) and value.strip() != "" and value.strip().lower() != "unknown"
+
+
 def _validate_preflight_payload(payload: Mapping[str, Any]) -> None:
     if payload.get("schema_version") != V4_HARDWARE_PREFLIGHT_SCHEMA_VERSION:
         raise V4ExecutionError("V4_GPU_PREFLIGHT_SCHEMA_REQUIRED")
@@ -155,9 +160,13 @@ def _validate_preflight_payload(payload: Mapping[str, Any]) -> None:
     for sample in payload.get("samples", ()):
         if not isinstance(sample, Mapping) or not _runtime_proven(sample.get("cuda_runtime")):
             raise V4ExecutionError("V4_GPU_CUDA_RUNTIME_UNPROVEN")
+        if not _driver_proven(sample.get("driver_version")):
+            raise V4ExecutionError("V4_GPU_DRIVER_VERSION_UNPROVEN")
     for device in payload.get("devices", ()):
         if not isinstance(device, Mapping) or not _runtime_proven(device.get("cuda_runtime")):
             raise V4ExecutionError("V4_GPU_CUDA_RUNTIME_UNPROVEN")
+        if not _driver_proven(device.get("driver_version")):
+            raise V4ExecutionError("V4_GPU_DRIVER_VERSION_UNPROVEN")
     if payload.get("status") == "PASS":
         decision = _evaluate_basic(payload.get("samples", ()))
         if decision["status"] != "PASS":
@@ -499,6 +508,8 @@ def _evaluate_basic(samples: Sequence[Mapping[str, object]]) -> dict[str, object
             return _fail("V4_GPU_UUID_MISSING")
         if sample.get("device_model") != AUTHORIZED_GPU_MODEL:
             return _fail("V4_GPU_MODEL_NOT_AUTHORIZED")
+        if not _driver_proven(sample.get("driver_version")):
+            return _fail("V4_GPU_DRIVER_VERSION_UNPROVEN")
         if str(sample.get("mig_mode")).lower() not in {"disabled", "off", "0"}:
             return _fail("V4_GPU_MIG_ENABLED")
         if str(sample.get("ecc_health")).upper() not in {"OK", "PASS", "NONE", "0"}:
@@ -509,7 +520,7 @@ def _evaluate_basic(samples: Sequence[Mapping[str, object]]) -> dict[str, object
             return _fail("V4_GPU_FREE_MEMORY_INSUFFICIENT")
         if sample.get("utilization_gpu_percent") != 0:
             return _fail("V4_GPU_UTILIZATION_NONZERO")
-    for key, reason in (("resolved_physical_index", "V4_GPU_INDEX_DRIFT"), ("device_uuid", "V4_GPU_UUID_DRIFT"), ("device_model", "V4_GPU_MODEL_DRIFT")):
+    for key, reason in (("resolved_physical_index", "V4_GPU_INDEX_DRIFT"), ("device_uuid", "V4_GPU_UUID_DRIFT"), ("device_model", "V4_GPU_MODEL_DRIFT"), ("driver_version", "V4_GPU_DRIVER_VERSION_DRIFT")):
         if first.get(key) != second.get(key):
             return _fail(reason)
     return {"status": "PASS", "reason_code": "V4_GPU_BASIC_PREFLIGHT_PASS"}
@@ -629,6 +640,8 @@ def create_hardware_preflight(
 ) -> dict[str, object]:
     if not isinstance(requested_physical_index, int) or isinstance(requested_physical_index, bool) or requested_physical_index < 0:
         raise V4ExecutionError("V4_GPU_INDEX_INVALID")
+    if float(sample_interval_seconds) != FORMAL_SAMPLE_INTERVAL_SECONDS:
+        raise V4ExecutionError("V4_GPU_SAMPLE_INTERVAL_MUST_BE_5_SECONDS")
     resolved_authorization_commit, resolved_authorization_tree = _resolve_authorization_revision(authorization_commit, authorization_tree)
     run_id = uuid4().hex
     samples: list[dict[str, object]] = []
@@ -637,6 +650,8 @@ def create_hardware_preflight(
         sleeper(float(sample_interval_seconds))
         samples.append(dict(sampler(requested_physical_index)))
         decision = _evaluate_basic(samples)
+    except V4ExecutionError as exc:
+        decision = _fail(str(exc), error=str(exc))
     except Exception as exc:
         decision = _fail("V4_GPU_BASIC_SAMPLE_UNAVAILABLE", error=str(exc))
     probes: list[dict[str, object]] = []
@@ -644,6 +659,8 @@ def create_hardware_preflight(
         try:
             probes = [dict(probe_runner(model, requested_physical_index, samples[-1])) for model in SCIENTIFIC_MODELS]
             decision = _evaluate_probes(probes, samples[-1])
+        except V4ExecutionError as exc:
+            decision = _fail(str(exc), error=str(exc))
         except Exception as exc:
             decision = _fail("V4_GPU_TORCH_PROBE_FAILED", error=str(exc))
     selected = samples[-1] if samples else {}

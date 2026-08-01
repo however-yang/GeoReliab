@@ -40,7 +40,6 @@ from .splits import validate_scene_disjoint
 from .statistics import holm_adjust, paired_scene_bootstrap, tost_equivalence
 from .audit import (
     AuditError,
-    load_georeliab_evidence_input,
     load_stage_evidence_manifest,
     write_dense_audit_bundle,
 )
@@ -408,7 +407,6 @@ def build_parser() -> argparse.ArgumentParser:
     v4_preflight = subparsers.add_parser('v4-gpu-preflight')
     v4_preflight.add_argument('--output', type=Path, default=Path('artifacts/v4-hardware-preflight.json'))
     v4_preflight.add_argument('--requested-index', type=int, required=True)
-    v4_preflight.add_argument('--sample-interval-seconds', type=float, default=5.0)
     v4_preflight.add_argument('--schedule', type=Path)
     v4_preflight.add_argument('--project-commit', default='7381e60050143a78fca6a3ebde5706ae27d2c145')
     v4_preflight.add_argument('--project-tree', default='f4e2b1104496c817693aaa5989d0276d2ebe03e9')
@@ -550,7 +548,6 @@ def main(argv: list[str] | None = None) -> int:
                 project_commit=args.project_commit,
                 project_tree=args.project_tree,
                 schedule_sha256=schedule_sha,
-                sample_interval_seconds=args.sample_interval_seconds,
             )
             print(json.dumps(payload, indent=2, sort_keys=True))
             return 0 if payload.get('status') == 'PASS' else 2

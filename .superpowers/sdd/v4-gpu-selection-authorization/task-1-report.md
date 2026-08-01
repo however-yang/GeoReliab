@@ -194,3 +194,29 @@ DONE_WITH_CONCERNS
 - No checkpoint/model-forward, protocol/config/split/corruption/metrics/adapters/evidence files were touched.
 - No permanent cuda index or UUID was hardcoded; tests continue to use injected samplers and dummy immutable SHAs.
 - Remaining concern unchanged: broad `tests/test_v4*.py` is still not used as completion evidence because of pre-existing Windows temp/cache/staging ACL failures documented above.
+
+## Whole-Branch Review Fix: Interval, Driver, and Reason Codes - 2026-08-01
+
+### REQUEST CHANGES findings fixed
+1. Formal preflight sample interval is now exactly `5.0` seconds. The CLI no longer exposes `--sample-interval-seconds`, and the core preflight rejects non-5.0 before sampling or artifact creation with `V4_GPU_SAMPLE_INTERVAL_MUST_BE_5_SECONDS`. Tests remain fast by passing `5.0` with injected no-op sleepers.
+2. Every present hardware sample and device summary must have nonempty/proven `driver_version`; `_evaluate_basic` rejects missing driver versions and rejects two-sample driver drift with `V4_GPU_DRIVER_VERSION_DRIFT`.
+3. `create_hardware_preflight` now preserves exact `V4ExecutionError` reason codes raised by samplers and probe runners; only unexpected exceptions map to generic `V4_GPU_BASIC_SAMPLE_UNAVAILABLE` or `V4_GPU_TORCH_PROBE_FAILED`.
+
+### Added regressions
+- Non-5.0 interval rejects before sampler invocation and creates no artifact.
+- Driver version drift blocks preflight; missing sample/device driver versions fail staged snapshot validation.
+- Sampler-raised `V4_GPU_CUDA_RUNTIME_UNPROVEN` and probe-raised `V4_GPU_TORCH_PROBE_VISIBLE_DEVICE_MISMATCH` remain exact published reason codes.
+- CLI preflight tests no longer pass interval overrides.
+
+### Commands and exact results
+- `ruff check georeliab_mve\v4_authorization.py georeliab_mve\cli.py tests\test_v4_authorization.py` -> PASS: `All checks passed!`.
+- `python -m py_compile georeliab_mve\v4_authorization.py georeliab_mve\cli.py tests\test_v4_authorization.py` -> PASS.
+- `python -m pytest tests\test_v4_authorization.py -q` -> PASS: `58 passed`, with one pre-existing pytest-asyncio deprecation warning.
+- `python -m pytest tests\test_v4_execution_governance.py tests\test_storage_audit_refactor.py tests\test_storage_audit_cli_refactor.py tests\test_storage_science_lock_refactor.py -q` -> PASS: `73 passed`, with one pre-existing pytest-asyncio deprecation warning.
+- `git diff --check` -> PASS.
+
+### Self-review
+- No GPU/model/scientific execution was run.
+- No checkpoint/model-forward, protocol/config/split/corruption/metrics/adapters/evidence files were touched.
+- No permanent cuda index or UUID was hardcoded; existing evidence entries remain preserved as superseded engineering evidence where noted.
+- Remaining concern unchanged: broad `tests/test_v4*.py` is still not used as completion evidence because of pre-existing Windows temp/cache/staging ACL failures documented above.

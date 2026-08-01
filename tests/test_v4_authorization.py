@@ -85,6 +85,7 @@ def _pass_probe(model_id: str, index: int, sample: dict[str, object]) -> dict[st
         ((_sample(mig_mode="Enabled"), _sample()), "V4_GPU_MIG_ENABLED"),
         ((_sample(free_memory_bytes=15 * 1024 * 1024 * 1024), _sample()), "V4_GPU_FREE_MEMORY_INSUFFICIENT"),
         ((_sample(device_model="NVIDIA A100-SXM4-80GB"), _sample()), "V4_GPU_MODEL_NOT_AUTHORIZED"),
+        ((_sample(), _sample(driver_version="556.00")), "V4_GPU_DRIVER_VERSION_DRIFT"),
         ((_sample(utilization_gpu_percent=1), _sample()), "V4_GPU_UTILIZATION_NONZERO"),
         ((_sample(ecc_health="ERROR"), _sample()), "V4_GPU_HEALTH_ERROR"),
     ],
@@ -112,7 +113,7 @@ def test_gpu_preflight_basic_failures_publish_snapshot_only(
         schedule_sha256=SCHEDULE_SHA,
         authorization_commit=AUTHORIZATION_COMMIT,
         authorization_tree=AUTHORIZATION_TREE,
-        sample_interval_seconds=0,
+        sample_interval_seconds=5.0,
         sampler=sampler,
         sleeper=lambda _seconds: None,
         probe_runner=probe,
@@ -132,7 +133,7 @@ def test_gpu_preflight_pass_writes_rich_snapshot_receipt_and_cleans_partials(tmp
         schedule_sha256=SCHEDULE_SHA,
         authorization_commit=AUTHORIZATION_COMMIT,
         authorization_tree=AUTHORIZATION_TREE,
-        sample_interval_seconds=0,
+        sample_interval_seconds=5.0,
         sampler=lambda _index: _sample(),
         sleeper=lambda _seconds: None,
         probe_runner=_pass_probe,
@@ -165,7 +166,7 @@ def test_external_process_failure_publishes_blocked_decision_only(tmp_path: Path
         schedule_sha256=SCHEDULE_SHA,
         authorization_commit=AUTHORIZATION_COMMIT,
         authorization_tree=AUTHORIZATION_TREE,
-        sample_interval_seconds=0,
+        sample_interval_seconds=5.0,
         sampler=lambda _index: _sample(
             utilization_gpu_percent=99,
             compute_processes=[{"pid": 123, "owner": "other", "cwd": "/tmp", "cmdline": "python", "used_memory_bytes": 1}],
@@ -210,7 +211,7 @@ def test_failed_preflight_rerun_removes_old_pass_receipt(tmp_path: Path) -> None
         schedule_sha256=SCHEDULE_SHA,
         authorization_commit=AUTHORIZATION_COMMIT,
         authorization_tree=AUTHORIZATION_TREE,
-        sample_interval_seconds=0,
+        sample_interval_seconds=5.0,
         sampler=lambda _index: _sample(),
         sleeper=lambda _seconds: None,
         probe_runner=_pass_probe,
@@ -236,7 +237,7 @@ def test_failed_preflight_rerun_removes_old_pass_receipt(tmp_path: Path) -> None
         schedule_sha256=SCHEDULE_SHA,
         authorization_commit=AUTHORIZATION_COMMIT,
         authorization_tree=AUTHORIZATION_TREE,
-        sample_interval_seconds=0,
+        sample_interval_seconds=5.0,
         sampler=lambda _index: _sample(device_model="NVIDIA A100-SXM4-80GB"),
         sleeper=lambda _seconds: None,
         probe_runner=_pass_probe,
@@ -260,7 +261,7 @@ def test_gpu_preflight_probe_mismatch_fails_without_receipt(tmp_path: Path) -> N
         schedule_sha256=SCHEDULE_SHA,
         authorization_commit=AUTHORIZATION_COMMIT,
         authorization_tree=AUTHORIZATION_TREE,
-        sample_interval_seconds=0,
+        sample_interval_seconds=5.0,
         sampler=lambda _index: _sample(),
         sleeper=lambda _seconds: None,
         probe_runner=bad_probe,
@@ -283,7 +284,7 @@ def test_gpu_preflight_probe_post_process_fails_without_receipt(tmp_path: Path) 
         schedule_sha256=SCHEDULE_SHA,
         authorization_commit=AUTHORIZATION_COMMIT,
         authorization_tree=AUTHORIZATION_TREE,
-        sample_interval_seconds=0,
+        sample_interval_seconds=5.0,
         sampler=lambda _index: _sample(),
         sleeper=lambda _seconds: None,
         probe_runner=busy_probe,
@@ -307,7 +308,7 @@ def test_gpu_preflight_omitted_post_probe_fields_fail_without_receipt(tmp_path: 
         schedule_sha256=SCHEDULE_SHA,
         authorization_commit=AUTHORIZATION_COMMIT,
         authorization_tree=AUTHORIZATION_TREE,
-        sample_interval_seconds=0,
+        sample_interval_seconds=5.0,
         sampler=lambda _index: _sample(),
         sleeper=lambda _seconds: None,
         probe_runner=incomplete_probe,
@@ -319,6 +320,74 @@ def test_gpu_preflight_omitted_post_probe_fields_fail_without_receipt(tmp_path: 
     assert snapshot["reason_code"] == "V4_GPU_TORCH_PROBE_SCHEMA_REQUIRED"
     assert not (tmp_path / "v4-execution-receipt.json").exists()
     assert list(tmp_path.glob("*.partial")) == []
+
+
+def test_gpu_preflight_rejects_nonformal_sample_interval_before_sampling(tmp_path: Path) -> None:
+    calls = {"sample": 0}
+
+    def sampler(_index: int) -> dict[str, object]:
+        calls["sample"] += 1
+        return _sample()
+
+    with pytest.raises(V4ExecutionError, match="V4_GPU_SAMPLE_INTERVAL_MUST_BE_5_SECONDS"):
+        create_hardware_preflight(
+            output_path=tmp_path / "hardware.json",
+            requested_physical_index=1,
+            schedule_sha256=SCHEDULE_SHA,
+            authorization_commit=AUTHORIZATION_COMMIT,
+            authorization_tree=AUTHORIZATION_TREE,
+            sample_interval_seconds=0,
+            sampler=sampler,
+            sleeper=lambda _seconds: None,
+            probe_runner=_pass_probe,
+        )
+
+    assert calls["sample"] == 0
+    assert not (tmp_path / "hardware.json").exists()
+
+
+def test_gpu_preflight_preserves_sampler_v4_reason(tmp_path: Path) -> None:
+    def sampler(_index: int) -> dict[str, object]:
+        raise V4ExecutionError("V4_GPU_CUDA_RUNTIME_UNPROVEN")
+
+    result = create_hardware_preflight(
+        output_path=tmp_path / "hardware.json",
+        requested_physical_index=1,
+        schedule_sha256=SCHEDULE_SHA,
+        authorization_commit=AUTHORIZATION_COMMIT,
+        authorization_tree=AUTHORIZATION_TREE,
+        sample_interval_seconds=5.0,
+        sampler=sampler,
+        sleeper=lambda _seconds: None,
+        probe_runner=_pass_probe,
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["reason_code"] == "V4_GPU_CUDA_RUNTIME_UNPROVEN"
+    assert load_json(tmp_path / "hardware.json")["reason_code"] == "V4_GPU_CUDA_RUNTIME_UNPROVEN"
+    assert not (tmp_path / "v4-execution-receipt.json").exists()
+
+
+def test_gpu_preflight_preserves_probe_v4_reason(tmp_path: Path) -> None:
+    def probe(model_id: str, index: int, sample: dict[str, object]) -> dict[str, object]:
+        raise V4ExecutionError("V4_GPU_TORCH_PROBE_VISIBLE_DEVICE_MISMATCH")
+
+    result = create_hardware_preflight(
+        output_path=tmp_path / "hardware.json",
+        requested_physical_index=1,
+        schedule_sha256=SCHEDULE_SHA,
+        authorization_commit=AUTHORIZATION_COMMIT,
+        authorization_tree=AUTHORIZATION_TREE,
+        sample_interval_seconds=5.0,
+        sampler=lambda _index: _sample(),
+        sleeper=lambda _seconds: None,
+        probe_runner=probe,
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["reason_code"] == "V4_GPU_TORCH_PROBE_VISIBLE_DEVICE_MISMATCH"
+    assert load_json(tmp_path / "hardware.json")["reason_code"] == "V4_GPU_TORCH_PROBE_VISIBLE_DEVICE_MISMATCH"
+    assert not (tmp_path / "v4-execution-receipt.json").exists()
 
 
 def test_nvidia_smi_sample_fails_closed_when_process_enumeration_unproven() -> None:
@@ -414,6 +483,46 @@ def test_staged_preflight_rejects_unknown_device_cuda_runtime(tmp_path: Path) ->
     assert not target.with_name(target.name + ".partial").exists()
 
 
+def test_staged_preflight_rejects_unknown_device_driver_version(tmp_path: Path) -> None:
+    samples = [_sample(), _sample()]
+    probes = [_pass_probe(model_id, 1, samples[-1]) for model_id in SCIENTIFIC_MODELS]
+    target = tmp_path / "hardware.json"
+    payload = {
+        "schema_version": "georeliab-v4-hardware-preflight-1.0",
+        "status": "PASS",
+        "reason_code": "V4_GPU_PREFLIGHT_PASS",
+        "samples": samples,
+        "devices": [{"cuda_runtime": "CUDA Version 13.0", "driver_version": "unknown"}],
+        "model_environment_probes": probes,
+    }
+
+    with pytest.raises(V4ExecutionError, match="V4_GPU_DRIVER_VERSION_UNPROVEN"):
+        _atomic_json(target, payload, validator=_validate_preflight_payload)
+
+    assert not target.exists()
+    assert not target.with_name(target.name + ".partial").exists()
+
+
+def test_staged_preflight_rejects_missing_sample_driver_version(tmp_path: Path) -> None:
+    samples = [_sample(driver_version=""), _sample()]
+    probes = [_pass_probe(model_id, 1, samples[-1]) for model_id in SCIENTIFIC_MODELS]
+    target = tmp_path / "hardware.json"
+    payload = {
+        "schema_version": "georeliab-v4-hardware-preflight-1.0",
+        "status": "FAIL",
+        "reason_code": "V4_GPU_DRIVER_VERSION_UNPROVEN",
+        "samples": samples,
+        "devices": [],
+        "model_environment_probes": probes,
+    }
+
+    with pytest.raises(V4ExecutionError, match="V4_GPU_DRIVER_VERSION_UNPROVEN"):
+        _atomic_json(target, payload, validator=_validate_preflight_payload)
+
+    assert not target.exists()
+    assert not target.with_name(target.name + ".partial").exists()
+
+
 def test_default_torch_probe_independently_binds_frozen_env_and_post_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     expected_sample = _sample()
     commands: list[tuple[tuple[str, ...], dict[str, str] | None]] = []
@@ -473,7 +582,7 @@ def _prepare_authorization_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         schedule_sha256=schedule_sha,
         authorization_commit=AUTHORIZATION_COMMIT,
         authorization_tree=AUTHORIZATION_TREE,
-        sample_interval_seconds=0,
+        sample_interval_seconds=5.0,
         sampler=lambda _index: _sample(),
         sleeper=lambda _seconds: None,
         probe_runner=_pass_probe,
@@ -976,8 +1085,6 @@ def test_v4_preflight_cli_requires_explicit_requested_index(tmp_path: Path) -> N
             "v4-gpu-preflight",
             "--output",
             str(tmp_path / "hardware.json"),
-            "--sample-interval-seconds",
-            "0",
         ],
         cwd=Path(__file__).resolve().parents[1],
         stdout=subprocess.PIPE,
@@ -1001,8 +1108,6 @@ def test_v4_preflight_cli_fails_closed_without_gpu_when_index_explicit(tmp_path:
             str(tmp_path / "hardware.json"),
             "--requested-index",
             "1",
-            "--sample-interval-seconds",
-            "0",
         ],
         cwd=Path(__file__).resolve().parents[1],
         stdout=subprocess.PIPE,
