@@ -59,6 +59,12 @@ from .execution_governance import (
     validate_storage_refactor_rollout,
 )
 from .science_lock import BASE_PROJECT_COMMIT
+from .v4_execution import V4ExecutionError
+from .v4_authorization import (
+    create_execution_authorization,
+    create_hardware_preflight,
+    validate_execution_authorization,
+)
 
 
 DEFAULT_PROTOCOL = Path('configs/dual_mve_protocol.toml')
@@ -399,6 +405,26 @@ def build_parser() -> argparse.ArgumentParser:
     rollout.add_argument('--root', type=Path, required=True)
     rollout.add_argument('--output', type=Path)
 
+    v4_preflight = subparsers.add_parser('v4-gpu-preflight')
+    v4_preflight.add_argument('--output', type=Path, default=Path('artifacts/v4-hardware-preflight.json'))
+    v4_preflight.add_argument('--requested-index', type=int, default=0)
+    v4_preflight.add_argument('--sample-interval-seconds', type=float, default=5.0)
+    v4_preflight.add_argument('--schedule', type=Path)
+    v4_preflight.add_argument('--project-commit', default='7381e60050143a78fca6a3ebde5706ae27d2c145')
+    v4_preflight.add_argument('--project-tree', default='f4e2b1104496c817693aaa5989d0276d2ebe03e9')
+
+    v4_create_auth = subparsers.add_parser('v4-create-execution-authorization')
+    v4_create_auth.add_argument('--root', type=Path, default=Path('.'))
+    v4_create_auth.add_argument('--receipt', type=Path, required=True)
+    v4_create_auth.add_argument('--resource-inventory', type=Path, required=True)
+    v4_create_auth.add_argument('--run-root', type=Path, required=True)
+    v4_create_auth.add_argument('--artifact-root', type=Path, required=True)
+    v4_create_auth.add_argument('--final-evidence-path', type=Path, required=True)
+    v4_create_auth.add_argument('--output', type=Path, default=Path('artifacts/v4-execution-authorization.json'))
+
+    v4_validate_auth = subparsers.add_parser('v4-validate-execution-authorization')
+    v4_validate_auth.add_argument('authorization', type=Path)
+
     return parser
 
 
@@ -516,6 +542,34 @@ def main(argv: list[str] | None = None) -> int:
             if args.input is not None:
                 raise ValueError('scientific GeoReliab audit requires --stage-evidence; aggregate --input is disabled')
             raise ValueError('GeoReliab audit requires --stage-evidence or bundle audit arguments')
+        if args.command == 'v4-gpu-preflight':
+            schedule_sha = _sha256_file(args.schedule) if args.schedule is not None else None
+            payload = create_hardware_preflight(
+                output_path=args.output,
+                requested_physical_index=args.requested_index,
+                project_commit=args.project_commit,
+                project_tree=args.project_tree,
+                schedule_sha256=schedule_sha,
+                sample_interval_seconds=args.sample_interval_seconds,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0 if payload.get('status') == 'PASS' else 2
+        if args.command == 'v4-create-execution-authorization':
+            payload = create_execution_authorization(
+                root=args.root,
+                receipt_path=args.receipt,
+                resource_inventory_path=args.resource_inventory,
+                run_root=args.run_root,
+                artifact_root=args.artifact_root,
+                final_evidence_path=args.final_evidence_path,
+                output_path=args.output,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == 'v4-validate-execution-authorization':
+            payload = validate_execution_authorization(args.authorization)
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
         source_root = Path(__file__).resolve().parents[1]
         if args.command == 'archive-superseded':
             payload = archive_superseded_results(
@@ -599,7 +653,7 @@ def main(argv: list[str] | None = None) -> int:
                 }
             print(json.dumps(payload, indent=2, sort_keys=True))
             return 0 if payload.get('status') == 'PASS' else 2
-    except (KeyError, TypeError, ValueError, AuditError, StorageAuditError, ExecutionGovernanceError, OSError, json.JSONDecodeError) as exc:
+    except (KeyError, TypeError, ValueError, AuditError, StorageAuditError, ExecutionGovernanceError, V4ExecutionError, OSError, json.JSONDecodeError) as exc:
         print(f'ERROR: {exc}', file=sys.stderr)
         return 2
     raise AssertionError('unreachable command')

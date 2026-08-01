@@ -1,0 +1,723 @@
+"""CPU-only GeoReliab v4 GPU preflight and execution authorization.
+
+This module only inspects already-prepared inputs and hardware metadata. It does
+not load model checkpoints, instantiate adapters, execute forwards, compute
+scientific metrics, acquire the scientific execution lock, or touch the GPU
+inference ledger.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import subprocess
+import time
+from typing import Any, Callable
+from uuid import uuid4
+
+from .v4_counterfactuals import (
+    FOG_STATES,
+    LIGHTING_STATES,
+    SCIENTIFIC_MODELS,
+    SCIENTIFIC_STATES,
+    TEST_SCENE_IDS,
+    parse_scientific_schedule,
+    validate_scientific_schedule,
+)
+from .v4_execution import (
+    BYTE_CATASTROPHE,
+    BYTE_TARGET,
+    GPU_CATASTROPHE_SECONDS,
+    GPU_TARGET_SECONDS,
+    SCIENTIFIC_MVE,
+    V4ExecutionError,
+    V4ExecutionReceipt,
+)
+from .v4_science_lock import V4_PROTOCOL_ID, V4_PROTOCOL_SHA256
+
+
+IMPLEMENTATION_ANCHOR_COMMIT = "7381e60050143a78fca6a3ebde5706ae27d2c145"
+IMPLEMENTATION_ANCHOR_TREE = "f4e2b1104496c817693aaa5989d0276d2ebe03e9"
+V4_HARDWARE_PREFLIGHT_SCHEMA_VERSION = "georeliab-v4-hardware-preflight-1.0"
+V4_EXECUTION_AUTHORIZATION_SCHEMA_VERSION = "georeliab-v4-execution-authorization-1.0"
+AUTHORIZED_GPU_MODEL = "NVIDIA A100 80GB PCIe"
+MIN_FREE_MEMORY_BYTES = 16 * 1024 * 1024 * 1024
+AUTHORIZED_FINALIZER = "georeliab_mve.v4_execution:finalize_v4_scientific_bundle"
+AUTHORIZED_RESOURCE_KEYS = (
+    "raw_data",
+    "model_weights_config",
+    "upstream_commits_manifests",
+    "split",
+    "state_inventory_200",
+    "fog_manifest",
+    "scientific_schedule_400",
+    "environment_locks",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class V4ExecutionAuthorization:
+    receipt_path: str
+    receipt_sha256: str
+    hardware_preflight_path: str
+    hardware_preflight_sha256: str
+    implementation_commit: str
+    implementation_tree: str
+    protocol_id: str
+    protocol_sha256: str
+    schedule_sha256: str
+    resource_inventory: tuple[tuple[str, str, str], ...]
+    run_root: str
+    artifact_root: str
+    final_evidence_path: str
+    finalizer: str
+    schema_version: str = V4_EXECUTION_AUTHORIZATION_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, object]:
+        payload = asdict(self)
+        payload["resource_inventory"] = [
+            {"key": key, "path": path, "sha256": digest}
+            for key, path, digest in self.resource_inventory
+        ]
+        payload["authorized_scope"] = _authorized_scope()
+        payload["authorization_sha256"] = _sha_json(
+            {key: value for key, value in payload.items() if key != "authorization_sha256"}
+        )
+        return payload
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha_json(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _json_bytes(value: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(dict(value), sort_keys=True, separators=(",", ":"), default=str)
+        + "\n"
+    ).encode("utf-8")
+
+
+def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(path.name + ".partial")
+    try:
+        with partial.open("wb") as handle:
+            handle.write(_json_bytes(payload))
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+        reloaded = json.loads(partial.read_text(encoding="utf-8"))
+        if not isinstance(reloaded, dict):
+            raise V4ExecutionError("V4_ATOMIC_JSON_STAGING_VALIDATION_FAILED")
+        partial.replace(path)
+    finally:
+        try:
+            partial.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise V4ExecutionError("V4_AUTHORIZATION_JSON_UNREADABLE") from exc
+    if not isinstance(payload, dict):
+        raise V4ExecutionError("V4_AUTHORIZATION_JSON_NOT_OBJECT")
+    return payload
+
+
+def _is_sha(value: object, length: int = 64) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and value == value.lower()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _resolve_under_root(root: Path, target: Path, *, must_exist: bool = False) -> Path:
+    resolved_root = root.resolve()
+    if resolved_root == Path(resolved_root.anchor):
+        raise V4ExecutionError("V4_AUTHORIZATION_ROOT_INVALID")
+    resolved = target.resolve(strict=must_exist)
+    try:
+        relative = resolved.relative_to(resolved_root)
+    except ValueError as exc:
+        raise V4ExecutionError("V4_AUTHORIZATION_PATH_ESCAPE") from exc
+    if not relative.parts:
+        raise V4ExecutionError("V4_AUTHORIZATION_PATH_ESCAPE")
+    return resolved
+
+
+def _run_text_command(command: Sequence[str], *, env: Mapping[str, str] | None = None) -> str:
+    merged_env = os.environ.copy()
+    if env is not None:
+        merged_env.update({key: str(value) for key, value in env.items()})
+    return subprocess.run(
+        list(command),
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=merged_env,
+    ).stdout
+
+
+def _parse_csv_row(text: str, expected_columns: int, *, reason_code: str) -> list[str]:
+    rows = [row.strip() for row in text.splitlines() if row.strip()]
+    if len(rows) != 1:
+        raise V4ExecutionError(reason_code)
+    values = [item.strip() for item in rows[0].split(",")]
+    if len(values) != expected_columns:
+        raise V4ExecutionError(reason_code)
+    return values
+
+
+def _int_from_smi(value: str) -> int:
+    stripped = value.strip()
+    if stripped in {"", "N/A", "[Not Supported]", "Not Supported"}:
+        return 0
+    return int(float(stripped))
+
+
+def _bytes_from_mib(value: str) -> int:
+    return _int_from_smi(value) * 1024 * 1024
+
+
+def _process_owner(pid: int) -> str | None:
+    if os.name == "nt":
+        return None
+    try:
+        import pwd
+
+        uid_text = Path(f"/proc/{pid}/status").read_text(encoding="utf-8").split("Uid:")[1].splitlines()[0].strip().split()[0]
+        return pwd.getpwuid(int(uid_text)).pw_name
+    except (OSError, IndexError, KeyError, ValueError):
+        return None
+
+
+def _process_cwd(pid: int) -> str | None:
+    if os.name == "nt":
+        return None
+    try:
+        return str(Path(f"/proc/{pid}/cwd").resolve())
+    except OSError:
+        return None
+
+
+def _process_cmdline(pid: int) -> str | None:
+    if os.name == "nt":
+        return None
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+    except OSError:
+        return None
+
+
+def nvidia_smi_hardware_sample(
+    requested_physical_index: int,
+    *,
+    command_runner: Callable[..., str] = _run_text_command,
+) -> dict[str, object]:
+    base = _parse_csv_row(
+        command_runner((
+            "nvidia-smi",
+            "-i",
+            str(requested_physical_index),
+            "--query-gpu=index,uuid,name,memory.total,memory.free,memory.used,utilization.gpu,temperature.gpu,driver_version",
+            "--format=csv,noheader,nounits",
+        )),
+        9,
+        reason_code="V4_GPU_BASIC_SAMPLE_UNAVAILABLE",
+    )
+    mig_ecc = _parse_csv_row(
+        command_runner((
+            "nvidia-smi",
+            "-i",
+            str(requested_physical_index),
+            "--query-gpu=mig.mode.current,ecc.errors.uncorrected.volatile.total",
+            "--format=csv,noheader,nounits",
+        )),
+        2,
+        reason_code="V4_GPU_HEALTH_SAMPLE_UNAVAILABLE",
+    )
+    try:
+        cuda_runtime = command_runner(("nvcc", "--version")).strip().splitlines()[-1]
+    except Exception:
+        cuda_runtime = "unknown"
+    processes: list[dict[str, object]] = []
+    try:
+        proc_text = command_runner((
+            "nvidia-smi",
+            "-i",
+            str(requested_physical_index),
+            "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
+            "--format=csv,noheader,nounits",
+        ))
+    except Exception:
+        proc_text = ""
+    for row in [line.strip() for line in proc_text.splitlines() if line.strip()]:
+        gpu_uuid, pid_raw, process_name, used_raw = [item.strip() for item in row.split(",", 3)]
+        pid = _int_from_smi(pid_raw)
+        processes.append({
+            "gpu_uuid": gpu_uuid,
+            "pid": pid,
+            "process_name": process_name,
+            "owner": _process_owner(pid),
+            "cwd": _process_cwd(pid),
+            "cmdline": _process_cmdline(pid),
+            "used_memory_bytes": _bytes_from_mib(used_raw),
+        })
+    return {
+        "host": platform.node(),
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "requested_physical_index": requested_physical_index,
+        "resolved_physical_index": _int_from_smi(base[0]),
+        "device_uuid": base[1],
+        "device_model": base[2],
+        "total_memory_bytes": _bytes_from_mib(base[3]),
+        "free_memory_bytes": _bytes_from_mib(base[4]),
+        "used_memory_bytes": _bytes_from_mib(base[5]),
+        "utilization_gpu_percent": _int_from_smi(base[6]),
+        "temperature_c": _int_from_smi(base[7]),
+        "driver_version": base[8],
+        "cuda_runtime": cuda_runtime,
+        "mig_mode": mig_ecc[0],
+        "ecc_health": "OK" if _int_from_smi(mig_ecc[1]) == 0 else "ERROR",
+        "compute_processes": processes,
+    }
+
+
+def _frozen_python_for_model(model_id: str) -> str:
+    env_key = {"VGGT": "GEORELIAB_V4_VGGT_PYTHON", "MASt3R": "GEORELIAB_V4_MAST3R_PYTHON"}.get(model_id)
+    if env_key is None:
+        raise V4ExecutionError("V4_GPU_TORCH_PROBE_MODEL_SET_MISMATCH")
+    value = os.environ.get(env_key)
+    if not value:
+        raise V4ExecutionError(f"V4_GPU_TORCH_PROBE_FROZEN_ENV_REQUIRED:{env_key}")
+    return value
+
+
+def _default_torch_probe(model_id: str, requested_physical_index: int, expected_sample: Mapping[str, object]) -> dict[str, object]:
+    code = (
+        "import json, torch;"
+        "payload={'torch_cuda_available': torch.cuda.is_available(),"
+        "'torch_device_count': torch.cuda.device_count(),"
+        "'torch_current_device': torch.cuda.current_device() if torch.cuda.is_available() else None,"
+        "'device_name': torch.cuda.get_device_name(0) if torch.cuda.is_available() and torch.cuda.device_count()==1 else None};"
+        "print(json.dumps(payload, sort_keys=True))"
+    )
+    payload = json.loads(_run_text_command((_frozen_python_for_model(model_id), "-c", code), env={"CUDA_VISIBLE_DEVICES": str(requested_physical_index)}))
+    return {
+        "model_id": model_id,
+        "torch_device_count": payload.get("torch_device_count"),
+        "torch_cuda_available": payload.get("torch_cuda_available"),
+        "torch_current_device": payload.get("torch_current_device"),
+        "mapped_device_uuid": expected_sample.get("device_uuid"),
+        "mapped_device_model": payload.get("device_name"),
+        "mapped_total_memory_bytes": expected_sample.get("total_memory_bytes"),
+        "compute_process_count": len(expected_sample.get("compute_processes", ())),
+    }
+
+
+def _fail(reason_code: str, **extra: object) -> dict[str, object]:
+    return {"status": "FAIL", "reason_code": reason_code, **extra}
+
+
+def _evaluate_basic(samples: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    if len(samples) != 2:
+        return _fail("V4_GPU_PREFLIGHT_TWO_SAMPLES_REQUIRED")
+    first, second = samples
+    for sample in samples:
+        if sample.get("requested_physical_index") != sample.get("resolved_physical_index"):
+            return _fail("V4_GPU_INDEX_RESOLUTION_MISMATCH")
+        if not isinstance(sample.get("device_uuid"), str) or not sample.get("device_uuid"):
+            return _fail("V4_GPU_UUID_MISSING")
+        if sample.get("device_model") != AUTHORIZED_GPU_MODEL:
+            return _fail("V4_GPU_MODEL_NOT_AUTHORIZED")
+        if str(sample.get("mig_mode")).lower() not in {"disabled", "off", "0"}:
+            return _fail("V4_GPU_MIG_ENABLED")
+        if str(sample.get("ecc_health")).upper() not in {"OK", "PASS", "NONE", "0"}:
+            return _fail("V4_GPU_HEALTH_ERROR")
+        if len(sample.get("compute_processes", ())) != 0:
+            return _fail("V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS")
+        if not isinstance(sample.get("free_memory_bytes"), int) or int(sample["free_memory_bytes"]) < MIN_FREE_MEMORY_BYTES:
+            return _fail("V4_GPU_FREE_MEMORY_INSUFFICIENT")
+        if sample.get("utilization_gpu_percent") != 0:
+            return _fail("V4_GPU_UTILIZATION_NONZERO")
+    for key, reason in (("resolved_physical_index", "V4_GPU_INDEX_DRIFT"), ("device_uuid", "V4_GPU_UUID_DRIFT"), ("device_model", "V4_GPU_MODEL_DRIFT")):
+        if first.get(key) != second.get(key):
+            return _fail(reason)
+    return {"status": "PASS", "reason_code": "V4_GPU_BASIC_PREFLIGHT_PASS"}
+
+
+def _evaluate_probes(probes: Sequence[Mapping[str, object]], sample: Mapping[str, object]) -> dict[str, object]:
+    seen: set[str] = set()
+    if len(probes) != len(SCIENTIFIC_MODELS):
+        return _fail("V4_GPU_TORCH_PROBE_MODEL_SET_MISMATCH")
+    for probe in probes:
+        model_id = probe.get("model_id")
+        if model_id not in SCIENTIFIC_MODELS or str(model_id) in seen:
+            return _fail("V4_GPU_TORCH_PROBE_MODEL_SET_MISMATCH")
+        seen.add(str(model_id))
+        if probe.get("torch_cuda_available") is not True or probe.get("torch_device_count") != 1 or probe.get("torch_current_device") != 0:
+            return _fail("V4_GPU_TORCH_PROBE_VISIBLE_DEVICE_MISMATCH")
+        if probe.get("mapped_device_uuid") != sample.get("device_uuid") or probe.get("mapped_device_model") != sample.get("device_model") or probe.get("mapped_total_memory_bytes") != sample.get("total_memory_bytes"):
+            return _fail("V4_GPU_TORCH_PROBE_PHYSICAL_DEVICE_MISMATCH")
+        if probe.get("compute_process_count") != 0:
+            return _fail("V4_GPU_TORCH_PROBE_LEFT_PROCESS")
+    return {"status": "PASS", "reason_code": "V4_GPU_PREFLIGHT_PASS"}
+
+
+def create_hardware_preflight(
+    *,
+    output_path: Path,
+    requested_physical_index: int,
+    project_commit: str = IMPLEMENTATION_ANCHOR_COMMIT,
+    project_tree: str = IMPLEMENTATION_ANCHOR_TREE,
+    scope: str = SCIENTIFIC_MVE,
+    stage: str = SCIENTIFIC_MVE,
+    schedule_sha256: str | None = None,
+    sample_interval_seconds: float = 5.0,
+    sampler: Callable[[int], Mapping[str, object]] = nvidia_smi_hardware_sample,
+    sleeper: Callable[[float], None] = time.sleep,
+    probe_runner: Callable[[str, int, Mapping[str, object]], Mapping[str, object]] = _default_torch_probe,
+) -> dict[str, object]:
+    if not isinstance(requested_physical_index, int) or isinstance(requested_physical_index, bool) or requested_physical_index < 0:
+        raise V4ExecutionError("V4_GPU_INDEX_INVALID")
+    samples: list[dict[str, object]] = []
+    try:
+        samples.append(dict(sampler(requested_physical_index)))
+        sleeper(float(sample_interval_seconds))
+        samples.append(dict(sampler(requested_physical_index)))
+        decision = _evaluate_basic(samples)
+    except Exception as exc:
+        decision = _fail("V4_GPU_BASIC_SAMPLE_UNAVAILABLE", error=str(exc))
+    probes: list[dict[str, object]] = []
+    if decision["status"] == "PASS":
+        try:
+            probes = [dict(probe_runner(model, requested_physical_index, samples[-1])) for model in SCIENTIFIC_MODELS]
+            decision = _evaluate_probes(probes, samples[-1])
+        except Exception as exc:
+            decision = _fail("V4_GPU_TORCH_PROBE_FAILED", error=str(exc))
+    selected = samples[-1] if samples else {}
+    receipt_path = output_path.with_name("v4-execution-receipt.json")
+    if decision["status"] != "PASS":
+        try:
+            receipt_path.unlink()
+        except FileNotFoundError:
+            pass
+    snapshot = {
+        "schema_version": V4_HARDWARE_PREFLIGHT_SCHEMA_VERSION,
+        "status": decision["status"],
+        "reason_code": decision["reason_code"],
+        "project_commit": project_commit,
+        "project_tree": project_tree,
+        "scope": scope,
+        "stage": stage,
+        "requested_physical_index": requested_physical_index,
+        "resolved_physical_index": selected.get("resolved_physical_index"),
+        "sample_interval_seconds": float(sample_interval_seconds),
+        "visible_gpu_count": 1 if decision["status"] == "PASS" else 0,
+        "compute_process_count": len(selected.get("compute_processes", ())) if selected else 0,
+        "stable_sample_count": len(samples),
+        "environment": {"CUDA_VISIBLE_DEVICES": str(requested_physical_index), "GEORELIAB_PHYSICAL_GPU_DEVICE": f"cuda:{requested_physical_index}"},
+        "devices": [{
+            "physical_index": selected.get("resolved_physical_index"),
+            "uuid": selected.get("device_uuid"),
+            "model": selected.get("device_model"),
+            "driver_version": selected.get("driver_version"),
+            "total_memory_bytes": selected.get("total_memory_bytes"),
+            "free_memory_bytes": selected.get("free_memory_bytes"),
+            "used_memory_bytes": selected.get("used_memory_bytes"),
+            "utilization_gpu_percent": selected.get("utilization_gpu_percent"),
+            "temperature_c": selected.get("temperature_c"),
+            "cuda_runtime": selected.get("cuda_runtime"),
+            "mig_mode": selected.get("mig_mode"),
+            "ecc_health": selected.get("ecc_health"),
+            "compute_process_count": len(selected.get("compute_processes", ())) if selected else 0,
+        }] if selected else [],
+        "samples": [{"sample_index": index, **sample} for index, sample in enumerate(samples)],
+        "model_environment_probes": probes,
+    }
+    if "error" in decision:
+        snapshot["error"] = decision["error"]
+    _atomic_json(output_path, snapshot)
+    result: dict[str, object] = {
+        "status": snapshot["status"],
+        "reason_code": snapshot["reason_code"],
+        "hardware_preflight_path": str(output_path),
+        "hardware_preflight_sha256": sha256_file(output_path),
+    }
+    if snapshot["status"] != "PASS":
+        return result
+    receipt = V4ExecutionReceipt(
+        explicit_user_selection=True,
+        project_commit=project_commit,
+        project_tree=project_tree,
+        protocol_id=V4_PROTOCOL_ID,
+        protocol_sha256=V4_PROTOCOL_SHA256,
+        scope=scope,
+        stage=stage,
+        schedule_sha256=schedule_sha256,
+        hardware_preflight_path=str(output_path),
+        hardware_preflight_sha256=str(result["hardware_preflight_sha256"]),
+        requested_physical_index=requested_physical_index,
+        resolved_physical_index=int(selected["resolved_physical_index"]),
+        device_uuid=str(selected["device_uuid"]),
+        device_model=str(selected["device_model"]),
+        driver_version=str(selected["driver_version"]),
+        total_memory_bytes=int(selected["total_memory_bytes"]),
+        max_concurrent_gpus=1,
+        sequential_model_execution=True,
+        sequential_unit_execution=True,
+        fallback_allowed=False,
+        device_switch_allowed=False,
+        retry_allowed=False,
+        nonce=uuid4().hex,
+    )
+    _atomic_json(receipt_path, receipt.to_dict())
+    result["receipt_path"] = str(receipt_path)
+    result["receipt_sha256"] = sha256_file(receipt_path)
+    return result
+
+
+def _rich_preflight_receipt_args(preflight_path: Path, receipt: V4ExecutionReceipt) -> dict[str, object]:
+    payload = load_json(preflight_path)
+    if payload.get("schema_version") != V4_HARDWARE_PREFLIGHT_SCHEMA_VERSION or payload.get("status") != "PASS":
+        raise V4ExecutionError("V4_GPU_PREFLIGHT_NOT_PASS")
+    return {
+        "project_commit": receipt.project_commit,
+        "project_tree": receipt.project_tree,
+        "scope": receipt.scope,
+        "stage": receipt.stage,
+        "schedule_sha256": receipt.schedule_sha256,
+        "hardware_preflight_path": preflight_path,
+        "hardware_preflight_sha256": receipt.hardware_preflight_sha256,
+        "requested_physical_index": receipt.requested_physical_index,
+        "visible_gpu_count": payload.get("visible_gpu_count"),
+        "active_gpu_count": payload.get("compute_process_count"),
+        "lock_active": False,
+    }
+
+
+def validate_rich_preflight_for_receipt(preflight_path: Path, receipt: V4ExecutionReceipt) -> None:
+    payload = load_json(preflight_path)
+    if payload.get("schema_version") != V4_HARDWARE_PREFLIGHT_SCHEMA_VERSION or payload.get("status") != "PASS":
+        raise V4ExecutionError("V4_GPU_PREFLIGHT_NOT_PASS")
+    if payload.get("project_commit") != receipt.project_commit or payload.get("project_tree") != receipt.project_tree:
+        raise V4ExecutionError("V4_GPU_RECEIPT_GIT_MISMATCH")
+    if payload.get("requested_physical_index") != receipt.requested_physical_index or payload.get("resolved_physical_index") != receipt.resolved_physical_index:
+        raise V4ExecutionError("V4_GPU_RECEIPT_DEVICE_MISMATCH")
+    devices = payload.get("devices")
+    if not isinstance(devices, list) or len(devices) != 1:
+        raise V4ExecutionError("V4_GPU_RECEIPT_SINGLE_VISIBLE_GPU_REQUIRED")
+    device = devices[0]
+    if not isinstance(device, Mapping):
+        raise V4ExecutionError("V4_GPU_RECEIPT_DEVICE_MISMATCH")
+    if device.get("uuid") != receipt.device_uuid or device.get("model") != receipt.device_model or device.get("driver_version") != receipt.driver_version or device.get("total_memory_bytes") != receipt.total_memory_bytes:
+        raise V4ExecutionError("V4_GPU_RECEIPT_DEVICE_MISMATCH")
+    decision = _evaluate_basic(payload.get("samples", ()))
+    if decision["status"] != "PASS":
+        raise V4ExecutionError(str(decision["reason_code"]))
+    probe_decision = _evaluate_probes(payload.get("model_environment_probes", ()), payload["samples"][-1])
+    if probe_decision["status"] != "PASS":
+        raise V4ExecutionError(str(probe_decision["reason_code"]))
+
+
+def _load_receipt(receipt_path: Path, expected_sha256: str | None = None) -> V4ExecutionReceipt:
+    if expected_sha256 is not None and sha256_file(receipt_path) != expected_sha256:
+        raise V4ExecutionError("V4_RECEIPT_TAMPER")
+    return V4ExecutionReceipt.from_mapping(load_json(receipt_path))
+
+
+def _validate_receipt_contract(receipt: V4ExecutionReceipt) -> None:
+    if receipt.explicit_user_selection is not True:
+        raise V4ExecutionError("GPU_SELECTION_REQUIRED")
+    if receipt.protocol_id != V4_PROTOCOL_ID or receipt.protocol_sha256 != V4_PROTOCOL_SHA256:
+        raise V4ExecutionError("V4_GPU_RECEIPT_PROTOCOL_MISMATCH")
+    if receipt.scope != SCIENTIFIC_MVE or receipt.stage != SCIENTIFIC_MVE:
+        raise V4ExecutionError("V4_GPU_RECEIPT_SCOPE_MISMATCH")
+    if receipt.max_concurrent_gpus != 1:
+        raise V4ExecutionError("V4_GPU_RECEIPT_SINGLE_GPU_REQUIRED")
+    if receipt.sequential_model_execution is not True or receipt.sequential_unit_execution is not True:
+        raise V4ExecutionError("V4_GPU_RECEIPT_SEQUENTIAL_REQUIRED")
+    if receipt.fallback_allowed is not False or receipt.device_switch_allowed is not False or receipt.retry_allowed is not False:
+        raise V4ExecutionError("V4_GPU_RECEIPT_NO_FALLBACK_REQUIRED")
+    if receipt.device_model != AUTHORIZED_GPU_MODEL:
+        raise V4ExecutionError("V4_GPU_MODEL_NOT_AUTHORIZED")
+
+
+def _validate_schedule_path(schedule_path: Path, expected_sha256: str) -> None:
+    if sha256_file(schedule_path) != expected_sha256:
+        raise V4ExecutionError("V4_SCHEDULE_TAMPER")
+    schedule = validate_scientific_schedule(parse_scientific_schedule(schedule_path.read_text(encoding="utf-8")))
+    if schedule.models != SCIENTIFIC_MODELS or len(schedule.units) != 400:
+        raise V4ExecutionError("V4_AUTHORIZATION_SCOPE_EXPANDED")
+
+
+def _inventory_from_manifest(root: Path, manifest_path: Path) -> tuple[tuple[str, str, str], ...]:
+    manifest = load_json(manifest_path)
+    if set(manifest) != set(AUTHORIZED_RESOURCE_KEYS):
+        raise V4ExecutionError("V4_RESOURCE_INVENTORY_SCHEMA_REQUIRED")
+    rows: list[tuple[str, str, str]] = []
+    for key in AUTHORIZED_RESOURCE_KEYS:
+        value = manifest[key]
+        if isinstance(value, str):
+            path = _resolve_under_root(root, Path(value), must_exist=True)
+            expected_sha = sha256_file(path)
+        elif isinstance(value, Mapping):
+            path = _resolve_under_root(root, Path(str(value.get("path"))), must_exist=True)
+            expected_sha = str(value.get("sha256"))
+            if not _is_sha(expected_sha) or sha256_file(path) != expected_sha:
+                raise V4ExecutionError("V4_RESOURCE_TAMPER")
+        else:
+            raise V4ExecutionError("V4_RESOURCE_INVENTORY_SCHEMA_REQUIRED")
+        rows.append((key, str(path), expected_sha))
+    return tuple(rows)
+
+
+def _authorized_scope() -> dict[str, object]:
+    return {
+        "model_set": list(SCIENTIFIC_MODELS),
+        "dataset": "DTU",
+        "test_scene_ids": list(TEST_SCENE_IDS),
+        "state_ids": list(SCIENTIFIC_STATES),
+        "lighting_states": list(LIGHTING_STATES),
+        "fog_states": list(FOG_STATES),
+        "model_independent_states": 200,
+        "execution_units": 400,
+        "l3_reused_once": True,
+        "fog_model": "Koschmieder",
+        "severity_family": "beta-only",
+        "primary_endpoint": "Pose",
+        "supporting_endpoints": ["Fusion", "F-score"],
+        "authorized_stop_gpu_seconds": GPU_TARGET_SECONDS,
+        "authorized_stop_logical_bytes": BYTE_TARGET,
+        "authorized_stop_allocated_bytes": BYTE_TARGET,
+        "hard_ceiling_gpu_seconds": GPU_CATASTROPHE_SECONDS,
+        "hard_ceiling_logical_bytes": BYTE_CATASTROPHE,
+        "hard_ceiling_allocated_bytes": BYTE_CATASTROPHE,
+        "forbidden": [
+            "UAVLight",
+            "v4.1",
+            "third model",
+            "second corruption family",
+            "seed expansion",
+            "severity expansion",
+            "grid expansion",
+            "automatic fallback",
+            "parallel GPU execution",
+        ],
+        "max_concurrency": 1,
+        "sequential_models": True,
+        "fallback_allowed": False,
+        "device_switch_allowed": False,
+        "retry_allowed": False,
+    }
+
+
+def create_execution_authorization(
+    *,
+    root: Path,
+    receipt_path: Path,
+    resource_inventory_path: Path,
+    run_root: Path,
+    artifact_root: Path,
+    final_evidence_path: Path,
+    output_path: Path,
+) -> dict[str, object]:
+    try:
+        output_path.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        output_path.with_name(output_path.name + ".partial").unlink()
+    except FileNotFoundError:
+        pass
+    resolved_root = root.resolve()
+    receipt = _load_receipt(receipt_path)
+    if receipt.project_commit != IMPLEMENTATION_ANCHOR_COMMIT or receipt.project_tree != IMPLEMENTATION_ANCHOR_TREE:
+        raise V4ExecutionError("V4_AUTHORIZATION_STALE_ANCHOR")
+    _validate_receipt_contract(receipt)
+    if receipt.schedule_sha256 is None:
+        raise V4ExecutionError("V4_AUTHORIZATION_SCHEDULE_REQUIRED")
+    preflight_path = Path(receipt.hardware_preflight_path)
+    if not preflight_path.is_absolute():
+        preflight_path = receipt_path.parent / preflight_path
+    validate_rich_preflight_for_receipt(preflight_path, receipt)
+    _validate_schedule_path(_resolve_under_root(resolved_root, Path(load_json(resource_inventory_path)["scientific_schedule_400"]["path"] if isinstance(load_json(resource_inventory_path).get("scientific_schedule_400"), Mapping) else load_json(resource_inventory_path)["scientific_schedule_400"]), must_exist=True), receipt.schedule_sha256)
+    inventory = _inventory_from_manifest(resolved_root, resource_inventory_path)
+    authorized = V4ExecutionAuthorization(
+        receipt_path=str(receipt_path.resolve()),
+        receipt_sha256=sha256_file(receipt_path),
+        hardware_preflight_path=str(preflight_path.resolve()),
+        hardware_preflight_sha256=sha256_file(preflight_path),
+        implementation_commit=receipt.project_commit,
+        implementation_tree=receipt.project_tree,
+        protocol_id=V4_PROTOCOL_ID,
+        protocol_sha256=V4_PROTOCOL_SHA256,
+        schedule_sha256=receipt.schedule_sha256,
+        resource_inventory=inventory,
+        run_root=str(_resolve_under_root(resolved_root, run_root)),
+        artifact_root=str(_resolve_under_root(resolved_root, artifact_root)),
+        final_evidence_path=str(_resolve_under_root(resolved_root, final_evidence_path)),
+        finalizer=AUTHORIZED_FINALIZER,
+    )
+    payload = authorized.to_dict()
+    _atomic_json(output_path, payload)
+    return {"status": "PASS", "authorization_path": str(output_path), "authorization_sha256": sha256_file(output_path)}
+
+
+def validate_execution_authorization(path: Path) -> dict[str, object]:
+    payload = load_json(path)
+    if payload.get("schema_version") != V4_EXECUTION_AUTHORIZATION_SCHEMA_VERSION:
+        raise V4ExecutionError("V4_AUTHORIZATION_SCHEMA_REQUIRED")
+    expected_sha = payload.get("authorization_sha256")
+    unsigned = {key: value for key, value in payload.items() if key != "authorization_sha256"}
+    if not _is_sha(expected_sha) or _sha_json(unsigned) != expected_sha:
+        raise V4ExecutionError("V4_AUTHORIZATION_TAMPER")
+    if payload.get("implementation_commit") != IMPLEMENTATION_ANCHOR_COMMIT or payload.get("implementation_tree") != IMPLEMENTATION_ANCHOR_TREE:
+        raise V4ExecutionError("V4_AUTHORIZATION_STALE_ANCHOR")
+    if payload.get("protocol_id") != V4_PROTOCOL_ID or payload.get("protocol_sha256") != V4_PROTOCOL_SHA256:
+        raise V4ExecutionError("V4_AUTHORIZATION_PROTOCOL_MISMATCH")
+    scope = payload.get("authorized_scope")
+    if scope != _authorized_scope():
+        raise V4ExecutionError("V4_AUTHORIZATION_SCOPE_EXPANDED")
+    receipt_path = Path(str(payload.get("receipt_path")))
+    receipt = _load_receipt(receipt_path, str(payload.get("receipt_sha256")))
+    if receipt.project_commit != payload.get("implementation_commit") or receipt.project_tree != payload.get("implementation_tree") or receipt.schedule_sha256 != payload.get("schedule_sha256"):
+        raise V4ExecutionError("V4_AUTHORIZATION_RECEIPT_MISMATCH")
+    _validate_receipt_contract(receipt)
+    preflight_path = Path(str(payload.get("hardware_preflight_path")))
+    if sha256_file(preflight_path) != payload.get("hardware_preflight_sha256"):
+        raise V4ExecutionError("V4_GPU_PREFLIGHT_TAMPER")
+    validate_rich_preflight_for_receipt(preflight_path, receipt)
+    for row in payload.get("resource_inventory", ()):
+        if not isinstance(row, Mapping) or row.get("key") not in AUTHORIZED_RESOURCE_KEYS:
+            raise V4ExecutionError("V4_RESOURCE_INVENTORY_SCHEMA_REQUIRED")
+        resource_path = Path(str(row.get("path")))
+        digest = row.get("sha256")
+        if not _is_sha(digest) or sha256_file(resource_path) != digest:
+            raise V4ExecutionError("V4_RESOURCE_TAMPER")
+    if [row.get("key") for row in payload.get("resource_inventory", ())] != list(AUTHORIZED_RESOURCE_KEYS):
+        raise V4ExecutionError("V4_RESOURCE_INVENTORY_SCHEMA_REQUIRED")
+    return {"status": "PASS", "authorization_path": str(path), "authorization_sha256": sha256_file(path)}
