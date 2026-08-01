@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import zlib
 
 import pytest
@@ -454,6 +455,70 @@ def test_materialize_missing_members_uses_expected_set_only_and_is_atomic(
     assert missing.is_file()
     assert not missing.with_name(missing.name + ".partial").exists()
     assert Path(str(result["receipt_path"])).is_file()
+
+
+def test_default_range_materialization_is_bounded_concurrent_and_ordered(
+    tmp_path: Path,
+    states_and_schedule: tuple[list[dict[str, object]], dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _inputs(tmp_path, states_and_schedule)
+    entries = _official_index(paths["root"])
+    missing_members = [
+        _member_path(paths["root"], TEST_SCENE_IDS[0], ORDERED_VIEWS[0], illumination)
+        for illumination in ("L1", "L2", "L4")
+    ]
+    for member in missing_members:
+        member.unlink()
+
+    requested = [
+        member.relative_to(paths["root"]).as_posix() for member in missing_members
+    ]
+    barrier = threading.Barrier(len(requested))
+    observed: list[str] = []
+    observed_lock = threading.Lock()
+
+    def fake_range_extract(
+        _archive: str,
+        _index: object,
+        members: list[str],
+        destination: Path,
+    ) -> dict[str, dict[str, object]]:
+        assert len(members) == 1
+        member = members[0]
+        barrier.wait(timeout=2)
+        output = destination / member
+        output.parent.mkdir(parents=True, exist_ok=True)
+        payload = _png_bytes()
+        output.write_bytes(payload)
+        with observed_lock:
+            observed.append(member)
+        return {
+            member: {
+                "member": member,
+                "raw_sha256": hashlib.sha256(payload).hexdigest(),
+                "disposition": "written",
+            }
+        }
+
+    monkeypatch.setattr(
+        "georeliab_mve.v4_rectified_closure.extract_range_members_evidence",
+        fake_range_extract,
+    )
+    result = materialize_missing_rectified_members(
+        root=paths["root"],
+        expected_set_path=paths["expected_set"],
+        official_rectified_archive="https://example.invalid/Rectified.zip",
+        output_dir=tmp_path / "materialize-concurrent",
+        indexer=lambda _archive: entries,
+    )
+
+    assert result["status"] == "PASS"
+    assert result["materialized_count"] == len(requested)
+    assert result["range_worker_count"] == len(requested)
+    assert sorted(observed) == sorted(requested)
+    assert [row["member"] for row in result["materialized_members"]] == requested
+    assert all(member.is_file() for member in missing_members)
 
 
 def test_public_cpu_only_cli_generates_closure(

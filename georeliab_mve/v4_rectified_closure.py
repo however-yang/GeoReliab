@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -47,6 +48,7 @@ RECTIFIED_ACCEPTANCE_SCHEDULE_UNITS = 400
 RECTIFIED_ACCEPTANCE_NON_L3_LIGHTING_UNITS = 240
 RECTIFIED_ACCEPTANCE_L3_REFERENCE_UNITS = 40
 RECTIFIED_ACCEPTANCE_FOG_UNITS = 120
+RECTIFIED_RANGE_MAX_WORKERS = 16
 REFERENCE_ILLUMINATION_ROLE = {
     "L3": "REFERENCE_EXCLUDED_FROM_RECTIFIED_MEMBER_CLOSURE"
 }
@@ -1514,6 +1516,55 @@ def _validate_existing_against_official_entry(path: Path, entry: object) -> None
         raise V4RectifiedClosureError("V4_RECTIFIED_OFFICIAL_INDEX_INVALID")
 
 
+def _materialize_range_members_concurrently(
+    *,
+    archive: Path | str,
+    index: object,
+    members: Sequence[str],
+    root: Path,
+) -> tuple[list[dict[str, object]], int]:
+    """Extract independent members concurrently while retaining canonical order."""
+
+    if not members:
+        return [], 0
+    worker_count = min(RECTIFIED_RANGE_MAX_WORKERS, len(members))
+
+    def extract_one(member: str) -> dict[str, object]:
+        evidence = extract_range_members_evidence(
+            str(archive),
+            index,  # type: ignore[arg-type]
+            [member],
+            root,
+        )
+        try:
+            return dict(evidence[member])
+        except KeyError as exc:
+            raise V4RectifiedClosureError(
+                "V4_RECTIFIED_MATERIALIZE_EVIDENCE_MISSING"
+            ) from exc
+
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="v4-rectified-range",
+    ) as executor:
+        futures = {member: executor.submit(extract_one, member) for member in members}
+        try:
+            rows = [futures[member].result() for member in members]
+        except Exception:
+            for future in futures.values():
+                future.cancel()
+            raise
+
+    return [
+        {
+            "member": member,
+            "sha256": row.get("raw_sha256"),
+            "disposition": row.get("disposition"),
+        }
+        for member, row in zip(members, rows, strict=True)
+    ], worker_count
+
+
 def materialize_missing_rectified_members(
     *,
     root: Path,
@@ -1553,26 +1604,19 @@ def materialize_missing_rectified_members(
         else:
             missing.append(member)
     materialized: list[dict[str, object]] = []
+    range_worker_count = 0
     if extractor is None:
         try:
-            evidence = extract_range_members_evidence(
-                str(archive),
-                index,  # type: ignore[arg-type]
-                missing,
-                resolved_root,
+            materialized, range_worker_count = _materialize_range_members_concurrently(
+                archive=archive,
+                index=index,
+                members=missing,
+                root=resolved_root,
             )
         except PreparationError as exc:
             raise V4RectifiedClosureError("V4_RECTIFIED_OFFICIAL_MEMBER_HASH_MISMATCH") from exc
-        for member in missing:
-            row = evidence[member]
-            materialized.append(
-                {
-                    "member": member,
-                    "sha256": row.get("raw_sha256"),
-                    "disposition": row.get("disposition"),
-                }
-            )
     else:
+        range_worker_count = 1 if missing else 0
         for member in missing:
             destination = _member_path_under_root(resolved_root, member)
             partial = destination.with_name(destination.name + ".partial")
@@ -1615,6 +1659,7 @@ def materialize_missing_rectified_members(
         "expected_set_sha256": _json_sha(expected_set),
         "missing_count": len(missing),
         "materialized_count": len(materialized),
+        "range_worker_count": range_worker_count,
         "materialized_members": materialized,
     }
     receipt_path = output_dir / MATERIALIZE_RECEIPT_NAME
