@@ -169,3 +169,28 @@ DONE_WITH_CONCERNS
 - No checkpoint/model-forward, protocol/config/split/corruption/metrics/adapters/evidence files were touched.
 - No future commit SHA is hardcoded; runtime resolution uses the current git HEAD/tree or explicit full values.
 - Remaining concern unchanged: broad `tests/test_v4*.py` is still not used as completion evidence because of pre-existing Windows temp/cache/staging ACL failures documented above.
+
+## CUDA Runtime Field-Completeness Fix - 2026-08-01
+
+### Formal dry preflight follow-up
+- A formal dry preflight engineering artifact exposed `cuda_runtime: unknown`; that artifact is superseded as engineering evidence only.
+- The dry preflight did not produce a PASS receipt, authorization, schedule, checkpoint/model forward, or scientific result.
+
+### Changes made
+- `nvidia_smi_hardware_sample` now proves CUDA runtime from a separate read-only `nvidia-smi` banner parse, recording values such as `CUDA Version 13.0` from the host banner.
+- Removed the previous `nvcc --version` fallback and the silent `unknown` write path.
+- CUDA runtime is fail-closed with `V4_GPU_CUDA_RUNTIME_UNPROVEN` when the banner is unavailable or malformed.
+- Snapshot staging now rejects any present sample or device summary whose `cuda_runtime` is empty or `unknown`.
+- External-process failure precedence remains intact when CUDA runtime is available: process enumeration is still proven and active processes still block with `V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS`.
+
+### Commands and exact results
+- `ruff check georeliab_mve\v4_authorization.py tests\test_v4_authorization.py` -> PASS: `All checks passed!`.
+- `python -m py_compile georeliab_mve\v4_authorization.py tests\test_v4_authorization.py` -> PASS.
+- `python -m pytest tests\test_v4_authorization.py -q` -> PASS: `52 passed`, with one pre-existing pytest-asyncio deprecation warning.
+- `git diff --check` -> PASS.
+
+### Self-review
+- No GPU/model/scientific execution was run for this fix.
+- No checkpoint/model-forward, protocol/config/split/corruption/metrics/adapters/evidence files were touched.
+- No permanent cuda index or UUID was hardcoded; tests continue to use injected samplers and dummy immutable SHAs.
+- Remaining concern unchanged: broad `tests/test_v4*.py` is still not used as completion evidence because of pre-existing Windows temp/cache/staging ACL failures documented above.

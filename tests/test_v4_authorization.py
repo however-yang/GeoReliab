@@ -323,17 +323,95 @@ def test_gpu_preflight_omitted_post_probe_fields_fail_without_receipt(tmp_path: 
 
 def test_nvidia_smi_sample_fails_closed_when_process_enumeration_unproven() -> None:
     def runner(command: tuple[str, ...]) -> str:
+        if command == ("nvidia-smi",):
+            return "NVIDIA-SMI 580.65.06    Driver Version: 580.65.06    CUDA Version: 13.0\n"
         query = command[3]
         if query == "--query-gpu=index,uuid,name,memory.total,memory.free,memory.used,utilization.gpu,temperature.gpu,driver_version":
-            return "1, GPU-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, NVIDIA A100 80GB PCIe, 81920 MiB, 80896 MiB, 1024 MiB, 0 %, 31, 555.55\n"
+            return "1, GPU-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, NVIDIA A100 80GB PCIe, 81920, 80896, 1024, 0, 31, 555.55\n"
         if query == "--query-gpu=mig.mode.current,ecc.errors.uncorrected.volatile.total":
             return "Disabled, 0\n"
-        if "--query-compute-apps=pid,process_name,used_memory" in command:
+        if "--query-compute-apps=gpu_uuid,pid,process_name,used_memory" in command:
             raise RuntimeError("nvidia-smi compute process query failed")
         raise AssertionError(command)
 
     with pytest.raises(V4ExecutionError, match="V4_GPU_PROCESS_ENUMERATION_UNPROVEN"):
         nvidia_smi_hardware_sample(1, command_runner=runner)
+
+
+def test_nvidia_smi_sample_extracts_cuda_runtime_from_banner() -> None:
+    def runner(command: tuple[str, ...]) -> str:
+        if command == ("nvidia-smi",):
+            return "| NVIDIA-SMI 580.65.06    Driver Version: 580.65.06    CUDA Version: 13.0 |\n"
+        query = command[3]
+        if query == "--query-gpu=index,uuid,name,memory.total,memory.free,memory.used,utilization.gpu,temperature.gpu,driver_version":
+            return "1, GPU-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, NVIDIA A100 80GB PCIe, 81920, 80896, 1024, 0, 31, 555.55\n"
+        if query == "--query-gpu=mig.mode.current,ecc.errors.uncorrected.volatile.total":
+            return "Disabled, 0\n"
+        if "--query-compute-apps=gpu_uuid,pid,process_name,used_memory" in command:
+            return ""
+        raise AssertionError(command)
+
+    sample = nvidia_smi_hardware_sample(1, command_runner=runner)
+
+    assert sample["cuda_runtime"] == "CUDA Version 13.0"
+
+
+@pytest.mark.parametrize("banner", ["", "NVIDIA-SMI 580.65.06 Driver Version: 580.65.06", "CUDA Version: unknown"])
+def test_nvidia_smi_sample_fails_closed_when_cuda_runtime_unproven(banner: str) -> None:
+    def runner(command: tuple[str, ...]) -> str:
+        if command == ("nvidia-smi",):
+            return banner
+        query = command[3]
+        if query == "--query-gpu=index,uuid,name,memory.total,memory.free,memory.used,utilization.gpu,temperature.gpu,driver_version":
+            return "1, GPU-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, NVIDIA A100 80GB PCIe, 81920, 80896, 1024, 0, 31, 555.55\n"
+        if query == "--query-gpu=mig.mode.current,ecc.errors.uncorrected.volatile.total":
+            return "Disabled, 0\n"
+        if "--query-compute-apps=gpu_uuid,pid,process_name,used_memory" in command:
+            return ""
+        raise AssertionError(command)
+
+    with pytest.raises(V4ExecutionError, match="V4_GPU_CUDA_RUNTIME_UNPROVEN"):
+        nvidia_smi_hardware_sample(1, command_runner=runner)
+
+
+def test_staged_preflight_rejects_unknown_cuda_runtime(tmp_path: Path) -> None:
+    samples = [_sample(cuda_runtime="unknown"), _sample()]
+    probes = [_pass_probe(model_id, 1, samples[-1]) for model_id in SCIENTIFIC_MODELS]
+    target = tmp_path / "hardware.json"
+    payload = {
+        "schema_version": "georeliab-v4-hardware-preflight-1.0",
+        "status": "PASS",
+        "reason_code": "V4_GPU_PREFLIGHT_PASS",
+        "samples": samples,
+        "devices": [{"cuda_runtime": "CUDA Version 13.0"}],
+        "model_environment_probes": probes,
+    }
+
+    with pytest.raises(V4ExecutionError, match="V4_GPU_CUDA_RUNTIME_UNPROVEN"):
+        _atomic_json(target, payload, validator=_validate_preflight_payload)
+
+    assert not target.exists()
+    assert not target.with_name(target.name + ".partial").exists()
+
+
+def test_staged_preflight_rejects_unknown_device_cuda_runtime(tmp_path: Path) -> None:
+    samples = [_sample(), _sample()]
+    probes = [_pass_probe(model_id, 1, samples[-1]) for model_id in SCIENTIFIC_MODELS]
+    target = tmp_path / "hardware.json"
+    payload = {
+        "schema_version": "georeliab-v4-hardware-preflight-1.0",
+        "status": "PASS",
+        "reason_code": "V4_GPU_PREFLIGHT_PASS",
+        "samples": samples,
+        "devices": [{"cuda_runtime": "unknown"}],
+        "model_environment_probes": probes,
+    }
+
+    with pytest.raises(V4ExecutionError, match="V4_GPU_CUDA_RUNTIME_UNPROVEN"):
+        _atomic_json(target, payload, validator=_validate_preflight_payload)
+
+    assert not target.exists()
+    assert not target.with_name(target.name + ".partial").exists()
 
 
 def test_default_torch_probe_independently_binds_frozen_env_and_post_probe(monkeypatch: pytest.MonkeyPatch) -> None:

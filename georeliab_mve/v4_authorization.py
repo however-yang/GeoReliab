@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import platform
 import subprocess
 import time
@@ -142,11 +143,21 @@ def _atomic_json(
             pass
 
 
+def _runtime_proven(value: object) -> bool:
+    return isinstance(value, str) and value.strip() != "" and value.strip().lower() != "unknown"
+
+
 def _validate_preflight_payload(payload: Mapping[str, Any]) -> None:
     if payload.get("schema_version") != V4_HARDWARE_PREFLIGHT_SCHEMA_VERSION:
         raise V4ExecutionError("V4_GPU_PREFLIGHT_SCHEMA_REQUIRED")
     if payload.get("status") not in {"PASS", "FAIL"} or not isinstance(payload.get("reason_code"), str):
         raise V4ExecutionError("V4_GPU_PREFLIGHT_SCHEMA_REQUIRED")
+    for sample in payload.get("samples", ()):
+        if not isinstance(sample, Mapping) or not _runtime_proven(sample.get("cuda_runtime")):
+            raise V4ExecutionError("V4_GPU_CUDA_RUNTIME_UNPROVEN")
+    for device in payload.get("devices", ()):
+        if not isinstance(device, Mapping) or not _runtime_proven(device.get("cuda_runtime")):
+            raise V4ExecutionError("V4_GPU_CUDA_RUNTIME_UNPROVEN")
     if payload.get("status") == "PASS":
         decision = _evaluate_basic(payload.get("samples", ()))
         if decision["status"] != "PASS":
@@ -316,6 +327,25 @@ def _bytes_from_mib(value: str) -> int:
     return _int_from_smi(value) * 1024 * 1024
 
 
+def _cuda_runtime_from_nvidia_smi_banner(text: str) -> str:
+    match = re.search(r"CUDA Version:\s*([0-9]+(?:\.[0-9]+)*)", text)
+    if match is None:
+        raise V4ExecutionError("V4_GPU_CUDA_RUNTIME_UNPROVEN")
+    return f"CUDA Version {match.group(1)}"
+
+
+def _nvidia_smi_cuda_runtime(command_runner: Callable[..., str]) -> str:
+    try:
+        runtime = _cuda_runtime_from_nvidia_smi_banner(command_runner(("nvidia-smi",)))
+    except V4ExecutionError:
+        raise
+    except Exception as exc:
+        raise V4ExecutionError("V4_GPU_CUDA_RUNTIME_UNPROVEN") from exc
+    if not _runtime_proven(runtime):
+        raise V4ExecutionError("V4_GPU_CUDA_RUNTIME_UNPROVEN")
+    return runtime
+
+
 def _process_owner(pid: int) -> str | None:
     if os.name == "nt":
         return None
@@ -373,10 +403,7 @@ def nvidia_smi_hardware_sample(
         2,
         reason_code="V4_GPU_HEALTH_SAMPLE_UNAVAILABLE",
     )
-    try:
-        cuda_runtime = command_runner(("nvcc", "--version")).strip().splitlines()[-1]
-    except Exception:
-        cuda_runtime = "unknown"
+    cuda_runtime = _nvidia_smi_cuda_runtime(command_runner)
     processes: list[dict[str, object]] = []
     try:
         proc_text = command_runner((
