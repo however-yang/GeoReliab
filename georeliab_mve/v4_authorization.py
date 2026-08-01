@@ -423,14 +423,23 @@ def _evaluate_probes(probes: Sequence[Mapping[str, object]], sample: Mapping[str
         if probe.get("torch_cuda_available") is not True or probe.get("torch_device_count") != 1 or probe.get("torch_current_device") != 0:
             return _fail("V4_GPU_TORCH_PROBE_VISIBLE_DEVICE_MISMATCH")
         if (
-            probe.get("mapped_device_uuid") != sample.get("device_uuid")
-            or probe.get("mapped_device_model") != sample.get("device_model")
-            or probe.get("mapped_total_memory_bytes") != sample.get("total_memory_bytes")
-            or probe.get("post_probe_physical_model", sample.get("device_model")) != sample.get("device_model")
-            or probe.get("post_probe_physical_total_memory_bytes", sample.get("total_memory_bytes")) != sample.get("total_memory_bytes")
+            not isinstance(probe.get("mapped_device_uuid"), str)
+            or not isinstance(probe.get("mapped_device_model"), str)
+            or not isinstance(probe.get("mapped_total_memory_bytes"), int)
+            or not isinstance(probe.get("post_probe_physical_model"), str)
+            or not isinstance(probe.get("post_probe_physical_total_memory_bytes"), int)
+            or not isinstance(probe.get("compute_process_count"), int)
+        ):
+            return _fail("V4_GPU_TORCH_PROBE_SCHEMA_REQUIRED")
+        if (
+            probe["mapped_device_uuid"] != sample.get("device_uuid")
+            or probe["mapped_device_model"] != sample.get("device_model")
+            or probe["mapped_total_memory_bytes"] != sample.get("total_memory_bytes")
+            or probe["post_probe_physical_model"] != sample.get("device_model")
+            or probe["post_probe_physical_total_memory_bytes"] != sample.get("total_memory_bytes")
         ):
             return _fail("V4_GPU_TORCH_PROBE_PHYSICAL_DEVICE_MISMATCH")
-        if probe.get("compute_process_count") != 0:
+        if probe["compute_process_count"] != 0:
             return _fail("V4_GPU_TORCH_PROBE_LEFT_PROCESS")
     return {"status": "PASS", "reason_code": "V4_GPU_PREFLIGHT_PASS"}
 

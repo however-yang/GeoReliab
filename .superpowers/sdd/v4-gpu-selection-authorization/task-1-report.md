@@ -73,3 +73,21 @@ DONE_WITH_CONCERNS
 - The reusable preflight API still accepts any explicit nonnegative physical GPU index; the production CLI now forces the operator to pass the index explicitly, so the formal run can use exactly `--requested-index 1` without an implicit default.
 - New tests exercise all six round-1 findings with fail-closed assertions and stale-artifact non-promotion checks.
 - Remaining concern: broad `tests/test_v4*.py` remains unsuitable as completion evidence in this Windows worktree because of pre-existing temp/cache/staging ACL failures documented above; focused authorization and related governance/storage regressions passed.
+
+## Round 2 Fix Addendum - 2026-08-01
+
+### Blocking finding addressed
+- `_evaluate_probes` no longer accepts missing post-probe physical evidence by falling back to the hardware sample. Every PASS probe must explicitly include typed `mapped_device_uuid`, `mapped_device_model`, `mapped_total_memory_bytes`, `post_probe_physical_model`, `post_probe_physical_total_memory_bytes`, and `compute_process_count` fields, and their values must match the sampled physical GPU with zero post-probe compute processes.
+- `_pass_probe` test fixture now includes the explicit post-probe fields, so tests cannot construct PASS snapshots from old/incomplete probe payloads.
+- Added regression coverage where omitted post-probe fields fail with `V4_GPU_TORCH_PROBE_SCHEMA_REQUIRED`, publish only a FAIL snapshot, leave no receipt, and leave no `.partial` artifact.
+- Artifact-specific preflight staged validation continues to call `_evaluate_probes`, so staged PASS preflight artifacts with incomplete probe payloads are rejected before promotion.
+
+### Round 2 commands and exact results
+- `python -m py_compile georeliab_mve\v4_authorization.py tests\test_v4_authorization.py` -> PASS.
+- `python -m pytest tests\test_v4_authorization.py -q` -> PASS: `31 passed`, with one pre-existing pytest-asyncio deprecation warning.
+- `python -m pytest tests\test_v4_execution_governance.py tests\test_storage_audit_refactor.py tests\test_storage_audit_cli_refactor.py tests\test_storage_science_lock_refactor.py -q` -> PASS: `73 passed`, with one pre-existing pytest-asyncio deprecation warning.
+
+### Round 2 self-review
+- No GPU/model/scientific execution was run.
+- No protocol/config/split/corruption/metrics/adapters/evidence files were modified.
+- Remaining concern unchanged: broad `tests/test_v4*.py` is still not used as completion evidence because of pre-existing Windows temp/cache/staging ACL failures documented above.

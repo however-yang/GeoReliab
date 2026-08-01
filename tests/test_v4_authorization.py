@@ -69,6 +69,8 @@ def _pass_probe(model_id: str, index: int, sample: dict[str, object]) -> dict[st
         "mapped_device_uuid": sample["device_uuid"],
         "mapped_device_model": sample["device_model"],
         "mapped_total_memory_bytes": sample["total_memory_bytes"],
+        "post_probe_physical_model": sample["device_model"],
+        "post_probe_physical_total_memory_bytes": sample["total_memory_bytes"],
         "compute_process_count": 0,
     }
 
@@ -223,6 +225,31 @@ def test_gpu_preflight_probe_post_process_fails_without_receipt(tmp_path: Path) 
     assert result["status"] == "FAIL"
     assert result["reason_code"] == "V4_GPU_TORCH_PROBE_LEFT_PROCESS"
     assert not (tmp_path / "v4-execution-receipt.json").exists()
+
+
+def test_gpu_preflight_omitted_post_probe_fields_fail_without_receipt(tmp_path: Path) -> None:
+    def incomplete_probe(model_id: str, index: int, sample: dict[str, object]) -> dict[str, object]:
+        payload = _pass_probe(model_id, index, sample)
+        payload.pop("post_probe_physical_model")
+        payload.pop("post_probe_physical_total_memory_bytes")
+        return payload
+
+    result = create_hardware_preflight(
+        output_path=tmp_path / "hardware.json",
+        requested_physical_index=1,
+        schedule_sha256=SCHEDULE_SHA,
+        sample_interval_seconds=0,
+        sampler=lambda _index: _sample(),
+        sleeper=lambda _seconds: None,
+        probe_runner=incomplete_probe,
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["reason_code"] == "V4_GPU_TORCH_PROBE_SCHEMA_REQUIRED"
+    snapshot = load_json(tmp_path / "hardware.json")
+    assert snapshot["reason_code"] == "V4_GPU_TORCH_PROBE_SCHEMA_REQUIRED"
+    assert not (tmp_path / "v4-execution-receipt.json").exists()
+    assert list(tmp_path.glob("*.partial")) == []
 
 
 def test_nvidia_smi_sample_fails_closed_when_process_enumeration_unproven() -> None:
