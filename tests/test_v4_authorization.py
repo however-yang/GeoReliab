@@ -15,6 +15,7 @@ from georeliab_mve.v4_authorization import (
     V4_EXECUTION_AUTHORIZATION_SCHEMA_VERSION,
     _atomic_json,
     _default_torch_probe,
+    _evaluate_basic,
     _sha_json,
     _validate_authorization_payload,
     _validate_preflight_decision_payload,
@@ -81,12 +82,40 @@ def _pass_probe(model_id: str, index: int, sample: dict[str, object]) -> dict[st
     [
         ((_sample(), _sample(resolved_physical_index=2)), "V4_GPU_INDEX_RESOLUTION_MISMATCH"),
         ((_sample(), _sample(device_uuid="GPU-drift")), "V4_GPU_UUID_DRIFT"),
-        ((_sample(utilization_gpu_percent=99, compute_processes=[{"pid": 123, "owner": "other", "cwd": "/tmp", "cmdline": "python", "used_memory_bytes": 1}]), _sample()), "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS"),
+        (
+            (
+                _sample(
+                    utilization_gpu_percent=99,
+                    compute_processes=[
+                        {
+                            "pid": 123,
+                            "owner": "other",
+                            "cwd": "/tmp",
+                            "cmdline": "python",
+                            "used_memory_bytes": 1,
+                        }
+                    ],
+                ),
+                _sample(
+                    utilization_gpu_percent=99,
+                    compute_processes=[
+                        {
+                            "pid": 123,
+                            "owner": "other",
+                            "cwd": "/tmp",
+                            "cmdline": "python",
+                            "used_memory_bytes": 1,
+                        }
+                    ],
+                ),
+            ),
+            "V4_GPU_NON_GEORELIAB_COMPUTE_PROCESS_PRESENT",
+        ),
         ((_sample(mig_mode="Enabled"), _sample()), "V4_GPU_MIG_ENABLED"),
         ((_sample(free_memory_bytes=15 * 1024 * 1024 * 1024), _sample()), "V4_GPU_FREE_MEMORY_INSUFFICIENT"),
         ((_sample(device_model="NVIDIA A100-SXM4-80GB"), _sample()), "V4_GPU_MODEL_NOT_AUTHORIZED"),
         ((_sample(), _sample(driver_version="556.00")), "V4_GPU_DRIVER_VERSION_DRIFT"),
-        ((_sample(utilization_gpu_percent=1), _sample()), "V4_GPU_UTILIZATION_NONZERO"),
+        ((_sample(utilization_gpu_percent=1), _sample()), "V4_GPU_UNEXPLAINED_ACTIVITY"),
         ((_sample(ecc_health="ERROR"), _sample()), "V4_GPU_HEALTH_ERROR"),
     ],
 )
@@ -176,7 +205,7 @@ def test_external_process_failure_publishes_blocked_decision_only(tmp_path: Path
     )
 
     assert result["status"] == "FAIL"
-    assert result["reason_code"] == "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS"
+    assert result["reason_code"] == "V4_GPU_NON_GEORELIAB_COMPUTE_PROCESS_PRESENT"
     assert output.is_file()
     decision_path = tmp_path / "v4-preflight-decision.json"
     assert result["preflight_decision_path"] == str(decision_path)
@@ -195,12 +224,148 @@ def test_external_process_failure_publishes_blocked_decision_only(tmp_path: Path
     assert decision["hardware_preflight_sha256"] == sha256_file(output)
     assert decision["status"] == "BLOCKED"
     assert decision["terminal_status"] == "BLOCKED"
-    assert decision["reason_code"] == "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS"
-    assert decision["terminal_reason_code"] == "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS"
+    assert decision["reason_code"] == "V4_GPU_NON_GEORELIAB_COMPUTE_PROCESS_PRESENT"
+    assert decision["terminal_reason_code"] == "V4_GPU_NON_GEORELIAB_COMPUTE_PROCESS_PRESENT"
     assert decision["scientific_result"] == "NO_SCIENTIFIC_RESULT"
     for path in stale_owned:
         assert not path.exists()
     assert list(tmp_path.glob("*.partial")) == []
+
+
+def test_missing_active_process_identity_is_fail_closed() -> None:
+    process = {
+        "pid": None,
+        "owner": "smli",
+        "cwd": "/srv/private/smli/GeoReliab",
+        "cmdline": "python -m georeliab_mve",
+    }
+
+    decision = _evaluate_basic(
+        (
+            _sample(compute_processes=[process]),
+            _sample(compute_processes=[process]),
+        )
+    )
+
+    assert decision == {
+        "status": "FAIL",
+        "reason_code": "V4_GPU_ACTIVE_COMPUTE_PROCESS_IDENTITY_INCOMPLETE",
+    }
+
+
+def test_georeliab_residual_process_is_distinct_from_external_process() -> None:
+    process = {
+        "pid": 123,
+        "owner": "smli",
+        "cwd": "/srv/private/smli/GeoReliab",
+        "cmdline": "python -m georeliab_mve.v4_execution",
+    }
+
+    decision = _evaluate_basic(
+        (
+            _sample(compute_processes=[process]),
+            _sample(compute_processes=[process]),
+        )
+    )
+
+    assert decision == {
+        "status": "FAIL",
+        "reason_code": "V4_GPU_GEORELIAB_RESIDUAL_COMPUTE_PROCESS_PRESENT",
+    }
+
+
+def test_active_compute_process_set_instability_is_fail_closed() -> None:
+    first = {
+        "pid": 123,
+        "owner": "smli",
+        "cwd": "/srv/private/smli/GeoReliab",
+        "cmdline": "python -m georeliab_mve.v4_execution",
+    }
+    second = {**first, "pid": 124}
+
+    decision = _evaluate_basic(
+        (
+            _sample(compute_processes=[first]),
+            _sample(compute_processes=[second]),
+        )
+    )
+
+    assert decision == {
+        "status": "FAIL",
+        "reason_code": "V4_GPU_ACTIVE_COMPUTE_PROCESS_STATE_UNSTABLE",
+    }
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "compute_processes", "compute_process_count"),
+    [
+        (
+            "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+            [
+                {
+                    "pid": 123,
+                    "owner": "other",
+                    "cwd": "/tmp",
+                    "cmdline": "python",
+                }
+            ],
+            1,
+        ),
+        ("V4_GPU_NON_GEORELIAB_COMPUTE_PROCESS_PRESENT", [], 0),
+    ],
+)
+def test_preflight_validation_rejects_reason_count_contradiction(
+    reason_code: str,
+    compute_processes: list[dict[str, object]],
+    compute_process_count: int,
+) -> None:
+    samples = [
+        _sample(compute_processes=compute_processes),
+        _sample(compute_processes=compute_processes),
+    ]
+    payload = {
+        "schema_version": "georeliab-v4-hardware-preflight-1.0",
+        "status": "FAIL",
+        "reason_code": reason_code,
+        "compute_process_count": compute_process_count,
+        "samples": samples,
+        "devices": [
+            {
+                "cuda_runtime": "CUDA Version 12.4",
+                "driver_version": "555.55",
+                "compute_process_count": compute_process_count,
+            }
+        ],
+    }
+
+    with pytest.raises(
+        V4ExecutionError,
+        match="V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION",
+    ):
+        _validate_preflight_payload(payload)
+
+
+def test_preflight_validation_forbids_legacy_inverted_reason_for_new_evidence() -> None:
+    payload = {
+        "schema_version": "georeliab-v4-hardware-preflight-1.0",
+        "status": "FAIL",
+        "reason_code": "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+        "compute_process_count": 0,
+        "samples": [_sample(), _sample()],
+        "devices": [
+            {
+                "cuda_runtime": "CUDA Version 12.4",
+                "driver_version": "555.55",
+                "compute_process_count": 0,
+            }
+        ],
+    }
+
+    with pytest.raises(
+        V4ExecutionError,
+        match="V4_GPU_LEGACY_INVERTED_REASON_FORBIDDEN",
+    ):
+        _validate_preflight_payload(payload)
 
 
 def test_failed_preflight_rerun_removes_old_pass_receipt(tmp_path: Path) -> None:

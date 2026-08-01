@@ -61,6 +61,20 @@ AUTHORIZED_RESOURCE_KEYS = (
     "scientific_schedule_400",
     "environment_locks",
 )
+PROCESS_PRESENT_REASON_CODES = frozenset(
+    {
+        "V4_GPU_NON_GEORELIAB_COMPUTE_PROCESS_PRESENT",
+        "V4_GPU_GEORELIAB_RESIDUAL_COMPUTE_PROCESS_PRESENT",
+        "V4_GPU_ACTIVE_COMPUTE_PROCESS_IDENTITY_INCOMPLETE",
+        "V4_GPU_ACTIVE_COMPUTE_PROCESS_STATE_UNSTABLE",
+    }
+)
+NO_ACTIVE_PROCESS_REASON_CODES = frozenset(
+    {"V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS"}
+)
+PROCESS_EVIDENCE_REASON_CODES = PROCESS_PRESENT_REASON_CODES | frozenset(
+    {"V4_GPU_UNEXPLAINED_ACTIVITY"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +181,7 @@ def _validate_preflight_payload(payload: Mapping[str, Any]) -> None:
             raise V4ExecutionError("V4_GPU_CUDA_RUNTIME_UNPROVEN")
         if not _driver_proven(device.get("driver_version")):
             raise V4ExecutionError("V4_GPU_DRIVER_VERSION_UNPROVEN")
+    _validate_evidence_reason_consistency(payload)
     if payload.get("status") == "PASS":
         decision = _evaluate_basic(payload.get("samples", ()))
         if decision["status"] != "PASS":
@@ -246,6 +261,7 @@ def _validate_preflight_decision_payload(
         raise V4ExecutionError("V4_PREFLIGHT_DECISION_SNAPSHOT_MISMATCH")
     if snapshot.get("run_id") != run_id:
         raise V4ExecutionError("V4_PREFLIGHT_DECISION_RUN_MISMATCH")
+    _validate_evidence_reason_consistency(snapshot)
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -497,6 +513,122 @@ def _fail(reason_code: str, **extra: object) -> dict[str, object]:
     return {"status": "FAIL", "reason_code": reason_code, **extra}
 
 
+def _active_process_identity(
+    process: Mapping[str, object],
+) -> tuple[int, str, str] | None:
+    pid = process.get("pid")
+    owner = process.get("owner")
+    cmdline = process.get("cmdline")
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(owner, str)
+        or not owner.strip()
+        or not isinstance(cmdline, str)
+        or not cmdline.strip()
+    ):
+        return None
+    return pid, owner.strip(), cmdline.strip()
+
+
+def _is_georeliab_process(process: Mapping[str, object]) -> bool:
+    provenance = " ".join(
+        str(process.get(key) or "")
+        for key in ("process_name", "cwd", "cmdline")
+    ).lower()
+    return "georeliab" in provenance
+
+
+def _classify_active_compute_processes(
+    samples: Sequence[Mapping[str, object]],
+) -> str | None:
+    process_rows: list[list[Mapping[str, object]]] = []
+    for sample in samples:
+        raw_processes = sample.get("compute_processes", ())
+        if not isinstance(raw_processes, Sequence) or isinstance(
+            raw_processes, (str, bytes)
+        ):
+            return "V4_GPU_ACTIVE_COMPUTE_PROCESS_IDENTITY_INCOMPLETE"
+        rows: list[Mapping[str, object]] = []
+        for process in raw_processes:
+            if not isinstance(process, Mapping):
+                return "V4_GPU_ACTIVE_COMPUTE_PROCESS_IDENTITY_INCOMPLETE"
+            rows.append(process)
+            if _active_process_identity(process) is None:
+                return "V4_GPU_ACTIVE_COMPUTE_PROCESS_IDENTITY_INCOMPLETE"
+        process_rows.append(rows)
+
+    if not any(process_rows):
+        if any(sample.get("utilization_gpu_percent") != 0 for sample in samples):
+            return "V4_GPU_UNEXPLAINED_ACTIVITY"
+        return None
+
+    identity_sets = [
+        {_active_process_identity(process) for process in rows}
+        for rows in process_rows
+    ]
+    if any(identities != identity_sets[0] for identities in identity_sets[1:]):
+        return "V4_GPU_ACTIVE_COMPUTE_PROCESS_STATE_UNSTABLE"
+    if any(
+        not _is_georeliab_process(process)
+        for rows in process_rows
+        for process in rows
+    ):
+        return "V4_GPU_NON_GEORELIAB_COMPUTE_PROCESS_PRESENT"
+    return "V4_GPU_GEORELIAB_RESIDUAL_COMPUTE_PROCESS_PRESENT"
+
+
+def _validate_evidence_reason_consistency(payload: Mapping[str, Any]) -> None:
+    samples = payload.get("samples", ())
+    if not isinstance(samples, Sequence) or isinstance(samples, (str, bytes)):
+        raise V4ExecutionError("V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION")
+    if not samples:
+        if payload.get("reason_code") in (
+            PROCESS_PRESENT_REASON_CODES | NO_ACTIVE_PROCESS_REASON_CODES
+        ):
+            raise V4ExecutionError("V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION")
+        return
+    if any(not isinstance(sample, Mapping) for sample in samples):
+        raise V4ExecutionError("V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION")
+
+    observed_count = max(
+        len(sample.get("compute_processes", ())) for sample in samples
+    )
+    declared_count = payload.get("compute_process_count")
+    if declared_count is not None and (
+        not isinstance(declared_count, int)
+        or isinstance(declared_count, bool)
+        or declared_count != observed_count
+    ):
+        raise V4ExecutionError("V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION")
+    for device in payload.get("devices", ()):
+        if (
+            isinstance(device, Mapping)
+            and "compute_process_count" in device
+            and device.get("compute_process_count") != observed_count
+        ):
+            raise V4ExecutionError("V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION")
+
+    reason_code = payload.get("reason_code")
+    if (
+        reason_code in (PROCESS_PRESENT_REASON_CODES | NO_ACTIVE_PROCESS_REASON_CODES)
+        and declared_count is None
+    ):
+        raise V4ExecutionError("V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION")
+    if reason_code in PROCESS_PRESENT_REASON_CODES and observed_count == 0:
+        raise V4ExecutionError("V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION")
+    if reason_code in NO_ACTIVE_PROCESS_REASON_CODES and observed_count > 0:
+        raise V4ExecutionError("V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION")
+    expected_reason = _classify_active_compute_processes(samples)
+    if expected_reason is not None and reason_code != expected_reason:
+        raise V4ExecutionError("V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION")
+    if expected_reason is None and reason_code in PROCESS_EVIDENCE_REASON_CODES:
+        raise V4ExecutionError("V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION")
+    if reason_code in NO_ACTIVE_PROCESS_REASON_CODES:
+        raise V4ExecutionError("V4_GPU_LEGACY_INVERTED_REASON_FORBIDDEN")
+
+
 def _evaluate_basic(samples: Sequence[Mapping[str, object]]) -> dict[str, object]:
     if len(samples) != 2:
         return _fail("V4_GPU_PREFLIGHT_TWO_SAMPLES_REQUIRED")
@@ -514,12 +646,11 @@ def _evaluate_basic(samples: Sequence[Mapping[str, object]]) -> dict[str, object
             return _fail("V4_GPU_MIG_ENABLED")
         if str(sample.get("ecc_health")).upper() not in {"OK", "PASS", "NONE", "0"}:
             return _fail("V4_GPU_HEALTH_ERROR")
-        if len(sample.get("compute_processes", ())) != 0:
-            return _fail("V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS")
         if not isinstance(sample.get("free_memory_bytes"), int) or int(sample["free_memory_bytes"]) < MIN_FREE_MEMORY_BYTES:
             return _fail("V4_GPU_FREE_MEMORY_INSUFFICIENT")
-        if sample.get("utilization_gpu_percent") != 0:
-            return _fail("V4_GPU_UTILIZATION_NONZERO")
+    active_process_reason = _classify_active_compute_processes(samples)
+    if active_process_reason is not None:
+        return _fail(active_process_reason)
     for key, reason in (("resolved_physical_index", "V4_GPU_INDEX_DRIFT"), ("device_uuid", "V4_GPU_UUID_DRIFT"), ("device_model", "V4_GPU_MODEL_DRIFT"), ("driver_version", "V4_GPU_DRIVER_VERSION_DRIFT")):
         if first.get(key) != second.get(key):
             return _fail(reason)
@@ -664,6 +795,10 @@ def create_hardware_preflight(
         except Exception as exc:
             decision = _fail("V4_GPU_TORCH_PROBE_FAILED", error=str(exc))
     selected = samples[-1] if samples else {}
+    evidence_process_count = max(
+        (len(sample.get("compute_processes", ())) for sample in samples),
+        default=0,
+    )
     receipt_path = output_path.with_name("v4-execution-receipt.json")
     if decision["status"] != "PASS":
         _remove_owned_preflight_siblings(output_path)
@@ -682,7 +817,7 @@ def create_hardware_preflight(
         "resolved_physical_index": selected.get("resolved_physical_index"),
         "sample_interval_seconds": float(sample_interval_seconds),
         "visible_gpu_count": 1 if decision["status"] == "PASS" else 0,
-        "compute_process_count": len(selected.get("compute_processes", ())) if selected else 0,
+        "compute_process_count": evidence_process_count,
         "stable_sample_count": len(samples),
         "environment": {"CUDA_VISIBLE_DEVICES": str(requested_physical_index), "GEORELIAB_PHYSICAL_GPU_DEVICE": f"cuda:{requested_physical_index}"},
         "devices": [{
@@ -698,7 +833,7 @@ def create_hardware_preflight(
             "cuda_runtime": selected.get("cuda_runtime"),
             "mig_mode": selected.get("mig_mode"),
             "ecc_health": selected.get("ecc_health"),
-            "compute_process_count": len(selected.get("compute_processes", ())) if selected else 0,
+            "compute_process_count": evidence_process_count,
         }] if selected else [],
         "samples": [{"sample_index": index, **sample} for index, sample in enumerate(samples)],
         "model_environment_probes": probes,

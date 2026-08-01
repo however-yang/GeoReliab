@@ -1,0 +1,51 @@
+{
+  "schema_version": "georeliab-v4-gpu-evidence-erratum-1.0",
+  "status": "IMMUTABLE_ERRATUM",
+  "attempt_id": "attempt-01",
+  "original_authorization_commit": "fa9a784c449303de0bb4ba67db92d0fbd418e10b",
+  "original_authorization_tree": "4c2c3bf2cdc0a72d5f3124eafe907bc02b0f412d",
+  "original_observation_started_at_utc": "2026-08-01T10:53:16Z",
+  "original_observation_completed_at_utc": "2026-08-01T10:53:22Z",
+  "original_hardware_snapshot": {
+    "path": "../fa9a784c449303de0bb4ba67db92d0fbd418e10b/v4-hardware-preflight.json",
+    "sha256": "5a6f73b1de3015db153ced3e91145604a19eb73443e3fe51c045ec010ae3521f"
+  },
+  "original_blocked_decision": {
+    "path": "../fa9a784c449303de0bb4ba67db92d0fbd418e10b/v4-preflight-decision.json",
+    "sha256": "cdfecf40bafd86110f29a745ae4f50ec85827d1c1ecdba0ca900ac7b8a9a5e26"
+  },
+  "erroneous_fields": [
+    {
+      "artifact": "v4-hardware-preflight.json",
+      "field": "reason_code",
+      "erroneous_value": "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+      "corrected_value": "V4_GPU_NON_GEORELIAB_COMPUTE_PROCESS_PRESENT"
+    },
+    {
+      "artifact": "v4-preflight-decision.json",
+      "field": "reason_code",
+      "erroneous_value": "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+      "corrected_value": "V4_GPU_NON_GEORELIAB_COMPUTE_PROCESS_PRESENT"
+    },
+    {
+      "artifact": "v4-preflight-decision.json",
+      "field": "terminal_reason_code",
+      "erroneous_value": "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+      "corrected_value": "V4_GPU_NON_GEORELIAB_COMPUTE_PROCESS_PRESENT"
+    }
+  ],
+  "basis": {
+    "compute_process_count": 1,
+    "stable_sample_count": 2,
+    "observed_pid": 1573318,
+    "observed_owner": "smli",
+    "observed_cmdline_contains_georeliab": false,
+    "scientific_result": "NO_SCIENTIFIC_RESULT"
+  },
+  "supersede_relationship": {
+    "original_decision_status": "SUPERSEDED_INTEGRITY_PRESERVED_HISTORY",
+    "original_decision_path": "../fa9a784c449303de0bb4ba67db92d0fbd418e10b/v4-preflight-decision.json",
+    "corrected_canonical_decision_path": "v4-preflight-decision.corrected.json"
+  },
+  "original_evidence_mutated": false
+}

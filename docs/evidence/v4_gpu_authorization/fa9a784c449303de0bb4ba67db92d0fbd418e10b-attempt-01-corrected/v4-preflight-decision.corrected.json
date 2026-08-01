@@ -1,0 +1,31 @@
+{
+  "schema_version": "georeliab-v4-preflight-decision-correction-1.0",
+  "correction_status": "CORRECTED_CANONICAL",
+  "attempt_id": "attempt-01",
+  "implementation_commit": "7381e60050143a78fca6a3ebde5706ae27d2c145",
+  "implementation_tree": "f4e2b1104496c817693aaa5989d0276d2ebe03e9",
+  "authorization_commit": "fa9a784c449303de0bb4ba67db92d0fbd418e10b",
+  "authorization_tree": "4c2c3bf2cdc0a72d5f3124eafe907bc02b0f412d",
+  "run_id": "a21d577d0ba64ca297438d94c6201bfc",
+  "requested_physical_index": 1,
+  "hardware_preflight_path": "../fa9a784c449303de0bb4ba67db92d0fbd418e10b/v4-hardware-preflight.json",
+  "hardware_preflight_sha256": "5a6f73b1de3015db153ced3e91145604a19eb73443e3fe51c045ec010ae3521f",
+  "original_blocked_decision_path": "../fa9a784c449303de0bb4ba67db92d0fbd418e10b/v4-preflight-decision.json",
+  "original_blocked_decision_sha256": "cdfecf40bafd86110f29a745ae4f50ec85827d1c1ecdba0ca900ac7b8a9a5e26",
+  "erratum_path": "erratum.json",
+  "status": "BLOCKED",
+  "reason_code": "V4_GPU_NON_GEORELIAB_COMPUTE_PROCESS_PRESENT",
+  "terminal_status": "BLOCKED",
+  "terminal_reason_code": "V4_GPU_NON_GEORELIAB_COMPUTE_PROCESS_PRESENT",
+  "scientific_result": "NO_SCIENTIFIC_RESULT",
+  "gpu_budget_consumed_seconds": 0,
+  "gpu_inference_count": 0,
+  "pass_receipt": null,
+  "execution_authorization": null,
+  "scientific_schedule": null,
+  "supersedes": {
+    "path": "../fa9a784c449303de0bb4ba67db92d0fbd418e10b/v4-preflight-decision.json",
+    "sha256": "cdfecf40bafd86110f29a745ae4f50ec85827d1c1ecdba0ca900ac7b8a9a5e26",
+    "preserve_original_bytes": true
+  }
+}
