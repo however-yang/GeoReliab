@@ -1,0 +1,68 @@
+{
+  "schema_version": "georeliab-v4-authorization-audit-1.0",
+  "terminal_status": "GPU_SELECTION_BLOCKED_WITH_REASON=V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+  "scientific_result": "NO_SCIENTIFIC_RESULT",
+  "implementation_anchor": {
+    "branch": "codex/v4-ranking-warning",
+    "commit": "7381e60050143a78fca6a3ebde5706ae27d2c145",
+    "tree": "f4e2b1104496c817693aaa5989d0276d2ebe03e9",
+    "draft_pr": "Cycsics/GeoReliab#1",
+    "protocol_status": "IMPLEMENTATION_ONLY"
+  },
+  "authorization_revision": {
+    "branch": "codex/v4-gpu-selection-authorization",
+    "commit": "5d862c87e8e5c391ed1b53280b0dd9ffd8236bdf",
+    "tree": "c08f947a12d4fcbd2b09d92c4c032a4a9ffa813a"
+  },
+  "candidate_gpu": {
+    "requested_physical_index": 1,
+    "resolved_physical_index": 1,
+    "uuid": "GPU-c1c4c0d5-5b39-9b0e-84a0-a667e65484fa",
+    "model": "NVIDIA A100 80GB PCIe",
+    "driver_version": "580.95.05",
+    "cuda_runtime": "CUDA Version 13.0",
+    "mig_mode": "Disabled",
+    "total_memory_bytes": 85899345920,
+    "free_memory_bytes": 77820067840,
+    "sample_utilization_percent": [85, 100],
+    "sample_timestamps_utc": [
+      "2026-08-01T10:27:33Z",
+      "2026-08-01T10:27:39Z"
+    ]
+  },
+  "blocking_process": {
+    "pid": 1573318,
+    "owner": "smli",
+    "project": "SURE-3D",
+    "cwd": "/srv/private/smli/worktrees/sddm-v3-teacher-pilot",
+    "used_memory_bytes": 7251951616
+  },
+  "artifacts": {
+    "hardware_preflight": {
+      "path": "/srv/private/smli/GeoReliab/artifacts/v4-authorization/5d862c87e8e5c391ed1b53280b0dd9ffd8236bdf/v4-hardware-preflight.json",
+      "sha256": "ad687f5f6c411f13bcb1161a9e01f76c372f0632e74ff0bd95011d3ee8040b4d"
+    },
+    "blocked_decision": {
+      "path": "/srv/private/smli/GeoReliab/artifacts/v4-authorization/5d862c87e8e5c391ed1b53280b0dd9ffd8236bdf/v4-preflight-decision.json",
+      "sha256": "b268112177eb7cfab3af6eb607cce1b8109c4431393d5fff750771e598deaccc"
+    },
+    "pass_receipt_count": 0,
+    "execution_authorization_count": 0,
+    "scientific_schedule_count": 0,
+    "scientific_artifact_count": 0,
+    "model_environment_probe_count": 0
+  },
+  "no_execution_proof": {
+    "stage_inventory_file_count_before": 31,
+    "stage_inventory_file_count_after": 31,
+    "stage_inventory_sha256_before": "e71d4f229ba3f3f1b63cfa0831ff5b540e9c993a229300b409e8a8c940f50147",
+    "stage_inventory_sha256_after": "e71d4f229ba3f3f1b63cfa0831ff5b540e9c993a229300b409e8a8c940f50147",
+    "gpu_inference_budget_consumed_seconds": 0,
+    "model_forward_count": 0
+  },
+  "superseded_engineering_preflight": {
+    "authorization_commit": "5aa81f26cfc4f96fce507cfe9ef901d4353617d6",
+    "reason": "cuda_runtime was not proven and was recorded as unknown",
+    "admitted_as_terminal_evidence": false
+  }
+}
