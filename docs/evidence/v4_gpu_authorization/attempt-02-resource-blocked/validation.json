@@ -1,0 +1,24 @@
+{
+  "bash_syntax_linux": "PASS",
+  "focused_attempt02_authorization_storage": {
+    "passed": 163,
+    "status": "PASS"
+  },
+  "full_pytest_linux": {
+    "collected": 572,
+    "failed": 10,
+    "passed": 559,
+    "skipped": 3,
+    "status": "PRE_EXISTING_FAILURES",
+    "summary": "The first run was invalidated by shared /tmp prefix collisions. A fresh dedicated basetemp eliminated setup errors; remaining failures are in unchanged legacy audit/preparation/adapter tests."
+  },
+  "git_diff_check": "PASS",
+  "observed_at_utc": "2026-08-01T15:19:41Z",
+  "py_compile": "PASS",
+  "ruff": {
+    "existing_errors": 51,
+    "python_files_changed": 0,
+    "status": "PRE_EXISTING_FAILURES"
+  },
+  "science_lock_and_config_diff": "ZERO_DIFF"
+}

@@ -1,0 +1,126 @@
+{
+  "archive_identity": {
+    "bytes": 129593443783,
+    "central_directory_sha256": "ba030282d52301aac01b70d1ce416adbc8eee19bdc8ee869fe0c892f26df59af",
+    "etag": "1e2c5f05c7-5652dcf644cb3",
+    "member_count": 54373,
+    "name": "Rectified.zip",
+    "url": "https://roboimagedata2.compute.dtu.dk/data/MVS/Rectified.zip"
+  },
+  "attempt_id": "attempt-02",
+  "attempt_root_audit": {
+    "partial_present_after": false,
+    "partial_present_before": false,
+    "path": "/srv/private/smli/GeoReliab/authorization-attempts/attempt-02",
+    "present_after": false,
+    "present_before": false
+  },
+  "base_resource_storage_prediction": {
+    "authorization_budget_bytes_exclusive": 150000000000,
+    "cross_filesystem_copy_allocated_bytes": 7781552128,
+    "generated_evidence_reserve_bytes": 100000000,
+    "logical_source_bytes": 21654250291,
+    "predicted_added_allocated_bytes_before_rectified_members": 7881552128,
+    "predicted_added_logical_bytes_before_rectified_members": 21754250291,
+    "rectified_selected_member_bytes": null,
+    "status": "INCOMPLETE_FAIL_CLOSED",
+    "why_incomplete": "The deleted canonical sparse index was the only local source of the missing selected-member offsets and sizes."
+  },
+  "canonical_sources": {
+    "a100_overlay_sha256": "c65ef97684adeda6b1bba8d8c152eb559df44367bc35973f549d7e8049136011",
+    "frozen_materialization_sha256": "d9db4739d1a727462c97102052025733a464b61e3e8555c82fb94ed33a78ac24",
+    "mast3r_config_sha256": "718eb93dc4f9e4332b60cc0041af962d712cbd346d7770ce35c5b22cff68eae4",
+    "mast3r_environment_lock_sha256": "c9f8fcf6e9f754ab3a9aa3959ec19fb4bf153a2b46814735dba7954d9d226c47",
+    "mast3r_weights_sha256": "0a615eb05fa9db654050aa655945ee5696e7c6c1b7f93f1ee8c37249010f6feb",
+    "points_sha256": "85862c8844978e8958040982b0071442d2a47fe67391aa1aca9a743153c9edc1",
+    "sample_set_sha256": "f719a5259db9257c4716ce014964444c1bb82fbb893e0d100b5fa01b82c029c7",
+    "science_lock_sha256": "3765955b255e12fb91eaabf7b91d8a5cb975cbc3afccdd5d20f8038594b74fcd",
+    "split_view_manifest_sha256": "c7aeaae02262ee98965ecd29e97ab77940c40d66b18536d55c27e6182a8b43dc",
+    "vggt_environment_lock_sha256": "a67cb88ce699243fc8ea0bc7536c05e3be0b1aec1d1db0fb89c2d5ee2737d47e",
+    "vggt_weights_sha256": "d15bf50a8615c8225ed48b51ea5cac673d82442ec0309036df555a053253afe0"
+  },
+  "gpu_inference_ledger_audit": {
+    "delta": 0,
+    "new_attempt_ledger_created": false,
+    "observed_existing_ledgers": [
+      {
+        "path": "engineering-failures/41d3197d4b41242b5c4c34ba962c81621efbbd86/preflight-real/repeat-a/stage/preflight/ledger.jsonl",
+        "sha256": "a657c447e6e0fc4b79d6ef3a72205e80522ad632284c8c7c219c8de7e7588258"
+      },
+      {
+        "path": "engineering-failures/41d3197d4b41242b5c4c34ba962c81621efbbd86/preflight-real/repeat-b/stage/preflight/ledger.jsonl",
+        "sha256": "1d94685b372bfb52c8db7f9f375746d435e981e22c4d796df2d14f6d66a00f0f"
+      },
+      {
+        "path": "preflight-real/repeat-a/stage/preflight/ledger.jsonl",
+        "sha256": "054a436f987ad742f6485bfc18da19134b78ca7d6b9da0c7c680f3f6aa086f8d"
+      },
+      {
+        "path": "preflight-real/repeat-b/stage/preflight/ledger.jsonl",
+        "sha256": "67c7b26c57b8d2655157454584f20a774c2f42eb41ad9df33f5dea62c91b4717"
+      }
+    ]
+  },
+  "network_attempts": [
+    {
+      "client_elapsed_seconds": 304.0,
+      "outcome": "CLIENT_TIMEOUT_NO_INDEX",
+      "request_kind": "validated Rectified central-directory index",
+      "sequence": 1
+    },
+    {
+      "client_elapsed_seconds": 588.9,
+      "outcome": "TERMINATED_NO_INDEX",
+      "request_kind": "validated Rectified central-directory index",
+      "sequence": 2
+    }
+  ],
+  "network_retry_policy": {
+    "member_range_requests_after_offline_fallback": 0,
+    "third_central_directory_attempt_made": false
+  },
+  "prohibited_execution_audit": {
+    "authorization_created": false,
+    "checkpoint_loads": 0,
+    "gpu_preflight_invocations": 0,
+    "mapping_probe_invocations": 0,
+    "metrics_created": false,
+    "model_forward_invocations": 0,
+    "model_instantiations": 0,
+    "receipt_created": false,
+    "scientific_artifacts_created": false,
+    "torch_imports": 0
+  },
+  "reason": "V4_RESOURCE_RECTIFIED_MEMBER_CLOSURE_UNAVAILABLE",
+  "required_inventory": {
+    "existing_selected_l3_members": 160,
+    "lighting_states": 7,
+    "missing_selected_members": 960,
+    "ordered_views": 8,
+    "required_selected_members": 1120,
+    "required_state_count": 200,
+    "required_unit_count": 400,
+    "test_scenes": 20
+  },
+  "retention_evidence": {
+    "action": "delete_verified_sparse_index",
+    "action_receipt_path": "/srv/private/smli/GeoReliab/artifacts/storage-retention/actions/000003-56746f2b047b8132.json",
+    "action_receipt_sha256": "92064463ea3c3ff03dbd310bb6753ca5b82a89ac869ba1bd4ec93e5dcde2d59c",
+    "deleted_sparse_index_path": "/srv/private/smli/GeoReliab/cache/Rectified.sparse-index.zip",
+    "deleted_sparse_index_sha256": "9395b91456cc40f85806109738d8f39660744c39f7977c258ccccc851ed7c70f",
+    "status": "PASS"
+  },
+  "rejected_pytest_fixtures": {
+    "count": 2,
+    "reason": "Each file is only 17 bytes, does not match the canonical sparse-index SHA-256, and is under a forbidden pytest path.",
+    "sha256": "d04fd59f3d9a1fd424c47874ae1dab0dde54fa73ba474245bfac79279afe6df7",
+    "size_bytes_each": 17
+  },
+  "scientific_result": null,
+  "tooling": {
+    "commit": "982997038a0c9db19b9d1eb38910df82e3661e39",
+    "detached_remote_worktree": "/srv/private/smli/GeoReliab/worktrees/982997038a0c9db19b9d1eb38910df82e3661e39",
+    "remote_worktree_clean_after": true,
+    "tree": "7e69bf6f7167430ad3921bc2f4a73b6d9354d9ce"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "attempt_id": "attempt-02",
+  "files": [
+    {
+      "path": "docs/evidence/v4_gpu_authorization/attempt-02-resource-blocked/README.md",
+      "sha256": "c00109df63a5035c507f884ba5693778f8293ff45887d10bc13062ee46ca376f"
+    },
+    {
+      "path": "docs/evidence/v4_gpu_authorization/attempt-02-resource-blocked/audit.json",
+      "sha256": "8edf22963c17d5db81bb07bd9cbf9345e5c49570537d9f5c74a408463fd8f0c7"
+    },
+    {
+      "path": "docs/evidence/v4_gpu_authorization/attempt-02-resource-blocked/resource-blocker.json",
+      "sha256": "425f4fc63f96d67a1511742bb2ccaba1da34bd7d1e79b542e39193ac12fd102c"
+    },
+    {
+      "path": "docs/evidence/v4_gpu_authorization/attempt-02-resource-blocked/validation.json",
+      "sha256": "db44d5290dbcfd11e0fecc93c0cd698f7d09f516105652252ea84b3fd6daccfa"
+    }
+  ],
+  "host": "a100-smli",
+  "observed_at_utc": "2026-08-01T15:19:41Z",
+  "reason": "V4_RESOURCE_RECTIFIED_MEMBER_CLOSURE_UNAVAILABLE"
+}
