@@ -232,6 +232,43 @@ def test_external_process_failure_publishes_blocked_decision_only(tmp_path: Path
     assert list(tmp_path.glob("*.partial")) == []
 
 
+def test_external_process_reason_precedes_low_memory_and_publishes(
+    tmp_path: Path,
+) -> None:
+    process = {
+        "pid": 123,
+        "owner": "other",
+        "cwd": "/tmp",
+        "cmdline": "python",
+        "used_memory_bytes": 1,
+    }
+    output = tmp_path / "hardware.json"
+
+    result = create_hardware_preflight(
+        output_path=output,
+        requested_physical_index=1,
+        schedule_sha256=SCHEDULE_SHA,
+        authorization_commit=AUTHORIZATION_COMMIT,
+        authorization_tree=AUTHORIZATION_TREE,
+        sample_interval_seconds=5.0,
+        sampler=lambda _index: _sample(
+            free_memory_bytes=15 * 1024 * 1024 * 1024,
+            compute_processes=[process],
+        ),
+        sleeper=lambda _seconds: None,
+        probe_runner=_pass_probe,
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["reason_code"] == "V4_GPU_NON_GEORELIAB_COMPUTE_PROCESS_PRESENT"
+    snapshot = load_json(output)
+    assert snapshot["reason_code"] == "V4_GPU_NON_GEORELIAB_COMPUTE_PROCESS_PRESENT"
+    assert snapshot["compute_process_count"] == 1
+    decision = load_json(tmp_path / "v4-preflight-decision.json")
+    assert decision["status"] == "BLOCKED"
+    assert decision["reason_code"] == "V4_GPU_NON_GEORELIAB_COMPUTE_PROCESS_PRESENT"
+
+
 def test_missing_active_process_identity_is_fail_closed() -> None:
     process = {
         "pid": None,
@@ -364,6 +401,32 @@ def test_preflight_validation_forbids_legacy_inverted_reason_for_new_evidence() 
     with pytest.raises(
         V4ExecutionError,
         match="V4_GPU_LEGACY_INVERTED_REASON_FORBIDDEN",
+    ):
+        _validate_preflight_payload(payload)
+
+
+def test_preflight_validation_rejects_non_sequence_processes_with_v4_error() -> None:
+    payload = {
+        "schema_version": "georeliab-v4-hardware-preflight-1.0",
+        "status": "FAIL",
+        "reason_code": "V4_GPU_ACTIVE_COMPUTE_PROCESS_IDENTITY_INCOMPLETE",
+        "compute_process_count": 0,
+        "samples": [
+            _sample(compute_processes=7),
+            _sample(compute_processes=7),
+        ],
+        "devices": [
+            {
+                "cuda_runtime": "CUDA Version 12.4",
+                "driver_version": "555.55",
+                "compute_process_count": 0,
+            }
+        ],
+    }
+
+    with pytest.raises(
+        V4ExecutionError,
+        match="V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION",
     ):
         _validate_preflight_payload(payload)
 

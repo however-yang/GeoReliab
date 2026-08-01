@@ -540,24 +540,35 @@ def _is_georeliab_process(process: Mapping[str, object]) -> bool:
     return "georeliab" in provenance
 
 
-def _classify_active_compute_processes(
+def _normalize_active_compute_process_rows(
     samples: Sequence[Mapping[str, object]],
-) -> str | None:
+) -> list[list[Mapping[str, object]]] | None:
     process_rows: list[list[Mapping[str, object]]] = []
     for sample in samples:
         raw_processes = sample.get("compute_processes", ())
         if not isinstance(raw_processes, Sequence) or isinstance(
             raw_processes, (str, bytes)
         ):
-            return "V4_GPU_ACTIVE_COMPUTE_PROCESS_IDENTITY_INCOMPLETE"
+            return None
         rows: list[Mapping[str, object]] = []
         for process in raw_processes:
             if not isinstance(process, Mapping):
-                return "V4_GPU_ACTIVE_COMPUTE_PROCESS_IDENTITY_INCOMPLETE"
+                return None
             rows.append(process)
-            if _active_process_identity(process) is None:
-                return "V4_GPU_ACTIVE_COMPUTE_PROCESS_IDENTITY_INCOMPLETE"
         process_rows.append(rows)
+    return process_rows
+
+
+def _classify_normalized_active_compute_process_rows(
+    samples: Sequence[Mapping[str, object]],
+    process_rows: Sequence[Sequence[Mapping[str, object]]],
+) -> str | None:
+    if any(
+        _active_process_identity(process) is None
+        for rows in process_rows
+        for process in rows
+    ):
+        return "V4_GPU_ACTIVE_COMPUTE_PROCESS_IDENTITY_INCOMPLETE"
 
     if not any(process_rows):
         if any(sample.get("utilization_gpu_percent") != 0 for sample in samples):
@@ -579,6 +590,15 @@ def _classify_active_compute_processes(
     return "V4_GPU_GEORELIAB_RESIDUAL_COMPUTE_PROCESS_PRESENT"
 
 
+def _classify_active_compute_processes(
+    samples: Sequence[Mapping[str, object]],
+) -> str | None:
+    process_rows = _normalize_active_compute_process_rows(samples)
+    if process_rows is None:
+        return "V4_GPU_ACTIVE_COMPUTE_PROCESS_IDENTITY_INCOMPLETE"
+    return _classify_normalized_active_compute_process_rows(samples, process_rows)
+
+
 def _validate_evidence_reason_consistency(payload: Mapping[str, Any]) -> None:
     samples = payload.get("samples", ())
     if not isinstance(samples, Sequence) or isinstance(samples, (str, bytes)):
@@ -592,9 +612,10 @@ def _validate_evidence_reason_consistency(payload: Mapping[str, Any]) -> None:
     if any(not isinstance(sample, Mapping) for sample in samples):
         raise V4ExecutionError("V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION")
 
-    observed_count = max(
-        len(sample.get("compute_processes", ())) for sample in samples
-    )
+    process_rows = _normalize_active_compute_process_rows(samples)
+    if process_rows is None:
+        raise V4ExecutionError("V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION")
+    observed_count = max(len(rows) for rows in process_rows)
     declared_count = payload.get("compute_process_count")
     if declared_count is not None and (
         not isinstance(declared_count, int)
@@ -620,7 +641,9 @@ def _validate_evidence_reason_consistency(payload: Mapping[str, Any]) -> None:
         raise V4ExecutionError("V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION")
     if reason_code in NO_ACTIVE_PROCESS_REASON_CODES and observed_count > 0:
         raise V4ExecutionError("V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION")
-    expected_reason = _classify_active_compute_processes(samples)
+    expected_reason = _classify_normalized_active_compute_process_rows(
+        samples, process_rows
+    )
     if expected_reason is not None and reason_code != expected_reason:
         raise V4ExecutionError("V4_GPU_EVIDENCE_REASON_COUNT_CONTRADICTION")
     if expected_reason is None and reason_code in PROCESS_EVIDENCE_REASON_CODES:
@@ -632,6 +655,9 @@ def _validate_evidence_reason_consistency(payload: Mapping[str, Any]) -> None:
 def _evaluate_basic(samples: Sequence[Mapping[str, object]]) -> dict[str, object]:
     if len(samples) != 2:
         return _fail("V4_GPU_PREFLIGHT_TWO_SAMPLES_REQUIRED")
+    active_process_reason = _classify_active_compute_processes(samples)
+    if active_process_reason is not None:
+        return _fail(active_process_reason)
     first, second = samples
     for sample in samples:
         if sample.get("requested_physical_index") != sample.get("resolved_physical_index"):
@@ -648,9 +674,6 @@ def _evaluate_basic(samples: Sequence[Mapping[str, object]]) -> dict[str, object
             return _fail("V4_GPU_HEALTH_ERROR")
         if not isinstance(sample.get("free_memory_bytes"), int) or int(sample["free_memory_bytes"]) < MIN_FREE_MEMORY_BYTES:
             return _fail("V4_GPU_FREE_MEMORY_INSUFFICIENT")
-    active_process_reason = _classify_active_compute_processes(samples)
-    if active_process_reason is not None:
-        return _fail(active_process_reason)
     for key, reason in (("resolved_physical_index", "V4_GPU_INDEX_DRIFT"), ("device_uuid", "V4_GPU_UUID_DRIFT"), ("device_model", "V4_GPU_MODEL_DRIFT"), ("driver_version", "V4_GPU_DRIVER_VERSION_DRIFT")):
         if first.get(key) != second.get(key):
             return _fail(reason)
@@ -795,10 +818,12 @@ def create_hardware_preflight(
         except Exception as exc:
             decision = _fail("V4_GPU_TORCH_PROBE_FAILED", error=str(exc))
     selected = samples[-1] if samples else {}
-    evidence_process_count = max(
-        (len(sample.get("compute_processes", ())) for sample in samples),
-        default=0,
-    )
+    process_rows = _normalize_active_compute_process_rows(samples)
+    if process_rows is None:
+        raise V4ExecutionError(
+            "V4_GPU_ACTIVE_COMPUTE_PROCESS_IDENTITY_INCOMPLETE"
+        )
+    evidence_process_count = max((len(rows) for rows in process_rows), default=0)
     receipt_path = output_path.with_name("v4-execution-receipt.json")
     if decision["status"] != "PASS":
         _remove_owned_preflight_siblings(output_path)
