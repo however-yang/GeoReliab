@@ -24,9 +24,11 @@ from uuid import uuid4
 from .v4_counterfactuals import (
     FOG_STATES,
     LIGHTING_STATES,
+    ModelIndependentState,
     SCIENTIFIC_MODELS,
     SCIENTIFIC_STATES,
     TEST_SCENE_IDS,
+    build_scientific_schedule,
     parse_scientific_schedule,
     validate_scientific_schedule,
 )
@@ -40,6 +42,28 @@ from .v4_execution import (
     V4ExecutionReceipt,
 )
 from .v4_science_lock import V4_PROTOCOL_ID, V4_PROTOCOL_SHA256
+
+
+ATTEMPT_ID = 'attempt-02'
+EXCLUDED_GPU_UUID = 'GPU-c1c4c0d5-5b39-9b0e-84a0-a667e65484fa'
+ATTEMPT_SCHEMA_PREFIX = 'georeliab-v4-attempt-02'
+ATTEMPT_INVENTORY_SCHEMA_VERSION = f'{ATTEMPT_SCHEMA_PREFIX}-gpu-inventory-1.0'
+ATTEMPT_PREFLIGHT_SCHEMA_VERSION = f'{ATTEMPT_SCHEMA_PREFIX}-hardware-preflight-1.0'
+ATTEMPT_RECEIPT_SCHEMA_VERSION = f'{ATTEMPT_SCHEMA_PREFIX}-gpu-receipt-1.0'
+ATTEMPT_RESOURCE_SCHEMA_VERSION = f'{ATTEMPT_SCHEMA_PREFIX}-resources-1.0'
+ATTEMPT_AUTHORIZATION_SCHEMA_VERSION = (
+    f'{ATTEMPT_SCHEMA_PREFIX}-execution-authorization-1.0'
+)
+ATTEMPT_RESOURCE_KEYS = (
+    'model_bindings',
+    'dtu_archives',
+    'v4_split',
+    'state_inventory_200',
+    'fog_manifest',
+    'scientific_schedule_400',
+    'environment_locks',
+    'science_lock',
+)
 
 
 IMPLEMENTATION_ANCHOR_COMMIT = "7381e60050143a78fca6a3ebde5706ae27d2c145"
@@ -72,6 +96,1455 @@ PROCESS_PRESENT_REASON_CODES = frozenset(
 NO_ACTIVE_PROCESS_REASON_CODES = frozenset(
     {"V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS"}
 )
+def _require_attempt_id(value: object) -> str:
+    if value != ATTEMPT_ID:
+        raise V4ExecutionError('V4_ATTEMPT_ID_MISMATCH')
+    return ATTEMPT_ID
+
+
+def _require_attempt_path(path: Path) -> Path:
+    lowered = tuple(part.lower() for part in path.resolve().parts)
+    if ATTEMPT_ID not in lowered or 'attempt-01' in lowered:
+        raise V4ExecutionError('V4_ATTEMPT_PATH_MISMATCH')
+    return path.resolve()
+
+
+def _reject_attempt_collision(paths: Sequence[Path]) -> None:
+    for path in paths:
+        if path.exists() or path.with_name(path.name + '.partial').exists():
+            raise V4ExecutionError('V4_ATTEMPT_ARTIFACT_COLLISION')
+
+
+def _publish_attempt_json(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    validator: Callable[[Mapping[str, Any]], None],
+) -> None:
+    _require_attempt_path(path)
+    _reject_attempt_collision((path,))
+    _atomic_json(path, payload, validator=validator)
+
+
+def _recursive_strings(value: object) -> set[str]:
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, Mapping):
+        result: set[str] = set()
+        for key, item in value.items():
+            result.update(_recursive_strings(key))
+            result.update(_recursive_strings(item))
+        return result
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        result = set()
+        for item in value:
+            result.update(_recursive_strings(item))
+        return result
+    return set()
+
+
+def _historical_values(paths: Sequence[Path]) -> set[str]:
+    def evidence_identities(value: object) -> set[str]:
+        identities: set[str] = set()
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                label = str(key).lower()
+                is_identity = (
+                    label == 'run_id'
+                    or 'timestamp' in label
+                    or label in {
+                        'hardware_preflight_sha256',
+                        'preflight_decision_sha256',
+                        'decision_sha256',
+                        'receipt_sha256',
+                        'receipt_payload_sha256',
+                        'authorization_sha256',
+                    }
+                )
+                if is_identity and isinstance(item, str):
+                    identities.add(item)
+                identities.update(evidence_identities(item))
+        elif isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes)
+        ):
+            for item in value:
+                identities.update(evidence_identities(item))
+        return identities
+
+    values: set[str] = set()
+    for path in paths:
+        payload = load_json(path)
+        if payload.get('attempt_id') == ATTEMPT_ID:
+            raise V4ExecutionError('V4_ATTEMPT_REUSE_FORBIDDEN')
+        values.update(evidence_identities(payload))
+    return values
+
+
+def _reject_historical_reuse(
+    payload: Mapping[str, Any], historical_values: set[str]
+) -> None:
+    current = _recursive_strings(payload)
+    reused = current & historical_values
+    if reused:
+        raise V4ExecutionError('V4_ATTEMPT_HISTORY_REUSE_FORBIDDEN')
+    if any('attempt-01' in value.lower() for value in current):
+        raise V4ExecutionError('V4_ATTEMPT_CROSS_LINK_FORBIDDEN')
+
+
+def _split_csv_rows(
+    text: str, expected_columns: int, *, reason_code: str
+) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        row = [item.strip() for item in raw.split(',', expected_columns - 1)]
+        if len(row) != expected_columns:
+            raise V4ExecutionError(reason_code)
+        rows.append(row)
+    if not rows:
+        raise V4ExecutionError(reason_code)
+    return rows
+
+
+def _required_smi_int(value: str, *, reason_code: str) -> int:
+    if value.strip().lower() in {
+        '',
+        'n/a',
+        '[not supported]',
+        'not supported',
+        'unknown',
+    }:
+        raise V4ExecutionError(reason_code)
+    try:
+        return int(float(value.strip()))
+    except ValueError as exc:
+        raise V4ExecutionError(reason_code) from exc
+
+
+def nvidia_smi_all_gpu_inventory_sample(
+    *, command_runner: Callable[..., str] | None = None
+) -> dict[str, object]:
+    '''Collect one CPU/read-only inventory of every visible physical GPU.'''
+
+    runner = _run_text_command if command_runner is None else command_runner
+    try:
+        rows = _split_csv_rows(
+            runner(
+                (
+                    'nvidia-smi',
+                    '--query-gpu=index,uuid,name,memory.total,memory.free,'
+                    'memory.used,utilization.gpu,temperature.gpu,'
+                    'mig.mode.current,ecc.errors.uncorrected.volatile.total,'
+                    'driver_version',
+                    '--format=csv,noheader,nounits',
+                )
+            ),
+            11,
+            reason_code='V4_GPU_INVENTORY_UNAVAILABLE',
+        )
+        cuda_runtime = _nvidia_smi_cuda_runtime(runner)
+        process_text = runner(
+            (
+                'nvidia-smi',
+                '--query-compute-apps=gpu_uuid,pid,process_name,used_memory',
+                '--format=csv,noheader,nounits',
+            )
+        )
+    except V4ExecutionError:
+        raise
+    except Exception as exc:
+        raise V4ExecutionError('V4_GPU_INVENTORY_UNAVAILABLE') from exc
+
+    processes_by_uuid: dict[str, list[dict[str, object]]] = {}
+    for raw in process_text.splitlines():
+        if not raw.strip():
+            continue
+        values = [item.strip() for item in raw.split(',', 3)]
+        if len(values) != 4:
+            raise V4ExecutionError('V4_GPU_PROCESS_ENUMERATION_UNPROVEN')
+        gpu_uuid, pid_raw, process_name, used_raw = values
+        pid = _required_smi_int(
+            pid_raw, reason_code='V4_GPU_PROCESS_IDENTITY_UNPROVEN'
+        )
+        processes_by_uuid.setdefault(gpu_uuid, []).append(
+            {
+                'pid': pid,
+                'owner': _process_owner(pid),
+                'cwd': _process_cwd(pid),
+                'cmdline': _process_cmdline(pid),
+                'process_name': process_name,
+                'used_memory_bytes': _required_smi_int(
+                    used_raw,
+                    reason_code='V4_GPU_PROCESS_MEMORY_UNPROVEN',
+                )
+                * 1024
+                * 1024,
+            }
+        )
+
+    devices: list[dict[str, object]] = []
+    for row in rows:
+        ecc_count = _required_smi_int(
+            row[9], reason_code='V4_GPU_ECC_HEALTH_UNPROVEN'
+        )
+        device_uuid = row[1]
+        devices.append(
+            {
+                'index': _required_smi_int(
+                    row[0], reason_code='V4_GPU_INDEX_UNPROVEN'
+                ),
+                'uuid': device_uuid,
+                'model': row[2],
+                'total_memory_bytes': _required_smi_int(
+                    row[3], reason_code='V4_GPU_MEMORY_UNPROVEN'
+                )
+                * 1024
+                * 1024,
+                'free_memory_bytes': _required_smi_int(
+                    row[4], reason_code='V4_GPU_MEMORY_UNPROVEN'
+                )
+                * 1024
+                * 1024,
+                'used_memory_bytes': _required_smi_int(
+                    row[5], reason_code='V4_GPU_MEMORY_UNPROVEN'
+                )
+                * 1024
+                * 1024,
+                'utilization_gpu_percent': _required_smi_int(
+                    row[6], reason_code='V4_GPU_UTILIZATION_UNPROVEN'
+                ),
+                'temperature_c': _required_smi_int(
+                    row[7], reason_code='V4_GPU_TEMPERATURE_UNPROVEN'
+                ),
+                'driver_version': row[10],
+                'cuda_runtime': cuda_runtime,
+                'mig_mode': row[8],
+                'ecc_health': 'OK' if ecc_count == 0 else 'ERROR',
+                'ecc_uncorrected_volatile_total': ecc_count,
+                'compute_processes': processes_by_uuid.get(device_uuid, []),
+            }
+        )
+    unknown_process_gpu = set(processes_by_uuid) - {
+        str(device['uuid']) for device in devices
+    }
+    if unknown_process_gpu:
+        raise V4ExecutionError('V4_GPU_PROCESS_DEVICE_IDENTITY_UNPROVEN')
+    return {
+        'schema_version': ATTEMPT_INVENTORY_SCHEMA_VERSION,
+        'attempt_id': ATTEMPT_ID,
+        'hostname': platform.node(),
+        'timestamp_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'driver_version': rows[0][10],
+        'cuda_runtime': cuda_runtime,
+        'devices': devices,
+    }
+
+
+def _validate_attempt_inventory(sample: Mapping[str, object]) -> None:
+    _require_attempt_id(sample.get('attempt_id'))
+    if sample.get('schema_version') != ATTEMPT_INVENTORY_SCHEMA_VERSION:
+        raise V4ExecutionError('V4_GPU_INVENTORY_SCHEMA_REQUIRED')
+    if not _runtime_proven(sample.get('hostname')):
+        raise V4ExecutionError('V4_GPU_HOST_IDENTITY_UNPROVEN')
+    if not _runtime_proven(sample.get('timestamp_utc')):
+        raise V4ExecutionError('V4_GPU_TIMESTAMP_UNPROVEN')
+    if not _driver_proven(sample.get('driver_version')):
+        raise V4ExecutionError('V4_GPU_DRIVER_VERSION_UNPROVEN')
+    if not _runtime_proven(sample.get('cuda_runtime')):
+        raise V4ExecutionError('V4_GPU_CUDA_RUNTIME_UNPROVEN')
+    devices = sample.get('devices')
+    if not isinstance(devices, list):
+        raise V4ExecutionError('V4_GPU_INVENTORY_SCHEMA_REQUIRED')
+    seen_uuid: set[str] = set()
+    seen_index: set[int] = set()
+    for device in devices:
+        if not isinstance(device, Mapping):
+            raise V4ExecutionError('V4_GPU_INVENTORY_SCHEMA_REQUIRED')
+        uuid = device.get('uuid')
+        index = device.get('index')
+        if (
+            not isinstance(uuid, str)
+            or not uuid.startswith('GPU-')
+            or type(index) is not int
+            or index < 0
+            or uuid in seen_uuid
+            or index in seen_index
+        ):
+            raise V4ExecutionError('V4_GPU_IDENTITY_UNPROVEN')
+        seen_uuid.add(uuid)
+        seen_index.add(index)
+        for key in (
+            'total_memory_bytes',
+            'free_memory_bytes',
+            'used_memory_bytes',
+            'utilization_gpu_percent',
+            'temperature_c',
+            'ecc_uncorrected_volatile_total',
+        ):
+            if type(device.get(key)) is not int or int(device[key]) < 0:
+                raise V4ExecutionError('V4_GPU_INVENTORY_SCHEMA_REQUIRED')
+        if not _runtime_proven(device.get('model')):
+            raise V4ExecutionError('V4_GPU_MODEL_UNPROVEN')
+        if not _driver_proven(device.get('driver_version')):
+            raise V4ExecutionError('V4_GPU_DRIVER_VERSION_UNPROVEN')
+        if not _runtime_proven(device.get('cuda_runtime')):
+            raise V4ExecutionError('V4_GPU_CUDA_RUNTIME_UNPROVEN')
+        if not _runtime_proven(device.get('mig_mode')):
+            raise V4ExecutionError('V4_GPU_MIG_STATE_UNPROVEN')
+        if not _runtime_proven(device.get('ecc_health')):
+            raise V4ExecutionError('V4_GPU_ECC_HEALTH_UNPROVEN')
+        processes = device.get('compute_processes')
+        if not isinstance(processes, list):
+            raise V4ExecutionError('V4_GPU_PROCESS_ENUMERATION_UNPROVEN')
+
+
+def _device_map(sample: Mapping[str, object]) -> dict[str, Mapping[str, object]]:
+    _validate_attempt_inventory(sample)
+    devices = sample['devices']
+    assert isinstance(devices, list)
+    return {str(device['uuid']): device for device in devices}
+
+
+def _process_signature(device: Mapping[str, object]) -> tuple[tuple[object, ...], ...]:
+    processes = device.get('compute_processes')
+    if not isinstance(processes, list):
+        raise V4ExecutionError('V4_GPU_PROCESS_ENUMERATION_UNPROVEN')
+    rows: list[tuple[object, ...]] = []
+    for process in processes:
+        if not isinstance(process, Mapping):
+            raise V4ExecutionError('V4_GPU_PROCESS_IDENTITY_UNPROVEN')
+        pid = process.get('pid')
+        owner = process.get('owner')
+        cwd = process.get('cwd')
+        cmdline = process.get('cmdline')
+        memory = process.get('used_memory_bytes')
+        if (
+            type(pid) is not int
+            or pid <= 0
+            or not _runtime_proven(owner)
+            or not _runtime_proven(cwd)
+            or not _runtime_proven(cmdline)
+            or type(memory) is not int
+            or memory < 0
+        ):
+            raise V4ExecutionError('V4_GPU_PROCESS_IDENTITY_UNPROVEN')
+        rows.append((pid, owner, cwd, cmdline, memory))
+    return tuple(sorted(rows))
+
+
+def _candidate_reason(
+    first: Mapping[str, object] | None,
+    second: Mapping[str, object] | None,
+) -> str | None:
+    if first is None or second is None:
+        return 'V4_GPU_MAPPING_DRIFT'
+    uuid = first.get('uuid')
+    if uuid == EXCLUDED_GPU_UUID:
+        return 'V4_GPU_UUID_EXCLUDED'
+    if (
+        second.get('uuid') != uuid
+        or second.get('index') != first.get('index')
+        or first.get('total_memory_bytes') != second.get('total_memory_bytes')
+    ):
+        return 'V4_GPU_MAPPING_DRIFT'
+    try:
+        first_processes = _process_signature(first)
+        second_processes = _process_signature(second)
+    except V4ExecutionError as exc:
+        return str(exc)
+    if first_processes != second_processes:
+        return 'V4_GPU_PROCESS_STATE_UNSTABLE'
+    if first_processes:
+        return 'V4_GPU_COMPUTE_PROCESS_PRESENT'
+    for device in (first, second):
+        if device.get('model') != AUTHORIZED_GPU_MODEL:
+            return 'V4_GPU_MODEL_NOT_AUTHORIZED'
+        if str(device.get('mig_mode')).strip().lower() not in {
+            'disabled',
+            'off',
+            '0',
+        }:
+            return 'V4_GPU_MIG_ENABLED'
+        if device.get('utilization_gpu_percent') != 0:
+            return 'V4_GPU_NOT_IDLE'
+        if int(device.get('free_memory_bytes', -1)) < MIN_FREE_MEMORY_BYTES:
+            return 'V4_GPU_FREE_MEMORY_INSUFFICIENT'
+        if (
+            str(device.get('ecc_health')).upper() not in {'OK', 'PASS', '0'}
+            or device.get('ecc_uncorrected_volatile_total') != 0
+        ):
+            return 'V4_GPU_HEALTH_ERROR'
+        if not _driver_proven(device.get('driver_version')):
+            return 'V4_GPU_DRIVER_VERSION_UNPROVEN'
+        if not _runtime_proven(device.get('cuda_runtime')):
+            return 'V4_GPU_CUDA_RUNTIME_UNPROVEN'
+    if first.get('driver_version') != second.get('driver_version'):
+        return 'V4_GPU_DRIVER_VERSION_DRIFT'
+    if first.get('cuda_runtime') != second.get('cuda_runtime'):
+        return 'V4_GPU_CUDA_RUNTIME_DRIFT'
+    return None
+
+
+def select_attempt_gpu(
+    samples: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    '''Select once from two complete inventories; UUID remains authoritative.'''
+
+    if len(samples) != 2:
+        raise V4ExecutionError('V4_GPU_PREFLIGHT_TWO_SAMPLES_REQUIRED')
+    first_map = _device_map(samples[0])
+    second_map = _device_map(samples[1])
+    if samples[0].get('hostname') != samples[1].get('hostname'):
+        raise V4ExecutionError('V4_GPU_HOST_IDENTITY_DRIFT')
+    if samples[0].get('timestamp_utc') == samples[1].get('timestamp_utc'):
+        raise V4ExecutionError('V4_GPU_SAMPLE_INDEPENDENCE_UNPROVEN')
+
+    evaluations: list[dict[str, object]] = []
+    eligible: list[Mapping[str, object]] = []
+    for uuid in sorted(set(first_map) | set(second_map)):
+        first = first_map.get(uuid)
+        second = second_map.get(uuid)
+        reason = _candidate_reason(first, second)
+        evaluation = {
+            'uuid': uuid,
+            'index_sample_1': None if first is None else first.get('index'),
+            'index_sample_2': None if second is None else second.get('index'),
+            'eligible': reason is None,
+            'reason_code': reason or 'V4_GPU_CANDIDATE_ELIGIBLE',
+        }
+        evaluations.append(evaluation)
+        if reason is None and second is not None:
+            eligible.append(second)
+    eligible.sort(
+        key=lambda device: (
+            -int(device['total_memory_bytes']),
+            -int(device['free_memory_bytes']),
+            str(device['uuid']),
+        )
+    )
+    if not eligible:
+        return {
+            'status': 'FAIL',
+            'reason_code': 'V4_NO_ELIGIBLE_IDLE_GPU',
+            'candidate_evaluations': evaluations,
+            'selected_gpu': None,
+        }
+    selected = dict(eligible[0])
+    return {
+        'status': 'PASS',
+        'reason_code': 'V4_GPU_SELECTED_BY_STABLE_IDENTITY',
+        'candidate_evaluations': evaluations,
+        'selected_gpu': selected,
+    }
+
+
+def _default_attempt_torch_probe(
+    model_id: str,
+    selected_uuid: str,
+    selected_index: int,
+    expected: Mapping[str, object],
+) -> dict[str, object]:
+    code = (
+        'import json,torch;'
+        'ok=torch.cuda.is_available() and torch.cuda.device_count()==1;'
+        'p=torch.cuda.get_device_properties(0) if ok else None;'
+        'print(json.dumps(dict('
+        'model_instantiated=False,checkpoint_loaded=False,'
+        'forward_executed=False,torch_cuda_available=torch.cuda.is_available(),'
+        'torch_device_count=torch.cuda.device_count(),'
+        'torch_current_device=torch.cuda.current_device() if ok else None,'
+        'mapped_device_model=p.name if p else None,'
+        'mapped_total_memory_bytes=p.total_memory if p else None)))'
+    )
+    python = _frozen_python_for_model(model_id)
+    payload = json.loads(
+        _run_text_command(
+            (python, '-c', code), env={'CUDA_VISIBLE_DEVICES': selected_uuid}
+        )
+    )
+    post = nvidia_smi_hardware_sample(selected_index)
+    return {
+        'model_id': model_id,
+        **payload,
+        'mapped_device_uuid': post.get('device_uuid'),
+        'post_probe_physical_model': post.get('device_model'),
+        'post_probe_physical_total_memory_bytes': post.get('total_memory_bytes'),
+        'residual_compute_process_count': len(post.get('compute_processes', ())),
+        'expected_uuid': expected.get('uuid'),
+    }
+
+
+def _evaluate_attempt_probes(
+    probes: Sequence[Mapping[str, object]], selected: Mapping[str, object]
+) -> dict[str, object]:
+    if len(probes) != len(SCIENTIFIC_MODELS):
+        return _fail('V4_GPU_TORCH_PROBE_MODEL_SET_MISMATCH')
+    seen: set[str] = set()
+    for probe in probes:
+        model = probe.get('model_id')
+        if model not in SCIENTIFIC_MODELS or str(model) in seen:
+            return _fail('V4_GPU_TORCH_PROBE_MODEL_SET_MISMATCH')
+        seen.add(str(model))
+        if (
+            probe.get('model_instantiated') is not False
+            or probe.get('checkpoint_loaded') is not False
+            or probe.get('forward_executed') is not False
+        ):
+            return _fail('V4_GPU_TORCH_PROBE_SCOPE_VIOLATION')
+        if (
+            probe.get('torch_cuda_available') is not True
+            or probe.get('torch_device_count') != 1
+            or probe.get('torch_current_device') != 0
+        ):
+            return _fail('V4_GPU_TORCH_PROBE_VISIBLE_DEVICE_MISMATCH')
+        if (
+            probe.get('mapped_device_uuid') != selected.get('uuid')
+            or probe.get('mapped_device_model') != selected.get('model')
+            or probe.get('mapped_total_memory_bytes')
+            != selected.get('total_memory_bytes')
+            or probe.get('post_probe_physical_model') != selected.get('model')
+            or probe.get('post_probe_physical_total_memory_bytes')
+            != selected.get('total_memory_bytes')
+        ):
+            return _fail('V4_GPU_TORCH_PROBE_DEVICE_MISMATCH')
+        if probe.get('residual_compute_process_count') != 0:
+            return _fail('V4_GPU_TORCH_PROBE_RESIDUAL_PROCESS')
+    return {'status': 'PASS', 'reason_code': 'V4_GPU_MAPPING_PROBES_PASS'}
+
+
+def _sign_attempt_payload(
+    payload: Mapping[str, Any], field: str
+) -> dict[str, object]:
+    signed = dict(payload)
+    signed[field] = _sha_json(payload)
+    return signed
+
+
+def _validate_attempt_signature(
+    payload: Mapping[str, Any], field: str, reason_code: str
+) -> None:
+    expected = payload.get(field)
+    unsigned = {key: value for key, value in payload.items() if key != field}
+    if not _is_sha(expected) or _sha_json(unsigned) != expected:
+        raise V4ExecutionError(reason_code)
+
+
+def _validate_attempt_preflight_payload(payload: Mapping[str, Any]) -> None:
+    _require_attempt_id(payload.get('attempt_id'))
+    if payload.get('schema_version') != ATTEMPT_PREFLIGHT_SCHEMA_VERSION:
+        raise V4ExecutionError('V4_ATTEMPT_PREFLIGHT_SCHEMA_REQUIRED')
+    if (
+        payload.get('implementation_commit') != IMPLEMENTATION_ANCHOR_COMMIT
+        or payload.get('implementation_tree') != IMPLEMENTATION_ANCHOR_TREE
+    ):
+        raise V4ExecutionError('V4_ATTEMPT_PREFLIGHT_ANCHOR_MISMATCH')
+    if payload.get('sample_interval_seconds') != FORMAL_SAMPLE_INTERVAL_SECONDS:
+        raise V4ExecutionError('V4_GPU_SAMPLE_INTERVAL_MUST_BE_5_SECONDS')
+    if payload.get('status') not in {'PASS', 'FAIL'}:
+        raise V4ExecutionError('V4_ATTEMPT_PREFLIGHT_SCHEMA_REQUIRED')
+    if not _is_sha(payload.get('run_id'), length=32):
+        raise V4ExecutionError('V4_ATTEMPT_RUN_ID_INVALID')
+    samples = payload.get('inventory_samples')
+    if not isinstance(samples, list):
+        raise V4ExecutionError('V4_ATTEMPT_PREFLIGHT_SCHEMA_REQUIRED')
+    if len(samples) == 2:
+        selection = select_attempt_gpu(samples)
+        if selection.get('selected_gpu') != payload.get('selected_gpu'):
+            raise V4ExecutionError('V4_GPU_SELECTION_TAMPER')
+        if selection.get('candidate_evaluations') != payload.get(
+            'candidate_evaluations'
+        ):
+            raise V4ExecutionError('V4_GPU_SELECTION_TAMPER')
+        if selection['status'] == 'FAIL':
+            if (
+                payload.get('status') != 'FAIL'
+                or payload.get('reason_code') != 'V4_NO_ELIGIBLE_IDLE_GPU'
+            ):
+                raise V4ExecutionError('V4_GPU_SELECTION_TAMPER')
+        elif payload.get('status') == 'PASS':
+            selected = selection.get('selected_gpu')
+            assert isinstance(selected, Mapping)
+            probe_decision = _evaluate_attempt_probes(
+                payload.get('model_environment_probes', ()), selected
+            )
+            if probe_decision['status'] != 'PASS':
+                raise V4ExecutionError(str(probe_decision['reason_code']))
+            if payload.get('reason_code') != 'V4_ATTEMPT_PREFLIGHT_PASS':
+                raise V4ExecutionError('V4_GPU_SELECTION_TAMPER')
+        elif payload.get('selected_gpu') is not None:
+            probes = payload.get('model_environment_probes', ())
+            if not isinstance(probes, list):
+                raise V4ExecutionError('V4_ATTEMPT_PREFLIGHT_SCHEMA_REQUIRED')
+    elif payload.get('status') != 'FAIL' or payload.get('selected_gpu') is not None:
+        raise V4ExecutionError('V4_ATTEMPT_PREFLIGHT_SCHEMA_REQUIRED')
+
+
+def _validate_attempt_decision_payload(payload: Mapping[str, Any]) -> None:
+    _require_attempt_id(payload.get('attempt_id'))
+    if payload.get('schema_version') != (
+        f'{ATTEMPT_SCHEMA_PREFIX}-preflight-decision-1.0'
+    ):
+        raise V4ExecutionError('V4_ATTEMPT_DECISION_SCHEMA_REQUIRED')
+    _validate_attempt_signature(
+        payload, 'decision_sha256', 'V4_ATTEMPT_DECISION_TAMPER'
+    )
+    snapshot_path = Path(str(payload.get('hardware_preflight_path')))
+    _require_attempt_path(snapshot_path)
+    if (
+        not snapshot_path.is_file()
+        or sha256_file(snapshot_path) != payload.get('hardware_preflight_sha256')
+    ):
+        raise V4ExecutionError('V4_ATTEMPT_PREFLIGHT_TAMPER')
+    snapshot = load_json(snapshot_path)
+    _validate_attempt_preflight_payload(snapshot)
+    for key in ('run_id', 'status', 'reason_code', 'selected_gpu'):
+        if payload.get(key) != snapshot.get(key):
+            raise V4ExecutionError('V4_ATTEMPT_DECISION_LINKAGE_MISMATCH')
+    if payload.get('terminal_status') != snapshot.get('status'):
+        raise V4ExecutionError('V4_ATTEMPT_DECISION_LINKAGE_MISMATCH')
+    if payload.get('scientific_result') != 'NO_SCIENTIFIC_RESULT':
+        raise V4ExecutionError('V4_ATTEMPT_DECISION_SCIENCE_FORBIDDEN')
+
+
+def _validate_attempt_receipt_payload(payload: Mapping[str, Any]) -> None:
+    _require_attempt_id(payload.get('attempt_id'))
+    if payload.get('schema_version') != ATTEMPT_RECEIPT_SCHEMA_VERSION:
+        raise V4ExecutionError('V4_ATTEMPT_RECEIPT_SCHEMA_REQUIRED')
+    _validate_attempt_signature(
+        payload, 'receipt_payload_sha256', 'V4_ATTEMPT_RECEIPT_TAMPER'
+    )
+    if (
+        payload.get('implementation_commit') != IMPLEMENTATION_ANCHOR_COMMIT
+        or payload.get('implementation_tree') != IMPLEMENTATION_ANCHOR_TREE
+    ):
+        raise V4ExecutionError('V4_AUTHORIZATION_STALE_ANCHOR')
+    if (
+        payload.get('protocol_id') != V4_PROTOCOL_ID
+        or payload.get('protocol_sha256') != V4_PROTOCOL_SHA256
+    ):
+        raise V4ExecutionError('V4_GPU_RECEIPT_PROTOCOL_MISMATCH')
+    if not _is_sha(payload.get('schedule_sha256')):
+        raise V4ExecutionError('V4_AUTHORIZATION_SCHEDULE_REQUIRED')
+    if (
+        payload.get('max_concurrent_gpus') != 1
+        or payload.get('sequential_model_execution') is not True
+        or payload.get('sequential_unit_execution') is not True
+        or payload.get('fallback_allowed') is not False
+        or payload.get('device_switch_allowed') is not False
+        or payload.get('retry_allowed') is not False
+    ):
+        raise V4ExecutionError('V4_GPU_RECEIPT_NO_FALLBACK_REQUIRED')
+    snapshot_path = Path(str(payload.get('hardware_preflight_path')))
+    decision_path = Path(str(payload.get('preflight_decision_path')))
+    for path, digest, reason in (
+        (
+            snapshot_path,
+            payload.get('hardware_preflight_sha256'),
+            'V4_ATTEMPT_PREFLIGHT_TAMPER',
+        ),
+        (
+            decision_path,
+            payload.get('preflight_decision_sha256'),
+            'V4_ATTEMPT_DECISION_TAMPER',
+        ),
+    ):
+        _require_attempt_path(path)
+        if not path.is_file() or sha256_file(path) != digest:
+            raise V4ExecutionError(reason)
+    snapshot = load_json(snapshot_path)
+    decision = load_json(decision_path)
+    _validate_attempt_preflight_payload(snapshot)
+    _validate_attempt_decision_payload(decision)
+    if snapshot.get('status') != 'PASS' or decision.get('status') != 'PASS':
+        raise V4ExecutionError('V4_ATTEMPT_PASS_EVIDENCE_REQUIRED')
+    selected = snapshot.get('selected_gpu')
+    if not isinstance(selected, Mapping):
+        raise V4ExecutionError('V4_ATTEMPT_PASS_EVIDENCE_REQUIRED')
+    if (
+        payload.get('run_id') != snapshot.get('run_id')
+        or payload.get('selected_gpu_uuid') != selected.get('uuid')
+        or payload.get('selected_physical_index') != selected.get('index')
+        or payload.get('selected_gpu_model') != selected.get('model')
+        or payload.get('selected_total_memory_bytes')
+        != selected.get('total_memory_bytes')
+    ):
+        raise V4ExecutionError('V4_GPU_RECEIPT_DEVICE_MISMATCH')
+
+
+def create_attempt_hardware_preflight(
+    *,
+    output_path: Path,
+    schedule_sha256: str,
+    inventory_sampler: Callable[[], Mapping[str, object]] | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+    sample_interval_seconds: float = FORMAL_SAMPLE_INTERVAL_SECONDS,
+    probe_runner: Callable[
+        [str, str, int, Mapping[str, object]], Mapping[str, object]
+    ] = _default_attempt_torch_probe,
+    historical_evidence_paths: Sequence[Path] = (),
+) -> dict[str, object]:
+    '''Materialize attempt-02 selection evidence without model/science work.'''
+
+    _require_attempt_path(output_path)
+    if sample_interval_seconds != FORMAL_SAMPLE_INTERVAL_SECONDS:
+        raise V4ExecutionError('V4_GPU_SAMPLE_INTERVAL_MUST_BE_5_SECONDS')
+    if not _is_sha(schedule_sha256):
+        raise V4ExecutionError('V4_AUTHORIZATION_SCHEDULE_REQUIRED')
+    decision_path = output_path.with_name('v4-preflight-decision.json')
+    receipt_path = output_path.with_name('v4-execution-receipt.json')
+    authorization_path = output_path.with_name('v4-execution-authorization.json')
+    _reject_attempt_collision(
+        (output_path, decision_path, receipt_path, authorization_path)
+    )
+    history = _historical_values(historical_evidence_paths)
+    sampler = (
+        nvidia_smi_all_gpu_inventory_sample
+        if inventory_sampler is None
+        else inventory_sampler
+    )
+    run_id = uuid4().hex
+    samples: list[dict[str, object]] = []
+    selection: dict[str, object] = {
+        'status': 'FAIL',
+        'reason_code': 'V4_GPU_INVENTORY_UNAVAILABLE',
+        'candidate_evaluations': [],
+        'selected_gpu': None,
+    }
+    error: str | None = None
+    try:
+        samples.append(dict(sampler()))
+        sleeper(FORMAL_SAMPLE_INTERVAL_SECONDS)
+        samples.append(dict(sampler()))
+        selection = select_attempt_gpu(samples)
+    except V4ExecutionError as exc:
+        error = str(exc)
+        selection['reason_code'] = str(exc)
+    except Exception as exc:
+        error = str(exc)
+
+    probes: list[dict[str, object]] = []
+    status = str(selection['status'])
+    reason = str(selection['reason_code'])
+    selected = selection.get('selected_gpu')
+    if status == 'PASS' and isinstance(selected, Mapping):
+        try:
+            selected_uuid = str(selected['uuid'])
+            selected_index = int(selected['index'])
+            for model in SCIENTIFIC_MODELS:
+                probes.append(
+                    dict(
+                        probe_runner(
+                            model,
+                            selected_uuid,
+                            selected_index,
+                            selected,
+                        )
+                    )
+                )
+            probe_decision = _evaluate_attempt_probes(probes, selected)
+            status = str(probe_decision['status'])
+            reason = (
+                'V4_ATTEMPT_PREFLIGHT_PASS'
+                if status == 'PASS'
+                else str(probe_decision['reason_code'])
+            )
+        except V4ExecutionError as exc:
+            status = 'FAIL'
+            reason = str(exc)
+            error = str(exc)
+        except Exception as exc:
+            status = 'FAIL'
+            reason = 'V4_GPU_TORCH_PROBE_FAILED'
+            error = str(exc)
+
+    snapshot: dict[str, object] = {
+        'schema_version': ATTEMPT_PREFLIGHT_SCHEMA_VERSION,
+        'attempt_id': ATTEMPT_ID,
+        'run_id': run_id,
+        'implementation_commit': IMPLEMENTATION_ANCHOR_COMMIT,
+        'implementation_tree': IMPLEMENTATION_ANCHOR_TREE,
+        'sample_interval_seconds': FORMAL_SAMPLE_INTERVAL_SECONDS,
+        'status': status,
+        'reason_code': reason,
+        'inventory_samples': samples,
+        'candidate_evaluations': selection['candidate_evaluations'],
+        'selected_gpu': selected,
+        'model_environment_probes': probes,
+        'no_fallback_or_switch': True,
+    }
+    if error is not None:
+        snapshot['error'] = error
+    _reject_historical_reuse(snapshot, history)
+    _publish_attempt_json(
+        output_path, snapshot, validator=_validate_attempt_preflight_payload
+    )
+    snapshot_sha = sha256_file(output_path)
+    decision = _sign_attempt_payload(
+        {
+            'schema_version': f'{ATTEMPT_SCHEMA_PREFIX}-preflight-decision-1.0',
+            'attempt_id': ATTEMPT_ID,
+            'run_id': run_id,
+            'status': status,
+            'reason_code': reason,
+            'terminal_status': status,
+            'selected_gpu': selected,
+            'hardware_preflight_path': str(output_path.resolve()),
+            'hardware_preflight_sha256': snapshot_sha,
+            'scientific_result': 'NO_SCIENTIFIC_RESULT',
+        },
+        'decision_sha256',
+    )
+    _reject_historical_reuse(decision, history)
+    _publish_attempt_json(
+        decision_path, decision, validator=_validate_attempt_decision_payload
+    )
+    result: dict[str, object] = {
+        'status': status,
+        'reason_code': reason,
+        'hardware_preflight_path': str(output_path),
+        'hardware_preflight_sha256': snapshot_sha,
+        'preflight_decision_path': str(decision_path),
+        'preflight_decision_sha256': sha256_file(decision_path),
+    }
+    if status != 'PASS' or not isinstance(selected, Mapping):
+        return result
+    receipt = _sign_attempt_payload(
+        {
+            'schema_version': ATTEMPT_RECEIPT_SCHEMA_VERSION,
+            'attempt_id': ATTEMPT_ID,
+            'run_id': run_id,
+            'implementation_commit': IMPLEMENTATION_ANCHOR_COMMIT,
+            'implementation_tree': IMPLEMENTATION_ANCHOR_TREE,
+            'protocol_id': V4_PROTOCOL_ID,
+            'protocol_sha256': V4_PROTOCOL_SHA256,
+            'schedule_sha256': schedule_sha256,
+            'hardware_preflight_path': str(output_path.resolve()),
+            'hardware_preflight_sha256': snapshot_sha,
+            'preflight_decision_path': str(decision_path.resolve()),
+            'preflight_decision_sha256': sha256_file(decision_path),
+            'selected_gpu_uuid': selected['uuid'],
+            'selected_physical_index': selected['index'],
+            'selected_gpu_model': selected['model'],
+            'selected_total_memory_bytes': selected['total_memory_bytes'],
+            'max_concurrent_gpus': 1,
+            'sequential_model_execution': True,
+            'sequential_unit_execution': True,
+            'fallback_allowed': False,
+            'device_switch_allowed': False,
+            'retry_allowed': False,
+            'nonce': uuid4().hex,
+        },
+        'receipt_payload_sha256',
+    )
+    _reject_historical_reuse(receipt, history)
+    _publish_attempt_json(
+        receipt_path, receipt, validator=_validate_attempt_receipt_payload
+    )
+    result['receipt_path'] = str(receipt_path)
+    result['receipt_sha256'] = sha256_file(receipt_path)
+    return result
+
+
+def validate_attempt_receipt(path: Path) -> dict[str, object]:
+    _require_attempt_path(path)
+    payload = load_json(path)
+    _validate_attempt_receipt_payload(payload)
+    return payload
+
+
+def _resolve_production_input(root: Path, path: Path) -> Path:
+    resolved = _resolve_under_root(root, path, must_exist=True)
+    lowered = tuple(part.lower() for part in resolved.parts)
+    forbidden_names = {
+        'v4-hardware-preflight.json',
+        'v4-preflight-decision.json',
+        'v4-execution-receipt.json',
+        'v4-execution-authorization.json',
+    }
+    if (
+        '.pytest_cache' in lowered
+        or 'attempt-01' in lowered
+        or resolved.name.lower() in forbidden_names
+    ):
+        raise V4ExecutionError('V4_PRODUCTION_INPUT_SOURCE_FORBIDDEN')
+    return resolved
+
+
+def _validated_file_binding(
+    root: Path, value: object, *, label: str
+) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) != {'path', 'sha256'}:
+        raise V4ExecutionError(f'V4_RESOURCE_BINDING_SCHEMA_REQUIRED:{label}')
+    path = _resolve_production_input(root, Path(str(value.get('path'))))
+    digest = value.get('sha256')
+    if not _is_sha(digest) or sha256_file(path) != digest:
+        raise V4ExecutionError(f'V4_RESOURCE_TAMPER:{label}')
+    return {'path': str(path), 'sha256': str(digest)}
+
+
+def _validated_model_bindings(root: Path, value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != set(SCIENTIFIC_MODELS):
+        raise V4ExecutionError('V4_MODEL_BINDINGS_SCHEMA_REQUIRED')
+    normalized: dict[str, object] = {}
+    for model in SCIENTIFIC_MODELS:
+        row = value[model]
+        if not isinstance(row, Mapping) or set(row) != {
+            'weights',
+            'config',
+            'upstream_commit',
+        }:
+            raise V4ExecutionError('V4_MODEL_BINDINGS_SCHEMA_REQUIRED')
+        upstream = row.get('upstream_commit')
+        if not _is_sha(upstream, length=40):
+            raise V4ExecutionError('V4_MODEL_UPSTREAM_COMMIT_REQUIRED')
+        normalized[model] = {
+            'weights': _validated_file_binding(
+                root, row['weights'], label=f'{model}:weights'
+            ),
+            'config': _validated_file_binding(
+                root, row['config'], label=f'{model}:config'
+            ),
+            'upstream_commit': upstream,
+        }
+    return normalized
+
+
+def _validated_archive_bindings(root: Path, value: object) -> dict[str, object]:
+    expected = {'SampleSet', 'Points', 'Rectified'}
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise V4ExecutionError('V4_DTU_ARCHIVE_BINDINGS_SCHEMA_REQUIRED')
+    normalized: dict[str, object] = {}
+    for name in ('SampleSet', 'Points', 'Rectified'):
+        row = value[name]
+        if not isinstance(row, Mapping) or set(row) != {
+            'path',
+            'sha256',
+            'etag',
+            'central_directory_sha256',
+            'referenced_members',
+        }:
+            raise V4ExecutionError('V4_DTU_ARCHIVE_BINDINGS_SCHEMA_REQUIRED')
+        path = _resolve_production_input(root, Path(str(row.get('path'))))
+        digest = row.get('sha256')
+        if not _is_sha(digest) or sha256_file(path) != digest:
+            raise V4ExecutionError('V4_DTU_ARCHIVE_TAMPER')
+        if not _runtime_proven(row.get('etag')) or not _is_sha(
+            row.get('central_directory_sha256')
+        ):
+            raise V4ExecutionError('V4_DTU_ARCHIVE_IDENTITY_UNPROVEN')
+        members = row.get('referenced_members')
+        if not isinstance(members, list) or not members:
+            raise V4ExecutionError('V4_DTU_MEMBER_DIGESTS_REQUIRED')
+        normalized_members: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for member in members:
+            if not isinstance(member, Mapping) or set(member) != {
+                'member',
+                'sha256',
+            }:
+                raise V4ExecutionError('V4_DTU_MEMBER_DIGESTS_REQUIRED')
+            member_name = member.get('member')
+            member_sha = member.get('sha256')
+            if (
+                not _runtime_proven(member_name)
+                or str(member_name) in seen
+                or not _is_sha(member_sha)
+            ):
+                raise V4ExecutionError('V4_DTU_MEMBER_DIGESTS_REQUIRED')
+            seen.add(str(member_name))
+            normalized_members.append(
+                {'member': str(member_name), 'sha256': str(member_sha)}
+            )
+        normalized[name] = {
+            'path': str(path),
+            'sha256': str(digest),
+            'etag': row['etag'],
+            'central_directory_sha256': row['central_directory_sha256'],
+            'referenced_members': normalized_members,
+        }
+    return normalized
+
+
+def _read_state_inventory(path: Path) -> tuple[ModelIndependentState, ...]:
+    payload = json.loads(path.read_text(encoding='utf-8'))
+    if isinstance(payload, Mapping):
+        rows = payload.get('states')
+    else:
+        rows = payload
+    if not isinstance(rows, list) or len(rows) != 200:
+        raise V4ExecutionError('V4_STATE_INVENTORY_NOT_EXACT_200')
+    try:
+        states = tuple(ModelIndependentState.from_dict(row) for row in rows)
+    except (TypeError, ValueError) as exc:
+        raise V4ExecutionError('V4_STATE_INVENTORY_INVALID') from exc
+    keys = [(state.scene_id, state.state_id) for state in states]
+    expected = [
+        (scene_id, state_id)
+        for scene_id in TEST_SCENE_IDS
+        for state_id in SCIENTIFIC_STATES
+    ]
+    if keys != expected or len(set(keys)) != 200:
+        raise V4ExecutionError('V4_STATE_INVENTORY_NOT_EXACT_200')
+    return states
+
+
+def _validate_split_binding(path: Path) -> None:
+    payload = load_json(path)
+    scenes = payload.get('test_scene_ids', payload.get('test'))
+    if scenes != list(TEST_SCENE_IDS):
+        raise V4ExecutionError('V4_SPLIT_TEST_SCENES_MISMATCH')
+
+
+def _validate_fog_binding(path: Path) -> None:
+    payload = load_json(path)
+    if (
+        payload.get('model') != 'Koschmieder'
+        or payload.get('severity_family') != 'beta-only'
+        or payload.get('state_ids') != list(FOG_STATES)
+    ):
+        raise V4ExecutionError('V4_FOG_MANIFEST_SCOPE_MISMATCH')
+
+
+def _validate_attempt_resource_payload(payload: Mapping[str, Any]) -> None:
+    _require_attempt_id(payload.get('attempt_id'))
+    if payload.get('schema_version') != ATTEMPT_RESOURCE_SCHEMA_VERSION:
+        raise V4ExecutionError('V4_RESOURCE_INVENTORY_SCHEMA_REQUIRED')
+    _validate_attempt_signature(
+        payload, 'resource_snapshot_sha256', 'V4_RESOURCE_SNAPSHOT_TAMPER'
+    )
+    if (
+        payload.get('implementation_commit') != IMPLEMENTATION_ANCHOR_COMMIT
+        or payload.get('implementation_tree') != IMPLEMENTATION_ANCHOR_TREE
+    ):
+        raise V4ExecutionError('V4_AUTHORIZATION_STALE_ANCHOR')
+    if (
+        payload.get('protocol_id') != V4_PROTOCOL_ID
+        or payload.get('protocol_sha256') != V4_PROTOCOL_SHA256
+    ):
+        raise V4ExecutionError('V4_AUTHORIZATION_PROTOCOL_MISMATCH')
+    resources = payload.get('resources')
+    if not isinstance(resources, Mapping) or set(resources) != set(
+        ATTEMPT_RESOURCE_KEYS
+    ):
+        raise V4ExecutionError('V4_RESOURCE_INVENTORY_SCHEMA_REQUIRED')
+    state_binding = resources['state_inventory_200']
+    schedule_binding = resources['scientific_schedule_400']
+    if not isinstance(state_binding, Mapping) or not isinstance(
+        schedule_binding, Mapping
+    ):
+        raise V4ExecutionError('V4_RESOURCE_INVENTORY_SCHEMA_REQUIRED')
+    state_path = Path(str(state_binding.get('path')))
+    schedule_path = Path(str(schedule_binding.get('path')))
+    for path, binding in (
+        (state_path, state_binding),
+        (schedule_path, schedule_binding),
+    ):
+        _require_attempt_path(path)
+        if (
+            not path.is_file()
+            or not _is_sha(binding.get('sha256'))
+            or sha256_file(path) != binding.get('sha256')
+        ):
+            raise V4ExecutionError('V4_RESOURCE_TAMPER')
+    state_payload = load_json(state_path)
+    if (
+        state_payload.get('attempt_id') != ATTEMPT_ID
+        or state_payload.get('state_count') != 200
+        or not isinstance(state_payload.get('states'), list)
+        or len(state_payload['states']) != 200
+    ):
+        raise V4ExecutionError('V4_STATE_INVENTORY_NOT_EXACT_200')
+    states = tuple(
+        ModelIndependentState.from_dict(row) for row in state_payload['states']
+    )
+    schedule_payload = load_json(schedule_path)
+    if schedule_payload.get('attempt_id') != ATTEMPT_ID:
+        raise V4ExecutionError('V4_ATTEMPT_ID_MISMATCH')
+    schedule = validate_scientific_schedule(schedule_payload.get('schedule', {}))
+    rebuilt = build_scientific_schedule(states)
+    if schedule.schedule_sha256 != rebuilt.schedule_sha256:
+        raise V4ExecutionError('V4_SCHEDULE_TAMPER')
+    l3_keys = [
+        (unit.model_id, unit.scene_id)
+        for unit in schedule.units
+        if unit.state_id == 'L3'
+    ]
+    if len(l3_keys) != 40 or len(set(l3_keys)) != 40:
+        raise V4ExecutionError('V4_SCHEDULE_L3_DEDUP_REQUIRED')
+    if payload.get('schedule_sha256') != schedule.schedule_sha256:
+        raise V4ExecutionError('V4_SCHEDULE_TAMPER')
+    if payload.get('state_count') != 200 or payload.get('unit_count') != 400:
+        raise V4ExecutionError('V4_AUTHORIZATION_SCOPE_EXPANDED')
+
+
+def materialize_attempt_resources(
+    *, root: Path, source_manifest_path: Path, output_path: Path
+) -> dict[str, object]:
+    '''Materialize the production 200-state/400-unit attempt-02 resources.'''
+
+    resolved_root = root.resolve()
+    _require_attempt_path(output_path)
+    state_path = output_path.with_name('v4-state-inventory-200.json')
+    schedule_path = output_path.with_name('v4-scientific-schedule-400.json')
+    _reject_attempt_collision((state_path, schedule_path, output_path))
+    source_path = _resolve_production_input(resolved_root, source_manifest_path)
+    source = load_json(source_path)
+    expected_keys = {
+        'attempt_id',
+        'model_bindings',
+        'dtu_archives',
+        'v4_split',
+        'state_inventory_200',
+        'fog_manifest',
+        'environment_locks',
+        'science_lock',
+    }
+    if set(source) != expected_keys:
+        raise V4ExecutionError('V4_RESOURCE_SOURCE_SCHEMA_REQUIRED')
+    _require_attempt_id(source.get('attempt_id'))
+    models = _validated_model_bindings(
+        resolved_root, source.get('model_bindings')
+    )
+    archives = _validated_archive_bindings(
+        resolved_root, source.get('dtu_archives')
+    )
+    split = _validated_file_binding(
+        resolved_root, source.get('v4_split'), label='v4_split'
+    )
+    _validate_split_binding(Path(split['path']))
+    source_states = _validated_file_binding(
+        resolved_root,
+        source.get('state_inventory_200'),
+        label='state_inventory_200',
+    )
+    states = _read_state_inventory(Path(source_states['path']))
+    fog = _validated_file_binding(
+        resolved_root, source.get('fog_manifest'), label='fog_manifest'
+    )
+    _validate_fog_binding(Path(fog['path']))
+    environments_raw = source.get('environment_locks')
+    if not isinstance(environments_raw, Mapping) or set(
+        environments_raw
+    ) != set(SCIENTIFIC_MODELS):
+        raise V4ExecutionError('V4_ENVIRONMENT_LOCKS_SCHEMA_REQUIRED')
+    environments = {
+        model: _validated_file_binding(
+            resolved_root,
+            environments_raw[model],
+            label=f'{model}:environment_lock',
+        )
+        for model in SCIENTIFIC_MODELS
+    }
+    science_lock = _validated_file_binding(
+        resolved_root, source.get('science_lock'), label='science_lock'
+    )
+    schedule = build_scientific_schedule(states)
+    state_payload = {
+        'schema_version': f'{ATTEMPT_SCHEMA_PREFIX}-state-inventory-1.0',
+        'attempt_id': ATTEMPT_ID,
+        'state_count': 200,
+        'source_path': source_states['path'],
+        'source_sha256': source_states['sha256'],
+        'states': [state.to_dict() for state in states],
+    }
+    schedule_payload = {
+        'schema_version': f'{ATTEMPT_SCHEMA_PREFIX}-schedule-wrapper-1.0',
+        'attempt_id': ATTEMPT_ID,
+        'state_count': 200,
+        'unit_count': 400,
+        'l3_inference_count': 40,
+        'schedule': schedule.to_dict(),
+    }
+    _publish_attempt_json(
+        state_path,
+        state_payload,
+        validator=lambda staged: (
+            None
+            if staged.get('attempt_id') == ATTEMPT_ID
+            and staged.get('state_count') == 200
+            and isinstance(staged.get('states'), list)
+            and len(staged['states']) == 200
+            else (_ for _ in ()).throw(
+                V4ExecutionError('V4_STATE_INVENTORY_NOT_EXACT_200')
+            )
+        ),
+    )
+    _publish_attempt_json(
+        schedule_path,
+        schedule_payload,
+        validator=lambda staged: validate_scientific_schedule(
+            staged.get('schedule', {})
+        ),
+    )
+    resources = {
+        'model_bindings': models,
+        'dtu_archives': archives,
+        'v4_split': split,
+        'state_inventory_200': {
+            'path': str(state_path.resolve()),
+            'sha256': sha256_file(state_path),
+        },
+        'fog_manifest': fog,
+        'scientific_schedule_400': {
+            'path': str(schedule_path.resolve()),
+            'sha256': sha256_file(schedule_path),
+        },
+        'environment_locks': environments,
+        'science_lock': science_lock,
+    }
+    payload = _sign_attempt_payload(
+        {
+            'schema_version': ATTEMPT_RESOURCE_SCHEMA_VERSION,
+            'attempt_id': ATTEMPT_ID,
+            'implementation_commit': IMPLEMENTATION_ANCHOR_COMMIT,
+            'implementation_tree': IMPLEMENTATION_ANCHOR_TREE,
+            'protocol_id': V4_PROTOCOL_ID,
+            'protocol_sha256': V4_PROTOCOL_SHA256,
+            'source_manifest_path': str(source_path),
+            'source_manifest_sha256': sha256_file(source_path),
+            'state_count': 200,
+            'unit_count': 400,
+            'schedule_sha256': schedule.schedule_sha256,
+            'resources': resources,
+        },
+        'resource_snapshot_sha256',
+    )
+    _publish_attempt_json(
+        output_path, payload, validator=_validate_attempt_resource_payload
+    )
+    return {
+        'status': 'PASS',
+        'resource_snapshot_path': str(output_path),
+        'resource_snapshot_sha256': sha256_file(output_path),
+        'schedule_sha256': schedule.schedule_sha256,
+        'state_count': 200,
+        'unit_count': 400,
+    }
+
+
+def validate_attempt_resources(path: Path) -> dict[str, object]:
+    _require_attempt_path(path)
+    payload = load_json(path)
+    _validate_attempt_resource_payload(payload)
+    _validate_all_attempt_resource_files(payload)
+    return payload
+
+
+def _validate_all_attempt_resource_files(payload: Mapping[str, Any]) -> None:
+    resources = payload.get('resources')
+    if not isinstance(resources, Mapping):
+        raise V4ExecutionError('V4_RESOURCE_INVENTORY_SCHEMA_REQUIRED')
+    bindings: list[Mapping[str, object]] = []
+    models = resources.get('model_bindings')
+    if not isinstance(models, Mapping):
+        raise V4ExecutionError('V4_MODEL_BINDINGS_SCHEMA_REQUIRED')
+    for model in SCIENTIFIC_MODELS:
+        row = models.get(model)
+        if not isinstance(row, Mapping):
+            raise V4ExecutionError('V4_MODEL_BINDINGS_SCHEMA_REQUIRED')
+        for key in ('weights', 'config'):
+            binding = row.get(key)
+            if not isinstance(binding, Mapping):
+                raise V4ExecutionError('V4_MODEL_BINDINGS_SCHEMA_REQUIRED')
+            bindings.append(binding)
+    archives = resources.get('dtu_archives')
+    if not isinstance(archives, Mapping):
+        raise V4ExecutionError('V4_DTU_ARCHIVE_BINDINGS_SCHEMA_REQUIRED')
+    for name in ('SampleSet', 'Points', 'Rectified'):
+        binding = archives.get(name)
+        if not isinstance(binding, Mapping):
+            raise V4ExecutionError('V4_DTU_ARCHIVE_BINDINGS_SCHEMA_REQUIRED')
+        bindings.append(binding)
+    for key in (
+        'v4_split',
+        'state_inventory_200',
+        'fog_manifest',
+        'scientific_schedule_400',
+        'science_lock',
+    ):
+        binding = resources.get(key)
+        if not isinstance(binding, Mapping):
+            raise V4ExecutionError('V4_RESOURCE_INVENTORY_SCHEMA_REQUIRED')
+        bindings.append(binding)
+    environments = resources.get('environment_locks')
+    if not isinstance(environments, Mapping):
+        raise V4ExecutionError('V4_ENVIRONMENT_LOCKS_SCHEMA_REQUIRED')
+    for model in SCIENTIFIC_MODELS:
+        binding = environments.get(model)
+        if not isinstance(binding, Mapping):
+            raise V4ExecutionError('V4_ENVIRONMENT_LOCKS_SCHEMA_REQUIRED')
+        bindings.append(binding)
+    for binding in bindings:
+        path = Path(str(binding.get('path')))
+        digest = binding.get('sha256')
+        if not path.is_file() or not _is_sha(digest) or sha256_file(path) != digest:
+            raise V4ExecutionError('V4_RESOURCE_TAMPER')
+    source = Path(str(payload.get('source_manifest_path')))
+    if (
+        not source.is_file()
+        or sha256_file(source) != payload.get('source_manifest_sha256')
+    ):
+        raise V4ExecutionError('V4_RESOURCE_SOURCE_TAMPER')
+    _validate_split_binding(Path(str(resources['v4_split']['path'])))
+    _validate_fog_binding(Path(str(resources['fog_manifest']['path'])))
+
+
+def _validate_attempt_authorization_payload(payload: Mapping[str, Any]) -> None:
+    _require_attempt_id(payload.get('attempt_id'))
+    if payload.get('schema_version') != ATTEMPT_AUTHORIZATION_SCHEMA_VERSION:
+        raise V4ExecutionError('V4_AUTHORIZATION_SCHEMA_REQUIRED')
+    _validate_attempt_signature(
+        payload, 'authorization_sha256', 'V4_AUTHORIZATION_TAMPER'
+    )
+    if (
+        payload.get('implementation_commit') != IMPLEMENTATION_ANCHOR_COMMIT
+        or payload.get('implementation_tree') != IMPLEMENTATION_ANCHOR_TREE
+    ):
+        raise V4ExecutionError('V4_AUTHORIZATION_STALE_ANCHOR')
+    if (
+        payload.get('protocol_id') != V4_PROTOCOL_ID
+        or payload.get('protocol_sha256') != V4_PROTOCOL_SHA256
+    ):
+        raise V4ExecutionError('V4_AUTHORIZATION_PROTOCOL_MISMATCH')
+    if payload.get('finalizer') != AUTHORIZED_FINALIZER:
+        raise V4ExecutionError('V4_AUTHORIZATION_FINALIZER_MISMATCH')
+    if payload.get('authorized_scope') != _authorized_scope():
+        raise V4ExecutionError('V4_AUTHORIZATION_SCOPE_EXPANDED')
+    root = Path(str(payload.get('root'))).resolve()
+    paths = (
+        Path(str(payload.get('run_root'))),
+        Path(str(payload.get('artifact_root'))),
+        Path(str(payload.get('final_evidence_path'))),
+    )
+    _resolve_under_root(root, paths[0], must_exist=True)
+    _resolve_under_root(root, paths[1], must_exist=True)
+    _resolve_under_root(root, paths[2])
+    for path in paths:
+        _require_attempt_path(path)
+    receipt_path = Path(str(payload.get('receipt_path')))
+    resources_path = Path(str(payload.get('resource_snapshot_path')))
+    _require_attempt_path(receipt_path)
+    _require_attempt_path(resources_path)
+    _resolve_under_root(root, receipt_path, must_exist=True)
+    _resolve_under_root(root, resources_path, must_exist=True)
+    if (
+        not receipt_path.is_file()
+        or sha256_file(receipt_path) != payload.get('receipt_sha256')
+    ):
+        raise V4ExecutionError('V4_RECEIPT_TAMPER')
+    if (
+        not resources_path.is_file()
+        or sha256_file(resources_path) != payload.get('resource_snapshot_file_sha256')
+    ):
+        raise V4ExecutionError('V4_RESOURCE_SNAPSHOT_TAMPER')
+    receipt = validate_attempt_receipt(receipt_path)
+    resources = validate_attempt_resources(resources_path)
+    _validate_all_attempt_resource_files(resources)
+    if (
+        receipt.get('schedule_sha256') != resources.get('schedule_sha256')
+        or receipt.get('schedule_sha256') != payload.get('schedule_sha256')
+        or receipt.get('selected_gpu_uuid') != payload.get('selected_gpu_uuid')
+        or receipt.get('selected_physical_index')
+        != payload.get('selected_physical_index')
+        or receipt.get('run_id') != payload.get('run_id')
+    ):
+        raise V4ExecutionError('V4_AUTHORIZATION_RECEIPT_MISMATCH')
+    if (
+        payload.get('max_concurrent_gpus') != 1
+        or payload.get('sequential_execution') is not True
+        or payload.get('fallback_allowed') is not False
+        or payload.get('device_switch_allowed') is not False
+        or payload.get('retry_allowed') is not False
+    ):
+        raise V4ExecutionError('V4_AUTHORIZATION_SCOPE_EXPANDED')
+
+
+def create_attempt_execution_authorization(
+    *,
+    root: Path,
+    receipt_path: Path,
+    resource_snapshot_path: Path,
+    run_root: Path,
+    artifact_root: Path,
+    final_evidence_path: Path,
+    output_path: Path,
+) -> dict[str, object]:
+    '''Authorize only the exact attempt-02 receipt and production resources.'''
+
+    _require_attempt_path(output_path)
+    _reject_attempt_collision((output_path,))
+    resolved_root = root.resolve()
+    receipt = validate_attempt_receipt(receipt_path)
+    resources = validate_attempt_resources(resource_snapshot_path)
+    _validate_all_attempt_resource_files(resources)
+    if receipt.get('schedule_sha256') != resources.get('schedule_sha256'):
+        raise V4ExecutionError('V4_AUTHORIZATION_SCHEDULE_MISMATCH')
+    resolved_run = _resolve_under_root(resolved_root, run_root, must_exist=True)
+    resolved_artifact = _resolve_under_root(
+        resolved_root, artifact_root, must_exist=True
+    )
+    resolved_evidence = _resolve_under_root(
+        resolved_root, final_evidence_path
+    )
+    for path in (resolved_run, resolved_artifact, resolved_evidence):
+        _require_attempt_path(path)
+    payload = _sign_attempt_payload(
+        {
+            'schema_version': ATTEMPT_AUTHORIZATION_SCHEMA_VERSION,
+            'attempt_id': ATTEMPT_ID,
+            'run_id': receipt['run_id'],
+            'implementation_commit': IMPLEMENTATION_ANCHOR_COMMIT,
+            'implementation_tree': IMPLEMENTATION_ANCHOR_TREE,
+            'protocol_id': V4_PROTOCOL_ID,
+            'protocol_sha256': V4_PROTOCOL_SHA256,
+            'receipt_path': str(receipt_path.resolve()),
+            'receipt_sha256': sha256_file(receipt_path),
+            'resource_snapshot_path': str(resource_snapshot_path.resolve()),
+            'resource_snapshot_file_sha256': sha256_file(
+                resource_snapshot_path
+            ),
+            'resource_snapshot_sha256': resources[
+                'resource_snapshot_sha256'
+            ],
+            'schedule_sha256': receipt['schedule_sha256'],
+            'selected_gpu_uuid': receipt['selected_gpu_uuid'],
+            'selected_physical_index': receipt['selected_physical_index'],
+            'root': str(resolved_root),
+            'run_root': str(resolved_run),
+            'artifact_root': str(resolved_artifact),
+            'final_evidence_path': str(resolved_evidence),
+            'finalizer': AUTHORIZED_FINALIZER,
+            'authorized_scope': _authorized_scope(),
+            'max_concurrent_gpus': 1,
+            'sequential_execution': True,
+            'fallback_allowed': False,
+            'device_switch_allowed': False,
+            'retry_allowed': False,
+        },
+        'authorization_sha256',
+    )
+    _publish_attempt_json(
+        output_path,
+        payload,
+        validator=_validate_attempt_authorization_payload,
+    )
+    return {
+        'status': 'PASS',
+        'authorization_path': str(output_path),
+        'authorization_sha256': sha256_file(output_path),
+    }
+
+
+def validate_attempt_execution_authorization(
+    path: Path,
+) -> dict[str, object]:
+    _require_attempt_path(path)
+    payload = load_json(path)
+    _validate_attempt_authorization_payload(payload)
+    return payload
+
+
 PROCESS_EVIDENCE_REASON_CODES = PROCESS_PRESENT_REASON_CODES | frozenset(
     {"V4_GPU_UNEXPLAINED_ACTIVITY"}
 )
