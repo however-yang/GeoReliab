@@ -46,7 +46,6 @@ IMPLEMENTATION_ANCHOR_TREE = "f4e2b1104496c817693aaa5989d0276d2ebe03e9"
 V4_HARDWARE_PREFLIGHT_SCHEMA_VERSION = "georeliab-v4-hardware-preflight-1.0"
 V4_EXECUTION_AUTHORIZATION_SCHEMA_VERSION = "georeliab-v4-execution-authorization-1.0"
 V4_PREFLIGHT_DECISION_SCHEMA_VERSION = "georeliab-v4-preflight-decision-1.0"
-V4_AUTHORIZATION_REVISION = "v4-gpu-selection-authorization"
 AUTHORIZED_GPU_MODEL = "NVIDIA A100 80GB PCIe"
 MIN_FREE_MEMORY_BYTES = 16 * 1024 * 1024 * 1024
 AUTHORIZED_FINALIZER = "georeliab_mve.v4_execution:finalize_v4_scientific_bundle"
@@ -173,13 +172,31 @@ def _validate_authorization_payload(payload: Mapping[str, Any]) -> None:
         raise V4ExecutionError("V4_AUTHORIZATION_FINALIZER_MISMATCH")
 
 
-def _validate_preflight_decision_payload(payload: Mapping[str, Any]) -> None:
+def _validate_preflight_decision_payload(
+    payload: Mapping[str, Any],
+    *,
+    expected_snapshot_path: Path | None = None,
+    expected_authorization_commit: str | None = None,
+    expected_authorization_tree: str | None = None,
+    expected_run_id: str | None = None,
+) -> None:
     if payload.get("schema_version") != V4_PREFLIGHT_DECISION_SCHEMA_VERSION:
         raise V4ExecutionError("V4_PREFLIGHT_DECISION_SCHEMA_REQUIRED")
     if payload.get("implementation_commit") != IMPLEMENTATION_ANCHOR_COMMIT or payload.get("implementation_tree") != IMPLEMENTATION_ANCHOR_TREE:
         raise V4ExecutionError("V4_PREFLIGHT_DECISION_ANCHOR_MISMATCH")
-    if payload.get("authorization_revision") != V4_AUTHORIZATION_REVISION:
+    authorization_commit = payload.get("authorization_commit")
+    authorization_tree = payload.get("authorization_tree")
+    if not _is_sha(authorization_commit, length=40) or not _is_sha(authorization_tree, length=40):
         raise V4ExecutionError("V4_PREFLIGHT_DECISION_REVISION_MISMATCH")
+    if expected_authorization_commit is not None and authorization_commit != expected_authorization_commit:
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_REVISION_MISMATCH")
+    if expected_authorization_tree is not None and authorization_tree != expected_authorization_tree:
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_REVISION_MISMATCH")
+    run_id = payload.get("run_id")
+    if not _is_sha(run_id, length=32):
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_SCHEMA_REQUIRED")
+    if expected_run_id is not None and run_id != expected_run_id:
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_RUN_MISMATCH")
     if not isinstance(payload.get("requested_physical_index"), int) or isinstance(payload.get("requested_physical_index"), bool):
         raise V4ExecutionError("V4_PREFLIGHT_DECISION_SCHEMA_REQUIRED")
     if payload.get("status") != "BLOCKED" or not isinstance(payload.get("reason_code"), str):
@@ -189,6 +206,8 @@ def _validate_preflight_decision_payload(payload: Mapping[str, Any]) -> None:
     if payload.get("scientific_result") != "NO_SCIENTIFIC_RESULT":
         raise V4ExecutionError("V4_PREFLIGHT_DECISION_NO_SCIENTIFIC_RESULT_REQUIRED")
     snapshot_path = Path(str(payload.get("hardware_preflight_path")))
+    if expected_snapshot_path is not None and snapshot_path.resolve() != expected_snapshot_path.resolve():
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_SNAPSHOT_PATH_MISMATCH")
     if not snapshot_path.is_file():
         raise V4ExecutionError("V4_PREFLIGHT_DECISION_SNAPSHOT_REQUIRED")
     snapshot_sha = payload.get("hardware_preflight_sha256")
@@ -201,8 +220,12 @@ def _validate_preflight_decision_payload(payload: Mapping[str, Any]) -> None:
         raise V4ExecutionError("V4_PREFLIGHT_DECISION_SNAPSHOT_MISMATCH")
     if snapshot.get("project_commit") != IMPLEMENTATION_ANCHOR_COMMIT or snapshot.get("project_tree") != IMPLEMENTATION_ANCHOR_TREE:
         raise V4ExecutionError("V4_PREFLIGHT_DECISION_SNAPSHOT_MISMATCH")
+    if snapshot.get("authorization_commit") != authorization_commit or snapshot.get("authorization_tree") != authorization_tree:
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_SNAPSHOT_MISMATCH")
     if snapshot.get("requested_physical_index") != payload.get("requested_physical_index"):
         raise V4ExecutionError("V4_PREFLIGHT_DECISION_SNAPSHOT_MISMATCH")
+    if snapshot.get("run_id") != run_id:
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_RUN_MISMATCH")
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -222,6 +245,26 @@ def _is_sha(value: object, length: int = 64) -> bool:
         and value == value.lower()
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _current_authorization_revision() -> tuple[str, str]:
+    repo_root = Path(__file__).resolve().parents[1]
+    try:
+        commit = _run_text_command(("git", "-C", str(repo_root), "rev-parse", "HEAD")).strip()
+        tree = _run_text_command(("git", "-C", str(repo_root), "rev-parse", "HEAD^{tree}")).strip()
+    except Exception as exc:
+        raise V4ExecutionError("V4_AUTHORIZATION_REVISION_UNRESOLVED") from exc
+    if not _is_sha(commit, length=40) or not _is_sha(tree, length=40):
+        raise V4ExecutionError("V4_AUTHORIZATION_REVISION_UNRESOLVED")
+    return commit, tree
+
+
+def _resolve_authorization_revision(authorization_commit: str | None, authorization_tree: str | None) -> tuple[str, str]:
+    if authorization_commit is None and authorization_tree is None:
+        return _current_authorization_revision()
+    if not _is_sha(authorization_commit, length=40) or not _is_sha(authorization_tree, length=40):
+        raise V4ExecutionError("V4_AUTHORIZATION_REVISION_REQUIRED")
+    return str(authorization_commit), str(authorization_tree)
 
 
 def _resolve_under_root(root: Path, target: Path, *, must_exist: bool = False) -> Path:
@@ -502,6 +545,9 @@ def _write_blocked_preflight_decision(
     output_path: Path,
     requested_physical_index: int,
     reason_code: str,
+    authorization_commit: str,
+    authorization_tree: str,
+    run_id: str,
 ) -> dict[str, object]:
     snapshot_sha = sha256_file(output_path)
     decision_path = _preflight_decision_path(output_path)
@@ -509,7 +555,9 @@ def _write_blocked_preflight_decision(
         "schema_version": V4_PREFLIGHT_DECISION_SCHEMA_VERSION,
         "implementation_commit": IMPLEMENTATION_ANCHOR_COMMIT,
         "implementation_tree": IMPLEMENTATION_ANCHOR_TREE,
-        "authorization_revision": V4_AUTHORIZATION_REVISION,
+        "authorization_commit": authorization_commit,
+        "authorization_tree": authorization_tree,
+        "run_id": run_id,
         "requested_physical_index": requested_physical_index,
         "hardware_preflight_path": str(output_path),
         "hardware_preflight_sha256": snapshot_sha,
@@ -519,7 +567,17 @@ def _write_blocked_preflight_decision(
         "terminal_reason_code": reason_code,
         "scientific_result": "NO_SCIENTIFIC_RESULT",
     }
-    _atomic_json(decision_path, payload, validator=_validate_preflight_decision_payload)
+    _atomic_json(
+        decision_path,
+        payload,
+        validator=lambda staged: _validate_preflight_decision_payload(
+            staged,
+            expected_snapshot_path=output_path,
+            expected_authorization_commit=authorization_commit,
+            expected_authorization_tree=authorization_tree,
+            expected_run_id=run_id,
+        ),
+    )
     return {
         "preflight_decision_path": str(decision_path),
         "preflight_decision_sha256": sha256_file(decision_path),
@@ -535,6 +593,8 @@ def create_hardware_preflight(
     scope: str = SCIENTIFIC_MVE,
     stage: str = SCIENTIFIC_MVE,
     schedule_sha256: str | None = None,
+    authorization_commit: str | None = None,
+    authorization_tree: str | None = None,
     sample_interval_seconds: float = 5.0,
     sampler: Callable[[int], Mapping[str, object]] = nvidia_smi_hardware_sample,
     sleeper: Callable[[float], None] = time.sleep,
@@ -542,6 +602,8 @@ def create_hardware_preflight(
 ) -> dict[str, object]:
     if not isinstance(requested_physical_index, int) or isinstance(requested_physical_index, bool) or requested_physical_index < 0:
         raise V4ExecutionError("V4_GPU_INDEX_INVALID")
+    resolved_authorization_commit, resolved_authorization_tree = _resolve_authorization_revision(authorization_commit, authorization_tree)
+    run_id = uuid4().hex
     samples: list[dict[str, object]] = []
     try:
         samples.append(dict(sampler(requested_physical_index)))
@@ -569,6 +631,9 @@ def create_hardware_preflight(
         "project_tree": project_tree,
         "scope": scope,
         "stage": stage,
+        "authorization_commit": resolved_authorization_commit,
+        "authorization_tree": resolved_authorization_tree,
+        "run_id": run_id,
         "requested_physical_index": requested_physical_index,
         "resolved_physical_index": selected.get("resolved_physical_index"),
         "sample_interval_seconds": float(sample_interval_seconds),
@@ -608,6 +673,9 @@ def create_hardware_preflight(
             output_path=output_path,
             requested_physical_index=requested_physical_index,
             reason_code=str(snapshot["reason_code"]),
+            authorization_commit=resolved_authorization_commit,
+            authorization_tree=resolved_authorization_tree,
+            run_id=run_id,
         ))
         return result
     try:

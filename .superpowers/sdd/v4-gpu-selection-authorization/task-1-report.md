@@ -145,3 +145,27 @@ DONE_WITH_CONCERNS
 - No GPU/model/scientific execution was run.
 - No checkpoint/model-forward, protocol/config/split/corruption/metrics/adapters/evidence files were touched.
 - The blocked decision cannot bind an unrelated, PASS, stale-anchor, wrong-index, or wrong-reason snapshot even when the referenced snapshot SHA is self-consistent.
+
+## Review Follow-up: Immutable Auth Revision and Same-Run Binding - 2026-08-01
+
+### HIGH findings fixed
+1. Blocked decisions and hardware snapshots now bind full immutable authorization code revision fields: `authorization_commit` and `authorization_tree`. Runtime preflight resolves the current git `HEAD` and `HEAD^{tree}` immediately before artifact generation when explicit full values are not supplied; tests use immutable dummy SHAs to avoid depending on the live worktree revision. The implementation anchor `7381e60050143a78fca6a3ebde5706ae27d2c145` / `f4e2b1104496c817693aaa5989d0276d2ebe03e9` remains separate.
+2. Hardware snapshots and blocked decisions now share a cryptographic `run_id`; the decision validator cross-checks snapshot path, SHA, run ID, reason, implementation anchor, authorization commit/tree, and requested index. Runtime decision staging uses a validator closure with expected snapshot path, expected authorization revision, and expected run ID, so a decision cannot bind another self-consistent FAIL snapshot.
+
+### Added regressions
+- External-process failure still publishes snapshot + blocked decision and no PASS receipt/authorization/schedule.
+- Staged decision rejects stale authorization commit/tree under the expected-runtime-revision closure.
+- Staged decision rejects a different matching FAIL snapshot under the expected-snapshot-path closure.
+- Existing snapshot mismatch tests still reject PASS, wrong reason, stale implementation anchor, and wrong requested-index snapshots.
+
+### Commands and exact results
+- `ruff check georeliab_mve\v4_authorization.py tests\test_v4_authorization.py` -> PASS: `All checks passed!`.
+- `python -m py_compile georeliab_mve\v4_authorization.py tests\test_v4_authorization.py` -> PASS.
+- `python -m pytest tests\test_v4_authorization.py -q` -> PASS: `46 passed`, with one pre-existing pytest-asyncio deprecation warning.
+- `git diff --check` -> PASS.
+
+### Self-review
+- No GPU/model/scientific execution was run.
+- No checkpoint/model-forward, protocol/config/split/corruption/metrics/adapters/evidence files were touched.
+- No future commit SHA is hardcoded; runtime resolution uses the current git HEAD/tree or explicit full values.
+- Remaining concern unchanged: broad `tests/test_v4*.py` is still not used as completion evidence because of pre-existing Windows temp/cache/staging ACL failures documented above.

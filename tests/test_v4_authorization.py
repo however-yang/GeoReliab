@@ -33,6 +33,8 @@ from georeliab_mve.v4_execution import V4ExecutionError
 
 DEVICE_UUID = "GPU-" + "a" * 32
 SCHEDULE_SHA = "b" * 64
+AUTHORIZATION_COMMIT = "c" * 40
+AUTHORIZATION_TREE = "d" * 40
 
 
 def _sample(**updates: object) -> dict[str, object]:
@@ -108,6 +110,8 @@ def test_gpu_preflight_basic_failures_publish_snapshot_only(
         output_path=output,
         requested_physical_index=1,
         schedule_sha256=SCHEDULE_SHA,
+        authorization_commit=AUTHORIZATION_COMMIT,
+        authorization_tree=AUTHORIZATION_TREE,
         sample_interval_seconds=0,
         sampler=sampler,
         sleeper=lambda _seconds: None,
@@ -126,6 +130,8 @@ def test_gpu_preflight_pass_writes_rich_snapshot_receipt_and_cleans_partials(tmp
         output_path=tmp_path / "hardware.json",
         requested_physical_index=1,
         schedule_sha256=SCHEDULE_SHA,
+        authorization_commit=AUTHORIZATION_COMMIT,
+        authorization_tree=AUTHORIZATION_TREE,
         sample_interval_seconds=0,
         sampler=lambda _index: _sample(),
         sleeper=lambda _seconds: None,
@@ -157,6 +163,8 @@ def test_external_process_failure_publishes_blocked_decision_only(tmp_path: Path
         output_path=output,
         requested_physical_index=1,
         schedule_sha256=SCHEDULE_SHA,
+        authorization_commit=AUTHORIZATION_COMMIT,
+        authorization_tree=AUTHORIZATION_TREE,
         sample_interval_seconds=0,
         sampler=lambda _index: _sample(
             utilization_gpu_percent=99,
@@ -174,7 +182,13 @@ def test_external_process_failure_publishes_blocked_decision_only(tmp_path: Path
     decision = load_json(decision_path)
     assert decision["implementation_commit"] == IMPLEMENTATION_ANCHOR_COMMIT
     assert decision["implementation_tree"] == IMPLEMENTATION_ANCHOR_TREE
-    assert decision["authorization_revision"] == "v4-gpu-selection-authorization"
+    assert decision["authorization_commit"] == AUTHORIZATION_COMMIT
+    assert decision["authorization_tree"] == AUTHORIZATION_TREE
+    assert isinstance(decision["run_id"], str)
+    snapshot = load_json(output)
+    assert decision["run_id"] == snapshot["run_id"]
+    assert snapshot["authorization_commit"] == AUTHORIZATION_COMMIT
+    assert snapshot["authorization_tree"] == AUTHORIZATION_TREE
     assert decision["requested_physical_index"] == 1
     assert decision["hardware_preflight_path"] == str(output)
     assert decision["hardware_preflight_sha256"] == sha256_file(output)
@@ -194,6 +208,8 @@ def test_failed_preflight_rerun_removes_old_pass_receipt(tmp_path: Path) -> None
         output_path=output,
         requested_physical_index=1,
         schedule_sha256=SCHEDULE_SHA,
+        authorization_commit=AUTHORIZATION_COMMIT,
+        authorization_tree=AUTHORIZATION_TREE,
         sample_interval_seconds=0,
         sampler=lambda _index: _sample(),
         sleeper=lambda _seconds: None,
@@ -218,6 +234,8 @@ def test_failed_preflight_rerun_removes_old_pass_receipt(tmp_path: Path) -> None
         output_path=output,
         requested_physical_index=1,
         schedule_sha256=SCHEDULE_SHA,
+        authorization_commit=AUTHORIZATION_COMMIT,
+        authorization_tree=AUTHORIZATION_TREE,
         sample_interval_seconds=0,
         sampler=lambda _index: _sample(device_model="NVIDIA A100-SXM4-80GB"),
         sleeper=lambda _seconds: None,
@@ -240,6 +258,8 @@ def test_gpu_preflight_probe_mismatch_fails_without_receipt(tmp_path: Path) -> N
         output_path=tmp_path / "hardware.json",
         requested_physical_index=1,
         schedule_sha256=SCHEDULE_SHA,
+        authorization_commit=AUTHORIZATION_COMMIT,
+        authorization_tree=AUTHORIZATION_TREE,
         sample_interval_seconds=0,
         sampler=lambda _index: _sample(),
         sleeper=lambda _seconds: None,
@@ -261,6 +281,8 @@ def test_gpu_preflight_probe_post_process_fails_without_receipt(tmp_path: Path) 
         output_path=tmp_path / "hardware.json",
         requested_physical_index=1,
         schedule_sha256=SCHEDULE_SHA,
+        authorization_commit=AUTHORIZATION_COMMIT,
+        authorization_tree=AUTHORIZATION_TREE,
         sample_interval_seconds=0,
         sampler=lambda _index: _sample(),
         sleeper=lambda _seconds: None,
@@ -283,6 +305,8 @@ def test_gpu_preflight_omitted_post_probe_fields_fail_without_receipt(tmp_path: 
         output_path=tmp_path / "hardware.json",
         requested_physical_index=1,
         schedule_sha256=SCHEDULE_SHA,
+        authorization_commit=AUTHORIZATION_COMMIT,
+        authorization_tree=AUTHORIZATION_TREE,
         sample_interval_seconds=0,
         sampler=lambda _index: _sample(),
         sleeper=lambda _seconds: None,
@@ -369,6 +393,8 @@ def _prepare_authorization_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         output_path=tmp_path / "artifacts" / "hardware.json",
         requested_physical_index=1,
         schedule_sha256=schedule_sha,
+        authorization_commit=AUTHORIZATION_COMMIT,
+        authorization_tree=AUTHORIZATION_TREE,
         sample_interval_seconds=0,
         sampler=lambda _index: _sample(),
         sleeper=lambda _seconds: None,
@@ -655,7 +681,9 @@ def test_invalid_staged_preflight_decision_is_not_promoted(tmp_path: Path) -> No
         "schema_version": "georeliab-v4-preflight-decision-1.0",
         "implementation_commit": IMPLEMENTATION_ANCHOR_COMMIT,
         "implementation_tree": IMPLEMENTATION_ANCHOR_TREE,
-        "authorization_revision": "v4-gpu-selection-authorization",
+        "authorization_commit": AUTHORIZATION_COMMIT,
+        "authorization_tree": AUTHORIZATION_TREE,
+        "run_id": "e" * 32,
         "requested_physical_index": 1,
         "hardware_preflight_path": str(snapshot),
         "hardware_preflight_sha256": sha256_file(snapshot),
@@ -694,6 +722,9 @@ def test_staged_preflight_decision_rejects_snapshot_mismatch(
         "reason_code": "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
         "project_commit": IMPLEMENTATION_ANCHOR_COMMIT,
         "project_tree": IMPLEMENTATION_ANCHOR_TREE,
+        "authorization_commit": AUTHORIZATION_COMMIT,
+        "authorization_tree": AUTHORIZATION_TREE,
+        "run_id": "e" * 32,
         "requested_physical_index": 1,
     }
     snapshot_payload.update(snapshot_updates)
@@ -703,7 +734,9 @@ def test_staged_preflight_decision_rejects_snapshot_mismatch(
         "schema_version": "georeliab-v4-preflight-decision-1.0",
         "implementation_commit": IMPLEMENTATION_ANCHOR_COMMIT,
         "implementation_tree": IMPLEMENTATION_ANCHOR_TREE,
-        "authorization_revision": "v4-gpu-selection-authorization",
+        "authorization_commit": AUTHORIZATION_COMMIT,
+        "authorization_tree": AUTHORIZATION_TREE,
+        "run_id": "e" * 32,
         "requested_physical_index": 1,
         "hardware_preflight_path": str(snapshot),
         "hardware_preflight_sha256": sha256_file(snapshot),
@@ -716,6 +749,107 @@ def test_staged_preflight_decision_rejects_snapshot_mismatch(
 
     with pytest.raises(V4ExecutionError, match="V4_PREFLIGHT_DECISION_SNAPSHOT_MISMATCH"):
         _atomic_json(target, payload, validator=_validate_preflight_decision_payload)
+
+    assert not target.exists()
+    assert not target.with_name(target.name + ".partial").exists()
+
+
+def test_staged_preflight_decision_rejects_stale_authorization_revision_closure(tmp_path: Path) -> None:
+    stale_commit = "f" * 40
+    stale_tree = "a" * 40
+    snapshot = tmp_path / "hardware.json"
+    _write_json(snapshot, {
+        "schema_version": "georeliab-v4-hardware-preflight-1.0",
+        "status": "FAIL",
+        "reason_code": "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+        "project_commit": IMPLEMENTATION_ANCHOR_COMMIT,
+        "project_tree": IMPLEMENTATION_ANCHOR_TREE,
+        "authorization_commit": stale_commit,
+        "authorization_tree": stale_tree,
+        "run_id": "e" * 32,
+        "requested_physical_index": 1,
+    })
+    target = tmp_path / "v4-preflight-decision.json"
+    payload = {
+        "schema_version": "georeliab-v4-preflight-decision-1.0",
+        "implementation_commit": IMPLEMENTATION_ANCHOR_COMMIT,
+        "implementation_tree": IMPLEMENTATION_ANCHOR_TREE,
+        "authorization_commit": stale_commit,
+        "authorization_tree": stale_tree,
+        "run_id": "e" * 32,
+        "requested_physical_index": 1,
+        "hardware_preflight_path": str(snapshot),
+        "hardware_preflight_sha256": sha256_file(snapshot),
+        "status": "BLOCKED",
+        "reason_code": "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+        "terminal_status": "BLOCKED",
+        "terminal_reason_code": "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+        "scientific_result": "NO_SCIENTIFIC_RESULT",
+    }
+
+    with pytest.raises(V4ExecutionError, match="V4_PREFLIGHT_DECISION_REVISION_MISMATCH"):
+        _atomic_json(
+            target,
+            payload,
+            validator=lambda staged: _validate_preflight_decision_payload(
+                staged,
+                expected_snapshot_path=snapshot,
+                expected_authorization_commit=AUTHORIZATION_COMMIT,
+                expected_authorization_tree=AUTHORIZATION_TREE,
+                expected_run_id="e" * 32,
+            ),
+        )
+
+    assert not target.exists()
+    assert not target.with_name(target.name + ".partial").exists()
+
+
+def test_staged_preflight_decision_rejects_different_matching_fail_snapshot(tmp_path: Path) -> None:
+    expected_snapshot = tmp_path / "hardware.json"
+    other_snapshot = tmp_path / "other-hardware.json"
+    snapshot_payload = {
+        "schema_version": "georeliab-v4-hardware-preflight-1.0",
+        "status": "FAIL",
+        "reason_code": "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+        "project_commit": IMPLEMENTATION_ANCHOR_COMMIT,
+        "project_tree": IMPLEMENTATION_ANCHOR_TREE,
+        "authorization_commit": AUTHORIZATION_COMMIT,
+        "authorization_tree": AUTHORIZATION_TREE,
+        "run_id": "e" * 32,
+        "requested_physical_index": 1,
+    }
+    _write_json(expected_snapshot, snapshot_payload)
+    _write_json(other_snapshot, snapshot_payload)
+    target = tmp_path / "v4-preflight-decision.json"
+    payload = {
+        "schema_version": "georeliab-v4-preflight-decision-1.0",
+        "implementation_commit": IMPLEMENTATION_ANCHOR_COMMIT,
+        "implementation_tree": IMPLEMENTATION_ANCHOR_TREE,
+        "authorization_commit": AUTHORIZATION_COMMIT,
+        "authorization_tree": AUTHORIZATION_TREE,
+        "run_id": "e" * 32,
+        "requested_physical_index": 1,
+        "hardware_preflight_path": str(other_snapshot),
+        "hardware_preflight_sha256": sha256_file(other_snapshot),
+        "status": "BLOCKED",
+        "reason_code": "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+        "terminal_status": "BLOCKED",
+        "terminal_reason_code": "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+        "scientific_result": "NO_SCIENTIFIC_RESULT",
+    }
+
+    with pytest.raises(V4ExecutionError, match="V4_PREFLIGHT_DECISION_SNAPSHOT_PATH_MISMATCH"):
+        _atomic_json(
+            target,
+            payload,
+            validator=lambda staged: _validate_preflight_decision_payload(
+                staged,
+                expected_snapshot_path=expected_snapshot,
+                expected_authorization_commit=AUTHORIZATION_COMMIT,
+                expected_authorization_tree=AUTHORIZATION_TREE,
+                expected_run_id="e" * 32,
+            ),
+        )
 
     assert not target.exists()
     assert not target.with_name(target.name + ".partial").exists()
