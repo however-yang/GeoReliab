@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stderr
 import hashlib
+from io import StringIO
 import json
 from pathlib import Path
 import platform
@@ -60,13 +62,75 @@ from .execution_governance import (
 from .science_lock import BASE_PROJECT_COMMIT
 from .v4_execution import V4ExecutionError
 from .v4_authorization import (
+    create_attempt_execution_authorization,
+    create_attempt_hardware_preflight,
     create_execution_authorization,
     create_hardware_preflight,
+    materialize_attempt_resources,
+    validate_attempt_execution_authorization,
+    validate_attempt_resources,
     validate_execution_authorization,
 )
 
 
 DEFAULT_PROTOCOL = Path('configs/dual_mve_protocol.toml')
+ATTEMPT02_COMMANDS = frozenset(
+    {
+        'v4-attempt02-prepare-resources',
+        'v4-attempt02-gpu-preflight',
+        'v4-attempt02-create-execution-authorization',
+        'v4-attempt02-validate-execution-authorization',
+    }
+)
+ATTEMPT02_REQUIRED_HISTORY_PATHS = (
+    Path(
+        'docs/evidence/v4_gpu_authorization/'
+        'fa9a784c449303de0bb4ba67db92d0fbd418e10b-attempt-01-corrected/'
+        'v4-preflight-decision.corrected.json'
+    ),
+    Path(
+        'docs/evidence/v4_gpu_authorization/'
+        'fa9a784c449303de0bb4ba67db92d0fbd418e10b-attempt-01-corrected/'
+        'erratum.json'
+    ),
+    Path(
+        'docs/evidence/v4_gpu_authorization/'
+        'fa9a784c449303de0bb4ba67db92d0fbd418e10b/'
+        'v4-hardware-preflight.json'
+    ),
+    Path(
+        'docs/evidence/v4_gpu_authorization/'
+        'fa9a784c449303de0bb4ba67db92d0fbd418e10b/'
+        'v4-preflight-decision.json'
+    ),
+)
+
+
+def _attempt02_required_history(
+    paths: list[Path], *, source_root: Path
+) -> tuple[Path, ...]:
+    provided = {path.resolve() for path in paths}
+    required = {
+        (source_root / relative).resolve()
+        for relative in ATTEMPT02_REQUIRED_HISTORY_PATHS
+    }
+    missing = sorted(str(path) for path in required - provided)
+    if missing:
+        raise V4ExecutionError(
+            'V4_ATTEMPT01_CANONICAL_HISTORY_REQUIRED:' + ','.join(missing)
+        )
+    for path in required:
+        if not path.is_file():
+            raise V4ExecutionError('V4_ATTEMPT01_HISTORY_MISSING:' + str(path))
+    return tuple(path.resolve() for path in paths)
+
+
+def _attempt02_failure_payload(exc: BaseException) -> dict[str, str]:
+    return {
+        'status': 'FAIL',
+        'reason_code': str(exc) or type(exc).__name__,
+        'error_type': type(exc).__name__,
+    }
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -423,6 +487,51 @@ def build_parser() -> argparse.ArgumentParser:
     v4_validate_auth = subparsers.add_parser('v4-validate-execution-authorization')
     v4_validate_auth.add_argument('authorization', type=Path)
 
+    attempt02_resources = subparsers.add_parser(
+        'v4-attempt02-prepare-resources'
+    )
+    attempt02_resources.add_argument('--root', type=Path, required=True)
+    attempt02_resources.add_argument(
+        '--source-manifest', type=Path, required=True
+    )
+    attempt02_resources.add_argument('--output', type=Path, required=True)
+
+    attempt02_preflight = subparsers.add_parser(
+        'v4-attempt02-gpu-preflight'
+    )
+    attempt02_preflight.add_argument('--output', type=Path, required=True)
+    attempt02_preflight.add_argument(
+        '--resource-snapshot', type=Path, required=True
+    )
+    attempt02_preflight.add_argument(
+        '--historical-evidence',
+        type=Path,
+        action='append',
+        required=True,
+    )
+
+    attempt02_create_auth = subparsers.add_parser(
+        'v4-attempt02-create-execution-authorization'
+    )
+    attempt02_create_auth.add_argument('--root', type=Path, required=True)
+    attempt02_create_auth.add_argument('--receipt', type=Path, required=True)
+    attempt02_create_auth.add_argument(
+        '--resource-snapshot', type=Path, required=True
+    )
+    attempt02_create_auth.add_argument('--run-root', type=Path, required=True)
+    attempt02_create_auth.add_argument(
+        '--artifact-root', type=Path, required=True
+    )
+    attempt02_create_auth.add_argument(
+        '--final-evidence-path', type=Path, required=True
+    )
+    attempt02_create_auth.add_argument('--output', type=Path, required=True)
+
+    attempt02_validate_auth = subparsers.add_parser(
+        'v4-attempt02-validate-execution-authorization'
+    )
+    attempt02_validate_auth.add_argument('authorization', type=Path)
+
     return parser
 
 
@@ -432,8 +541,68 @@ def main(argv: list[str] | None = None) -> int:
         from .runner import cli_main as runner_cli_main
 
         return runner_cli_main(raw_argv)
-    args = build_parser().parse_args(argv)
+    command_hint = raw_argv[0] if raw_argv else None
     try:
+        if command_hint in ATTEMPT02_COMMANDS:
+            with redirect_stderr(StringIO()):
+                args = build_parser().parse_args(raw_argv)
+        else:
+            args = build_parser().parse_args(raw_argv)
+    except SystemExit as exc:
+        if command_hint in ATTEMPT02_COMMANDS and exc.code != 0:
+            print(
+                json.dumps(
+                    {
+                        'status': 'FAIL',
+                        'reason_code': 'V4_ATTEMPT02_CLI_ARGUMENT_ERROR',
+                        'error_type': 'ArgumentParserError',
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 2
+        raise
+    try:
+        if args.command == 'v4-attempt02-prepare-resources':
+            payload = materialize_attempt_resources(
+                root=args.root,
+                source_manifest_path=args.source_manifest,
+                output_path=args.output,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0 if payload.get('status') == 'PASS' else 2
+        if args.command == 'v4-attempt02-gpu-preflight':
+            source_root = Path(__file__).resolve().parents[1]
+            history = _attempt02_required_history(
+                args.historical_evidence, source_root=source_root
+            )
+            resources = validate_attempt_resources(args.resource_snapshot)
+            payload = create_attempt_hardware_preflight(
+                output_path=args.output,
+                schedule_sha256=str(resources.get('schedule_sha256')),
+                historical_evidence_paths=history,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0 if payload.get('status') == 'PASS' else 2
+        if args.command == 'v4-attempt02-create-execution-authorization':
+            payload = create_attempt_execution_authorization(
+                root=args.root,
+                receipt_path=args.receipt,
+                resource_snapshot_path=args.resource_snapshot,
+                run_root=args.run_root,
+                artifact_root=args.artifact_root,
+                final_evidence_path=args.final_evidence_path,
+                output_path=args.output,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0 if payload.get('status') == 'PASS' else 2
+        if args.command == 'v4-attempt02-validate-execution-authorization':
+            payload = validate_attempt_execution_authorization(
+                args.authorization
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
         if args.command == 'dry-run':
             summary = run_dry_run(args.protocol, args.output_dir)
             print(json.dumps(summary, indent=2, sort_keys=True))
@@ -651,6 +820,15 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(payload, indent=2, sort_keys=True))
             return 0 if payload.get('status') == 'PASS' else 2
     except (KeyError, TypeError, ValueError, AuditError, StorageAuditError, ExecutionGovernanceError, V4ExecutionError, OSError, json.JSONDecodeError) as exc:
+        if args.command in ATTEMPT02_COMMANDS:
+            print(
+                json.dumps(
+                    _attempt02_failure_payload(exc),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 2
         print(f'ERROR: {exc}', file=sys.stderr)
         return 2
     raise AssertionError('unreachable command')

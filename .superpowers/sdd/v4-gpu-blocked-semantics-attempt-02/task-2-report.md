@@ -162,3 +162,35 @@ Review-round regression evidence:
 - Authorization/governance plus attempt-02 matrix: 162 passed.
 - Budget/storage plus attempt-02 matrix: 80 passed.
 - Focused Ruff, py_compile, and `git diff --check`: passed.
+
+## CLI fix round 2
+
+The controller identified that the attempt-02 APIs were not reachable from the
+public CLI. Four explicit commands now expose only the attempt-02 interfaces
+while preserving all legacy command names and dispatch paths:
+
+- `v4-attempt02-prepare-resources --root --source-manifest --output`
+- `v4-attempt02-gpu-preflight --output --resource-snapshot --historical-evidence <repeatable>`
+- `v4-attempt02-create-execution-authorization --root --receipt --resource-snapshot --run-root --artifact-root --final-evidence-path --output`
+- `v4-attempt02-validate-execution-authorization <authorization>`
+
+The preflight command validates the resource snapshot, reads its bound schedule
+SHA, and then invokes the attempt-02 preflight with no fallback argument or
+alternate device path. Before any sampling, it requires all canonical/original
+attempt-01 history artifacts: the corrected canonical decision, its erratum,
+the original hardware snapshot, and the original blocked decision. The core
+attempt path guard still rejects any output outside an exact `attempt-02` path.
+
+All attempt-02 parser errors, validation exceptions, and business FAIL results
+return exit code 2 and a JSON stdout payload. Successful commands also emit JSON.
+Legacy `v4-gpu-preflight`, `v4-create-execution-authorization`, and
+`v4-validate-execution-authorization` continue to dispatch to their original
+legacy functions and argument contracts.
+
+CLI-round verification evidence:
+
+- Public CLI parser/dispatch/negative/history/legacy tests: 16 passed.
+- CLI + attempt-02 + legacy authorization + governance matrix: 178 passed.
+- Focused Ruff, py_compile, and `git diff --check`: passed.
+- No live GPU enumeration, Torch probe, model/checkpoint/forward, scientific
+  work, fallback, push, merge, tag, or PR update was performed.
