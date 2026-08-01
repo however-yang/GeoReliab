@@ -131,3 +131,34 @@ No dependency was added and no frozen scientific configuration was changed.
   incomplete full-suite run emitted a failure before termination.
 - Live hardware and frozen-environment mapping evidence is intentionally absent
   from Task 2 and remains Task 3 work.
+
+## Review change round
+
+Review source:
+`.superpowers/sdd/v4-gpu-blocked-semantics-attempt-02/task-2-review-report.md`.
+
+Both HIGH findings and the one LOW finding are addressed:
+
+- Resource validation now derives the immutable attempt root from the snapshot
+  path and reuses the same production path-containment, forbidden-source, schema,
+  and digest helpers used during materialization. Model/config, DTU archives,
+  environment locks, split, fog, science lock, source-state inventory, source
+  manifest, and generated state/schedule bindings are revalidated. Rehashed paths
+  under `.pytest_cache`, `attempt-01`, or old authorization artifact names fail
+  closed.
+- The default frozen-environment Torch subprocess now obtains logical `cuda:0`'s
+  UUID directly from `torch.cuda.get_device_properties(0).uuid`. A wrong or
+  unavailable logical UUID returns `V4_GPU_TORCH_PROBE_DEVICE_MISMATCH`. The
+  post-probe physical sample contributes only MIG/ECC health and residual-process
+  evidence; it can no longer supply the logical-device UUID/model/memory proof.
+- The test module no longer shadows pytest's built-in `tmp_path` fixture or
+  writes routine test artifacts below the repository. Every test uses
+  pytest-managed temporary storage.
+
+Review-round regression evidence:
+
+- Attempt-02 tests: 47 passed, including 24 production binding/source-policy
+  combinations and wrong/unavailable logical UUID cases.
+- Authorization/governance plus attempt-02 matrix: 162 passed.
+- Budget/storage plus attempt-02 matrix: 80 passed.
+- Focused Ruff, py_compile, and `git diff --check`: passed.

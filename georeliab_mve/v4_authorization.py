@@ -109,6 +109,17 @@ def _require_attempt_path(path: Path) -> Path:
     return path.resolve()
 
 
+def _attempt_root_from_path(path: Path) -> Path:
+    resolved = _require_attempt_path(path)
+    lowered = tuple(part.lower() for part in resolved.parts)
+    positions = [
+        index for index, part in enumerate(lowered) if part == ATTEMPT_ID
+    ]
+    if len(positions) != 1:
+        raise V4ExecutionError('V4_ATTEMPT_PATH_MISMATCH')
+    return Path(*resolved.parts[: positions[0] + 1])
+
+
 def _reject_attempt_collision(paths: Sequence[Path]) -> None:
     for path in paths:
         if path.exists() or path.with_name(path.name + '.partial').exists():
@@ -549,11 +560,14 @@ def _default_attempt_torch_probe(
         'import json,torch;'
         'ok=torch.cuda.is_available() and torch.cuda.device_count()==1;'
         'p=torch.cuda.get_device_properties(0) if ok else None;'
+        'u=getattr(p,\'uuid\',None) if p else None;'
+        'u=u.decode(\'utf-8\') if isinstance(u,bytes) else u;'
         'print(json.dumps(dict('
         'model_instantiated=False,checkpoint_loaded=False,'
         'forward_executed=False,torch_cuda_available=torch.cuda.is_available(),'
         'torch_device_count=torch.cuda.device_count(),'
         'torch_current_device=torch.cuda.current_device() if ok else None,'
+        'mapped_device_uuid=str(u) if u else None,'
         'mapped_device_model=p.name if p else None,'
         'mapped_total_memory_bytes=p.total_memory if p else None)))'
     )
@@ -567,9 +581,8 @@ def _default_attempt_torch_probe(
     return {
         'model_id': model_id,
         **payload,
-        'mapped_device_uuid': post.get('device_uuid'),
-        'post_probe_physical_model': post.get('device_model'),
-        'post_probe_physical_total_memory_bytes': post.get('total_memory_bytes'),
+        'post_probe_mig_mode': post.get('mig_mode'),
+        'post_probe_ecc_health': post.get('ecc_health'),
         'residual_compute_process_count': len(post.get('compute_processes', ())),
         'expected_uuid': expected.get('uuid'),
     }
@@ -603,11 +616,13 @@ def _evaluate_attempt_probes(
             or probe.get('mapped_device_model') != selected.get('model')
             or probe.get('mapped_total_memory_bytes')
             != selected.get('total_memory_bytes')
-            or probe.get('post_probe_physical_model') != selected.get('model')
-            or probe.get('post_probe_physical_total_memory_bytes')
-            != selected.get('total_memory_bytes')
         ):
             return _fail('V4_GPU_TORCH_PROBE_DEVICE_MISMATCH')
+        if (
+            str(probe.get('post_probe_mig_mode')).lower() != 'disabled'
+            or probe.get('post_probe_ecc_health') != 'OK'
+        ):
+            return _fail('V4_GPU_TORCH_PROBE_POST_HEALTH_FAILED')
         if probe.get('residual_compute_process_count') != 0:
             return _fail('V4_GPU_TORCH_PROBE_RESIDUAL_PROCESS')
     return {'status': 'PASS', 'reason_code': 'V4_GPU_MAPPING_PROBES_PASS'}
@@ -971,16 +986,32 @@ def _resolve_production_input(root: Path, path: Path) -> Path:
     return resolved
 
 
+def _validated_production_file(
+    root: Path,
+    *,
+    path_value: object,
+    digest_value: object,
+    label: str,
+    tamper_reason: str | None = None,
+) -> dict[str, str]:
+    path = _resolve_production_input(root, Path(str(path_value)))
+    reason = tamper_reason or f'V4_RESOURCE_TAMPER:{label}'
+    if not _is_sha(digest_value) or sha256_file(path) != digest_value:
+        raise V4ExecutionError(reason)
+    return {'path': str(path), 'sha256': str(digest_value)}
+
+
 def _validated_file_binding(
     root: Path, value: object, *, label: str
 ) -> dict[str, str]:
     if not isinstance(value, Mapping) or set(value) != {'path', 'sha256'}:
         raise V4ExecutionError(f'V4_RESOURCE_BINDING_SCHEMA_REQUIRED:{label}')
-    path = _resolve_production_input(root, Path(str(value.get('path'))))
-    digest = value.get('sha256')
-    if not _is_sha(digest) or sha256_file(path) != digest:
-        raise V4ExecutionError(f'V4_RESOURCE_TAMPER:{label}')
-    return {'path': str(path), 'sha256': str(digest)}
+    return _validated_production_file(
+        root,
+        path_value=value.get('path'),
+        digest_value=value.get('sha256'),
+        label=label,
+    )
 
 
 def _validated_model_bindings(root: Path, value: object) -> dict[str, object]:
@@ -1025,10 +1056,13 @@ def _validated_archive_bindings(root: Path, value: object) -> dict[str, object]:
             'referenced_members',
         }:
             raise V4ExecutionError('V4_DTU_ARCHIVE_BINDINGS_SCHEMA_REQUIRED')
-        path = _resolve_production_input(root, Path(str(row.get('path'))))
-        digest = row.get('sha256')
-        if not _is_sha(digest) or sha256_file(path) != digest:
-            raise V4ExecutionError('V4_DTU_ARCHIVE_TAMPER')
+        archive_file = _validated_production_file(
+            root,
+            path_value=row.get('path'),
+            digest_value=row.get('sha256'),
+            label=f'dtu_archive:{name}',
+            tamper_reason='V4_DTU_ARCHIVE_TAMPER',
+        )
         if not _runtime_proven(row.get('etag')) or not _is_sha(
             row.get('central_directory_sha256')
         ):
@@ -1057,8 +1091,7 @@ def _validated_archive_bindings(root: Path, value: object) -> dict[str, object]:
                 {'member': str(member_name), 'sha256': str(member_sha)}
             )
         normalized[name] = {
-            'path': str(path),
-            'sha256': str(digest),
+            **archive_file,
             'etag': row['etag'],
             'central_directory_sha256': row['central_directory_sha256'],
             'referenced_members': normalized_members,
@@ -1184,7 +1217,8 @@ def materialize_attempt_resources(
     '''Materialize the production 200-state/400-unit attempt-02 resources.'''
 
     resolved_root = root.resolve()
-    _require_attempt_path(output_path)
+    if resolved_root != _attempt_root_from_path(output_path):
+        raise V4ExecutionError('V4_ATTEMPT_PATH_MISMATCH')
     state_path = output_path.with_name('v4-state-inventory-200.json')
     schedule_path = output_path.with_name('v4-scientific-schedule-400.json')
     _reject_attempt_collision((state_path, schedule_path, output_path))
@@ -1313,6 +1347,7 @@ def materialize_attempt_resources(
     _publish_attempt_json(
         output_path, payload, validator=_validate_attempt_resource_payload
     )
+    validate_attempt_resources(output_path)
     return {
         'status': 'PASS',
         'resource_snapshot_path': str(output_path),
@@ -1324,70 +1359,69 @@ def materialize_attempt_resources(
 
 
 def validate_attempt_resources(path: Path) -> dict[str, object]:
-    _require_attempt_path(path)
+    root = _attempt_root_from_path(path)
     payload = load_json(path)
     _validate_attempt_resource_payload(payload)
-    _validate_all_attempt_resource_files(payload)
+    _validate_all_attempt_resource_files(payload, root=root)
     return payload
 
 
-def _validate_all_attempt_resource_files(payload: Mapping[str, Any]) -> None:
+def _validate_all_attempt_resource_files(
+    payload: Mapping[str, Any], *, root: Path
+) -> None:
     resources = payload.get('resources')
     if not isinstance(resources, Mapping):
         raise V4ExecutionError('V4_RESOURCE_INVENTORY_SCHEMA_REQUIRED')
-    bindings: list[Mapping[str, object]] = []
-    models = resources.get('model_bindings')
-    if not isinstance(models, Mapping):
-        raise V4ExecutionError('V4_MODEL_BINDINGS_SCHEMA_REQUIRED')
-    for model in SCIENTIFIC_MODELS:
-        row = models.get(model)
-        if not isinstance(row, Mapping):
-            raise V4ExecutionError('V4_MODEL_BINDINGS_SCHEMA_REQUIRED')
-        for key in ('weights', 'config'):
-            binding = row.get(key)
-            if not isinstance(binding, Mapping):
-                raise V4ExecutionError('V4_MODEL_BINDINGS_SCHEMA_REQUIRED')
-            bindings.append(binding)
-    archives = resources.get('dtu_archives')
-    if not isinstance(archives, Mapping):
-        raise V4ExecutionError('V4_DTU_ARCHIVE_BINDINGS_SCHEMA_REQUIRED')
-    for name in ('SampleSet', 'Points', 'Rectified'):
-        binding = archives.get(name)
-        if not isinstance(binding, Mapping):
-            raise V4ExecutionError('V4_DTU_ARCHIVE_BINDINGS_SCHEMA_REQUIRED')
-        bindings.append(binding)
-    for key in (
-        'v4_split',
-        'state_inventory_200',
-        'fog_manifest',
-        'scientific_schedule_400',
-        'science_lock',
-    ):
-        binding = resources.get(key)
-        if not isinstance(binding, Mapping):
-            raise V4ExecutionError('V4_RESOURCE_INVENTORY_SCHEMA_REQUIRED')
-        bindings.append(binding)
+    _validated_model_bindings(root, resources.get('model_bindings'))
+    _validated_archive_bindings(root, resources.get('dtu_archives'))
+    split = _validated_file_binding(
+        root, resources.get('v4_split'), label='v4_split'
+    )
+    fog = _validated_file_binding(
+        root, resources.get('fog_manifest'), label='fog_manifest'
+    )
+    _validated_file_binding(
+        root, resources.get('science_lock'), label='science_lock'
+    )
     environments = resources.get('environment_locks')
-    if not isinstance(environments, Mapping):
+    if not isinstance(environments, Mapping) or set(environments) != set(
+        SCIENTIFIC_MODELS
+    ):
         raise V4ExecutionError('V4_ENVIRONMENT_LOCKS_SCHEMA_REQUIRED')
     for model in SCIENTIFIC_MODELS:
-        binding = environments.get(model)
-        if not isinstance(binding, Mapping):
-            raise V4ExecutionError('V4_ENVIRONMENT_LOCKS_SCHEMA_REQUIRED')
-        bindings.append(binding)
-    for binding in bindings:
-        path = Path(str(binding.get('path')))
-        digest = binding.get('sha256')
-        if not path.is_file() or not _is_sha(digest) or sha256_file(path) != digest:
-            raise V4ExecutionError('V4_RESOURCE_TAMPER')
-    source = Path(str(payload.get('source_manifest_path')))
-    if (
-        not source.is_file()
-        or sha256_file(source) != payload.get('source_manifest_sha256')
-    ):
-        raise V4ExecutionError('V4_RESOURCE_SOURCE_TAMPER')
-    _validate_split_binding(Path(str(resources['v4_split']['path'])))
-    _validate_fog_binding(Path(str(resources['fog_manifest']['path'])))
+        _validated_file_binding(
+            root,
+            environments[model],
+            label=f'{model}:environment_lock',
+        )
+    state = _validated_file_binding(
+        root,
+        resources.get('state_inventory_200'),
+        label='state_inventory_200',
+    )
+    schedule = _validated_file_binding(
+        root,
+        resources.get('scientific_schedule_400'),
+        label='scientific_schedule_400',
+    )
+    _require_attempt_path(Path(state['path']))
+    _require_attempt_path(Path(schedule['path']))
+    state_payload = load_json(Path(state['path']))
+    _validated_production_file(
+        root,
+        path_value=state_payload.get('source_path'),
+        digest_value=state_payload.get('source_sha256'),
+        label='state_inventory_source',
+    )
+    _validated_production_file(
+        root,
+        path_value=payload.get('source_manifest_path'),
+        digest_value=payload.get('source_manifest_sha256'),
+        label='source_manifest',
+        tamper_reason='V4_RESOURCE_SOURCE_TAMPER',
+    )
+    _validate_split_binding(Path(split['path']))
+    _validate_fog_binding(Path(fog['path']))
 
 
 def _validate_attempt_authorization_payload(payload: Mapping[str, Any]) -> None:
@@ -1440,7 +1474,6 @@ def _validate_attempt_authorization_payload(payload: Mapping[str, Any]) -> None:
         raise V4ExecutionError('V4_RESOURCE_SNAPSHOT_TAMPER')
     receipt = validate_attempt_receipt(receipt_path)
     resources = validate_attempt_resources(resources_path)
-    _validate_all_attempt_resource_files(resources)
     if (
         receipt.get('schedule_sha256') != resources.get('schedule_sha256')
         or receipt.get('schedule_sha256') != payload.get('schedule_sha256')
@@ -1477,7 +1510,6 @@ def create_attempt_execution_authorization(
     resolved_root = root.resolve()
     receipt = validate_attempt_receipt(receipt_path)
     resources = validate_attempt_resources(resource_snapshot_path)
-    _validate_all_attempt_resource_files(resources)
     if receipt.get('schedule_sha256') != resources.get('schedule_sha256'):
         raise V4ExecutionError('V4_AUTHORIZATION_SCHEDULE_MISMATCH')
     resolved_run = _resolve_under_root(resolved_root, run_root, must_exist=True)

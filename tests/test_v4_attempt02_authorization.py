@@ -5,10 +5,10 @@ from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
-import shutil
-from uuid import uuid4
 
 import pytest
+
+import georeliab_mve.v4_authorization as v4_authorization
 
 from georeliab_mve.v4_authorization import (
     ATTEMPT_ID,
@@ -37,17 +37,6 @@ from georeliab_mve.v4_execution import V4ExecutionError
 
 ORDERED_VIEWS = (1, 7, 13, 19, 25, 31, 37, 43)
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
-
-
-@pytest.fixture()
-def tmp_path() -> Path:
-    path = Path('.pytest-local') / uuid4().hex
-    path.mkdir(parents=True, exist_ok=False)
-    try:
-        yield path.resolve()
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
-
 
 def _sha(label: str) -> str:
     return hashlib.sha256(label.encode('utf-8')).hexdigest()
@@ -137,10 +126,8 @@ def _probe(
         'mapped_device_uuid': selected['uuid'],
         'mapped_device_model': selected['model'],
         'mapped_total_memory_bytes': selected['total_memory_bytes'],
-        'post_probe_physical_model': selected['model'],
-        'post_probe_physical_total_memory_bytes': selected[
-            'total_memory_bytes'
-        ],
+        'post_probe_mig_mode': 'Disabled',
+        'post_probe_ecc_health': 'OK',
         'residual_compute_process_count': 0,
     }
 
@@ -295,6 +282,61 @@ def test_probe_failure_never_falls_back_and_creates_no_receipt(tmp_path: Path) -
     assert snapshot['no_fallback_or_switch'] is True
     assert not (attempt / 'v4-execution-receipt.json').exists()
     assert not (attempt / 'v4-execution-authorization.json').exists()
+
+
+@pytest.mark.parametrize(
+    'logical_uuid', ['GPU-wrong-logical-device', None]
+)
+def test_default_probe_rejects_wrong_or_unavailable_logical_cuda0_uuid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    logical_uuid: str | None,
+) -> None:
+    selected = _device(4, 'GPU-selected')
+    logical_probe = {
+        'model_instantiated': False,
+        'checkpoint_loaded': False,
+        'forward_executed': False,
+        'torch_cuda_available': True,
+        'torch_device_count': 1,
+        'torch_current_device': 0,
+        'mapped_device_uuid': logical_uuid,
+        'mapped_device_model': selected['model'],
+        'mapped_total_memory_bytes': selected['total_memory_bytes'],
+    }
+    monkeypatch.setattr(
+        v4_authorization, '_frozen_python_for_model', lambda model: model
+    )
+    monkeypatch.setattr(
+        v4_authorization,
+        '_run_text_command',
+        lambda command, env=None: json.dumps(logical_probe),
+    )
+    monkeypatch.setattr(
+        v4_authorization,
+        'nvidia_smi_hardware_sample',
+        lambda index: {
+            'device_uuid': selected['uuid'],
+            'device_model': selected['model'],
+            'total_memory_bytes': selected['total_memory_bytes'],
+            'mig_mode': 'Disabled',
+            'ecc_health': 'OK',
+            'compute_processes': [],
+        },
+    )
+    rows = iter(_samples(selected))
+    attempt = tmp_path / ATTEMPT_ID
+    result = create_attempt_hardware_preflight(
+        output_path=attempt / 'v4-hardware-preflight.json',
+        schedule_sha256=_sha('schedule'),
+        inventory_sampler=lambda: next(rows),
+        sleeper=lambda seconds: None,
+        probe_runner=v4_authorization._default_attempt_torch_probe,
+    )
+
+    assert result['status'] == 'FAIL'
+    assert result['reason_code'] == 'V4_GPU_TORCH_PROBE_DEVICE_MISMATCH'
+    assert not (attempt / 'v4-execution-receipt.json').exists()
 
 
 def test_attempt_collision_and_cross_attempt_path_are_rejected(tmp_path: Path) -> None:
@@ -513,6 +555,71 @@ def test_resource_and_schedule_tamper_fail_closed(tmp_path: Path) -> None:
     )
     weights.write_text('tampered', encoding='utf-8')
     with pytest.raises(V4ExecutionError, match='V4_RESOURCE_TAMPER'):
+        validate_attempt_resources(resource_path)
+
+
+@pytest.mark.parametrize(
+    'binding_class',
+    [
+        'model',
+        'dtu_archive',
+        'environment',
+        'science_lock',
+        'split',
+        'fog',
+        'state_source',
+        'source_manifest',
+    ],
+)
+@pytest.mark.parametrize(
+    'forbidden_source',
+    ['pytest_cache', 'attempt-01', 'authorization_artifact'],
+)
+def test_resource_validation_rejects_rehashed_forbidden_production_paths(
+    tmp_path: Path, binding_class: str, forbidden_source: str
+) -> None:
+    root = tmp_path / ATTEMPT_ID
+    result = _materialized(root)
+    resource_path = Path(result['resource_snapshot_path'])
+    payload = json.loads(resource_path.read_text(encoding='utf-8'))
+    if forbidden_source == 'pytest_cache':
+        forbidden = root / '.pytest_cache' / 'canonical-source.bin'
+    elif forbidden_source == 'attempt-01':
+        forbidden = root / 'attempt-01' / 'canonical-source.bin'
+    else:
+        forbidden = root / 'production-sources' / 'v4-execution-authorization.json'
+    binding = _file(forbidden, f'{binding_class}:{forbidden_source}')
+
+    resources = payload['resources']
+    if binding_class == 'model':
+        resources['model_bindings']['VGGT']['weights'] = binding
+    elif binding_class == 'dtu_archive':
+        resources['dtu_archives']['SampleSet'].update(binding)
+    elif binding_class == 'environment':
+        resources['environment_locks']['MASt3R'] = binding
+    elif binding_class == 'science_lock':
+        resources['science_lock'] = binding
+    elif binding_class == 'split':
+        resources['v4_split'] = binding
+    elif binding_class == 'fog':
+        resources['fog_manifest'] = binding
+    elif binding_class == 'state_source':
+        state_binding = resources['state_inventory_200']
+        state_path = Path(state_binding['path'])
+        state_payload = json.loads(state_path.read_text(encoding='utf-8'))
+        state_payload['source_path'] = binding['path']
+        state_payload['source_sha256'] = binding['sha256']
+        _write_json(state_path, state_payload)
+        state_binding['sha256'] = _sha_file(state_path)
+    else:
+        payload['source_manifest_path'] = binding['path']
+        payload['source_manifest_sha256'] = binding['sha256']
+    _rehash(payload, 'resource_snapshot_sha256')
+    _write_json(resource_path, payload)
+
+    with pytest.raises(
+        V4ExecutionError, match='V4_PRODUCTION_INPUT_SOURCE_FORBIDDEN'
+    ):
         validate_attempt_resources(resource_path)
 
 
