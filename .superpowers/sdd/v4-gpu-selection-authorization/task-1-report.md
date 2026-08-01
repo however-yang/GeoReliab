@@ -46,3 +46,30 @@ DONE_WITH_CONCERNS
 - The repository's existing compact `validate_v4_gpu_receipt` preflight schema is left unchanged for backwards-compatible tests; the new rich snapshot is validated in `v4_authorization.py` rather than weakening the legacy validator.
 - The broad `tests/test_v4*.py` run could not be completed due Windows filesystem permission errors unrelated to source diffs. Focused new tests plus relevant v4 execution/storage regressions passed cleanly.
 - Some ignored pytest temp/cache directories are currently Windows ACL-locked and could not be removed with `Remove-Item -Recurse -Force`; they are not tracked by git.
+
+## Round 1 Fix Addendum - 2026-08-01
+
+### Reviewer findings addressed
+1. CLI GPU selection now requires explicit `--requested-index`; no reusable code hardcodes GPU 1, and no CLI default can silently fall back to `cuda:0`. Formal invocation must pass `--requested-index 1` explicitly.
+2. Frozen-env Torch probes now independently report logical cuda:0 device name and total memory, then re-query physical UUID/model/total-memory/process state after each probe.
+3. `nvidia-smi` compute-process enumeration failures now fail closed with `V4_GPU_PROCESS_ENUMERATION_UNPROVEN` instead of being treated as an empty process list.
+4. Failed preflight reruns now remove sibling authorization-owned PASS artifacts (`v4-execution-receipt.json`, `v4-execution-authorization.json`, `authorization.json`, `v4-execution-schedule.json`, `v4-state-inventory.json`) while preserving unrelated evidence.
+5. Authorization now binds `root`, re-resolves `run_root`, `artifact_root`, `final_evidence_path`, and resource paths during validation, and rejects any rehashed finalizer forgery.
+6. Atomic JSON promotion now requires artifact-specific staged validation for hardware preflight, receipt, and authorization payloads before replacement.
+
+### Round 1 files changed
+- `georeliab_mve/v4_authorization.py` - tightened fail-closed process enumeration, independent frozen-env post-probe binding, root/finalizer validation, stale sibling cleanup, and staged artifact validators.
+- `georeliab_mve/cli.py` - made `v4-gpu-preflight --requested-index` mandatory.
+- `tests/test_v4_authorization.py` - added regression coverage for mandatory CLI index, process enumeration failure, post-probe process leftovers, stale sibling cleanup, rehashed finalizer/root forgery, and invalid staged artifact non-promotion.
+
+### Round 1 commands and exact results
+- `python -m py_compile georeliab_mve\v4_authorization.py georeliab_mve\cli.py tests\test_v4_authorization.py` -> PASS.
+- `python -m pytest tests\test_v4_authorization.py -q` -> PASS: `30 passed`, with one pre-existing pytest-asyncio deprecation warning.
+- `python -m pytest tests\test_v4_execution_governance.py tests\test_storage_audit_refactor.py tests\test_storage_audit_cli_refactor.py tests\test_storage_science_lock_refactor.py -q` -> PASS: `73 passed`, with one pre-existing pytest-asyncio deprecation warning.
+
+### Round 1 self-review
+- No GPU/model/scientific execution was run.
+- No protocol/config/split/corruption/metrics/adapters/evidence files were modified.
+- The reusable preflight API still accepts any explicit nonnegative physical GPU index; the production CLI now forces the operator to pass the index explicitly, so the formal run can use exactly `--requested-index 1` without an implicit default.
+- New tests exercise all six round-1 findings with fail-closed assertions and stale-artifact non-promotion checks.
+- Remaining concern: broad `tests/test_v4*.py` remains unsuitable as completion evidence in this Windows worktree because of pre-existing temp/cache/staging ACL failures documented above; focused authorization and related governance/storage regressions passed.

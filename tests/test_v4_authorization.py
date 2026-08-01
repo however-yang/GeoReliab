@@ -14,9 +14,16 @@ from georeliab_mve.v4_authorization import (
     IMPLEMENTATION_ANCHOR_COMMIT,
     IMPLEMENTATION_ANCHOR_TREE,
     V4_EXECUTION_AUTHORIZATION_SCHEMA_VERSION,
+    _atomic_json,
+    _default_torch_probe,
+    _sha_json,
+    _validate_authorization_payload,
+    _validate_preflight_payload,
+    _validate_receipt_payload,
     create_execution_authorization,
     create_hardware_preflight,
     load_json,
+    nvidia_smi_hardware_sample,
     sha256_file,
     validate_execution_authorization,
 )
@@ -47,6 +54,7 @@ def _sample(**updates: object) -> dict[str, object]:
         "mig_mode": "Disabled",
         "ecc_health": "OK",
         "compute_processes": [],
+        "gpu_process_query_proven": True,
     }
     payload.update(updates)
     return payload
@@ -146,6 +154,17 @@ def test_failed_preflight_rerun_removes_old_pass_receipt(tmp_path: Path) -> None
     )
     assert first["status"] == "PASS"
     receipt = tmp_path / "v4-execution-receipt.json"
+    owned_siblings = [
+        receipt,
+        tmp_path / "v4-execution-authorization.json",
+        tmp_path / "authorization.json",
+        tmp_path / "v4-execution-schedule.json",
+        tmp_path / "v4-state-inventory.json",
+    ]
+    for sibling in owned_siblings[1:]:
+        _write_json(sibling, {"stale": True})
+    unrelated = tmp_path / "warning-evidence.json"
+    _write_json(unrelated, {"keep": True})
     assert receipt.is_file()
 
     second = create_hardware_preflight(
@@ -159,7 +178,9 @@ def test_failed_preflight_rerun_removes_old_pass_receipt(tmp_path: Path) -> None
     )
 
     assert second["status"] == "FAIL"
-    assert not receipt.exists()
+    for sibling in owned_siblings:
+        assert not sibling.exists()
+    assert unrelated.is_file()
 
 
 def test_gpu_preflight_probe_mismatch_fails_without_receipt(tmp_path: Path) -> None:
@@ -181,6 +202,72 @@ def test_gpu_preflight_probe_mismatch_fails_without_receipt(tmp_path: Path) -> N
     assert result["status"] == "FAIL"
     assert result["reason_code"] == "V4_GPU_TORCH_PROBE_PHYSICAL_DEVICE_MISMATCH"
     assert not (tmp_path / "v4-execution-receipt.json").exists()
+
+
+def test_gpu_preflight_probe_post_process_fails_without_receipt(tmp_path: Path) -> None:
+    def busy_probe(model_id: str, index: int, sample: dict[str, object]) -> dict[str, object]:
+        payload = _pass_probe(model_id, index, sample)
+        payload["compute_process_count"] = 1
+        return payload
+
+    result = create_hardware_preflight(
+        output_path=tmp_path / "hardware.json",
+        requested_physical_index=1,
+        schedule_sha256=SCHEDULE_SHA,
+        sample_interval_seconds=0,
+        sampler=lambda _index: _sample(),
+        sleeper=lambda _seconds: None,
+        probe_runner=busy_probe,
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["reason_code"] == "V4_GPU_TORCH_PROBE_LEFT_PROCESS"
+    assert not (tmp_path / "v4-execution-receipt.json").exists()
+
+
+def test_nvidia_smi_sample_fails_closed_when_process_enumeration_unproven() -> None:
+    def runner(command: tuple[str, ...]) -> str:
+        query = command[3]
+        if query == "--query-gpu=index,uuid,name,memory.total,memory.free,memory.used,utilization.gpu,temperature.gpu,driver_version":
+            return "1, GPU-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, NVIDIA A100 80GB PCIe, 81920 MiB, 80896 MiB, 1024 MiB, 0 %, 31, 555.55\n"
+        if query == "--query-gpu=mig.mode.current,ecc.errors.uncorrected.volatile.total":
+            return "Disabled, 0\n"
+        if "--query-compute-apps=pid,process_name,used_memory" in command:
+            raise RuntimeError("nvidia-smi compute process query failed")
+        raise AssertionError(command)
+
+    with pytest.raises(V4ExecutionError, match="V4_GPU_PROCESS_ENUMERATION_UNPROVEN"):
+        nvidia_smi_hardware_sample(1, command_runner=runner)
+
+
+def test_default_torch_probe_independently_binds_frozen_env_and_post_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected_sample = _sample()
+    commands: list[tuple[tuple[str, ...], dict[str, str] | None]] = []
+
+    def fake_run(command: tuple[str, ...], *, env: dict[str, str] | None = None) -> str:
+        commands.append((command, env))
+        return json.dumps({
+            "torch_cuda_available": True,
+            "torch_device_count": 1,
+            "torch_current_device": 0,
+            "device_name": expected_sample["device_model"],
+            "total_memory_bytes": expected_sample["total_memory_bytes"],
+        })
+
+    monkeypatch.setenv("GEORELIAB_V4_VGGT_PYTHON", sys.executable)
+    monkeypatch.setattr("georeliab_mve.v4_authorization._run_text_command", fake_run)
+    monkeypatch.setattr("georeliab_mve.v4_authorization.nvidia_smi_hardware_sample", lambda index: _sample(requested_physical_index=index, resolved_physical_index=index))
+
+    probe = _default_torch_probe("VGGT", 1, expected_sample)
+
+    assert commands[0][0][0] == sys.executable
+    assert commands[0][1] == {"CUDA_VISIBLE_DEVICES": "1"}
+    assert probe["mapped_device_uuid"] == DEVICE_UUID
+    assert probe["mapped_device_model"] == AUTHORIZED_GPU_MODEL
+    assert probe["mapped_total_memory_bytes"] == expected_sample["total_memory_bytes"]
+    assert probe["post_probe_physical_model"] == AUTHORIZED_GPU_MODEL
+    assert probe["post_probe_physical_total_memory_bytes"] == expected_sample["total_memory_bytes"]
+    assert probe["compute_process_count"] == 0
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -425,7 +512,70 @@ def test_validate_authorization_rejects_receipt_and_resource_tamper(
         validate_execution_authorization(paths["authorization"])
 
 
-def test_v4_preflight_cli_fails_closed_without_gpu(tmp_path: Path) -> None:
+def test_validate_authorization_rejects_rehashed_root_escape_and_finalizer_forgery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _prepare_authorization_inputs(tmp_path, monkeypatch)
+    create_execution_authorization(
+        root=tmp_path,
+        receipt_path=paths["receipt"],
+        resource_inventory_path=paths["resources"],
+        run_root=paths["run_root"],
+        artifact_root=paths["artifact_root"],
+        final_evidence_path=paths["final_evidence"],
+        output_path=paths["authorization"],
+    )
+    payload = load_json(paths["authorization"])
+    payload["finalizer"] = "georeliab_mve.v4_execution:unsafe_finalize"
+    payload["authorization_sha256"] = _sha_json({key: value for key, value in payload.items() if key != "authorization_sha256"})
+    _write_json(paths["authorization"], payload)
+    with pytest.raises(V4ExecutionError, match="V4_AUTHORIZATION_FINALIZER_MISMATCH"):
+        validate_execution_authorization(paths["authorization"])
+
+    paths = _prepare_authorization_inputs(tmp_path / "bounded", monkeypatch)
+    create_execution_authorization(
+        root=tmp_path / "bounded",
+        receipt_path=paths["receipt"],
+        resource_inventory_path=paths["resources"],
+        run_root=paths["run_root"],
+        artifact_root=paths["artifact_root"],
+        final_evidence_path=paths["final_evidence"],
+        output_path=paths["authorization"],
+    )
+    forged_root = tmp_path / "other-root"
+    forged_root.mkdir()
+    payload = load_json(paths["authorization"])
+    payload["root"] = str(forged_root)
+    payload["authorization_sha256"] = _sha_json({key: value for key, value in payload.items() if key != "authorization_sha256"})
+    _write_json(paths["authorization"], payload)
+    with pytest.raises(V4ExecutionError, match="V4_AUTHORIZATION_PATH_ESCAPE"):
+        validate_execution_authorization(paths["authorization"])
+
+
+def test_invalid_staged_artifacts_are_not_promoted(tmp_path: Path) -> None:
+    invalid_cases = [
+        (tmp_path / "hardware.json", {"schema_version": "bad", "status": "PASS", "reason_code": "bad"}, _validate_preflight_payload),
+        (tmp_path / "receipt.json", {"schema_version": "bad"}, _validate_receipt_payload),
+        (
+            tmp_path / "authorization.json",
+            {
+                "schema_version": V4_EXECUTION_AUTHORIZATION_SCHEMA_VERSION,
+                "finalizer": "georeliab_mve.v4_execution:finalize_v4_scientific_bundle",
+                "authorization_sha256": "0" * 64,
+            },
+            _validate_authorization_payload,
+        ),
+    ]
+
+    for path, payload, validator in invalid_cases:
+        with pytest.raises(V4ExecutionError):
+            _atomic_json(path, payload, validator=validator)
+        assert not path.exists()
+        assert not path.with_name(path.name + ".partial").exists()
+
+
+def test_v4_preflight_cli_requires_explicit_requested_index(tmp_path: Path) -> None:
     completed = subprocess.run(
         [
             sys.executable,
@@ -444,7 +594,34 @@ def test_v4_preflight_cli_fails_closed_without_gpu(tmp_path: Path) -> None:
     )
 
     assert completed.returncode == 2
+    assert "--requested-index" in completed.stderr
+    assert not (tmp_path / "hardware.json").exists()
+
+
+def test_v4_preflight_cli_fails_closed_without_gpu_when_index_explicit(tmp_path: Path) -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "georeliab_mve",
+            "v4-gpu-preflight",
+            "--output",
+            str(tmp_path / "hardware.json"),
+            "--requested-index",
+            "1",
+            "--sample-interval-seconds",
+            "0",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    assert completed.returncode == 2
     assert (tmp_path / "hardware.json").is_file()
     payload = json.loads(completed.stdout)
+    snapshot = load_json(tmp_path / "hardware.json")
     assert payload["status"] == "FAIL"
+    assert snapshot["requested_physical_index"] == 1
     assert "receipt_path" not in payload

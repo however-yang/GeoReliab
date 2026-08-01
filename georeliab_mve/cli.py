@@ -407,7 +407,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     v4_preflight = subparsers.add_parser('v4-gpu-preflight')
     v4_preflight.add_argument('--output', type=Path, default=Path('artifacts/v4-hardware-preflight.json'))
-    v4_preflight.add_argument('--requested-index', type=int, default=0)
+    v4_preflight.add_argument('--requested-index', type=int, required=True)
     v4_preflight.add_argument('--sample-interval-seconds', type=float, default=5.0)
     v4_preflight.add_argument('--schedule', type=Path)
     v4_preflight.add_argument('--project-commit', default='7381e60050143a78fca6a3ebde5706ae27d2c145')
