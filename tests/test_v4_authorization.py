@@ -602,6 +602,40 @@ def test_invalid_staged_artifacts_are_not_promoted(tmp_path: Path) -> None:
         assert not path.with_name(path.name + ".partial").exists()
 
 
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "mapped_device_uuid",
+        "mapped_device_model",
+        "mapped_total_memory_bytes",
+        "post_probe_physical_model",
+        "post_probe_physical_total_memory_bytes",
+        "compute_process_count",
+    ],
+)
+def test_staged_pass_preflight_omitted_required_probe_field_is_not_promoted(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    samples = [_sample(), _sample()]
+    probes = [_pass_probe(model_id, 1, samples[-1]) for model_id in SCIENTIFIC_MODELS]
+    probes[0].pop(missing_field)
+    payload = {
+        "schema_version": "georeliab-v4-hardware-preflight-1.0",
+        "status": "PASS",
+        "reason_code": "V4_GPU_PREFLIGHT_PASS",
+        "samples": samples,
+        "model_environment_probes": probes,
+    }
+    target = tmp_path / f"hardware-missing-{missing_field}.json"
+
+    with pytest.raises(V4ExecutionError, match="V4_GPU_TORCH_PROBE_SCHEMA_REQUIRED"):
+        _atomic_json(target, payload, validator=_validate_preflight_payload)
+
+    assert not target.exists()
+    assert not target.with_name(target.name + ".partial").exists()
+
+
 def test_v4_preflight_cli_requires_explicit_requested_index(tmp_path: Path) -> None:
     completed = subprocess.run(
         [

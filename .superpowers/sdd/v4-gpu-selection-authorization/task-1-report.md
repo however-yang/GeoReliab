@@ -91,3 +91,19 @@ DONE_WITH_CONCERNS
 - No GPU/model/scientific execution was run.
 - No protocol/config/split/corruption/metrics/adapters/evidence files were modified.
 - Remaining concern unchanged: broad `tests/test_v4*.py` is still not used as completion evidence because of pre-existing Windows temp/cache/staging ACL failures documented above.
+
+## Round 3 Fix Addendum - 2026-08-01
+
+### Missing regression added
+- Added a direct `_atomic_json(..., validator=_validate_preflight_payload)` regression for otherwise PASS staged preflight payloads whose first probe omits each required field: `mapped_device_uuid`, `mapped_device_model`, `mapped_total_memory_bytes`, `post_probe_physical_model`, `post_probe_physical_total_memory_bytes`, and `compute_process_count`.
+- Each parameterized case asserts exact `V4_GPU_TORCH_PROBE_SCHEMA_REQUIRED`, no target promotion, and no `.partial` artifact.
+- No production code changed in round 3.
+
+### Round 3 commands and exact results
+- `python -m py_compile tests\test_v4_authorization.py` -> PASS.
+- `python -m pytest tests\test_v4_authorization.py -q` -> PASS: `37 passed`, with one pre-existing pytest-asyncio deprecation warning.
+
+### Round 3 self-review
+- No GPU/model/scientific execution was run.
+- No protocol/config/split/corruption/metrics/adapters/evidence files were modified.
+- Remaining concern unchanged: broad `tests/test_v4*.py` is still not used as completion evidence because of pre-existing Windows temp/cache/staging ACL failures documented above.
