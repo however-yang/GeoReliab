@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
@@ -18,6 +17,7 @@ from georeliab_mve.v4_authorization import (
     _default_torch_probe,
     _sha_json,
     _validate_authorization_payload,
+    _validate_preflight_decision_payload,
     _validate_preflight_payload,
     _validate_receipt_payload,
     create_execution_authorization,
@@ -28,8 +28,7 @@ from georeliab_mve.v4_authorization import (
     validate_execution_authorization,
 )
 from georeliab_mve.v4_counterfactuals import SCIENTIFIC_MODELS
-from georeliab_mve.v4_execution import SCIENTIFIC_MVE, V4ExecutionError, V4ExecutionReceipt
-from georeliab_mve.v4_science_lock import V4_PROTOCOL_ID, V4_PROTOCOL_SHA256
+from georeliab_mve.v4_execution import V4ExecutionError
 
 
 DEVICE_UUID = "GPU-" + "a" * 32
@@ -140,6 +139,52 @@ def test_gpu_preflight_pass_writes_rich_snapshot_receipt_and_cleans_partials(tmp
     assert {row["model_id"] for row in snapshot["model_environment_probes"]} == set(SCIENTIFIC_MODELS)
     receipt = load_json(tmp_path / "v4-execution-receipt.json")
     assert receipt["schedule_sha256"] == SCHEDULE_SHA
+    assert list(tmp_path.glob("*.partial")) == []
+
+
+def test_external_process_failure_publishes_blocked_decision_only(tmp_path: Path) -> None:
+    output = tmp_path / "hardware.json"
+    stale_owned = [
+        tmp_path / "v4-execution-receipt.json",
+        tmp_path / "v4-execution-authorization.json",
+        tmp_path / "authorization.json",
+        tmp_path / "v4-execution-schedule.json",
+    ]
+    for path in stale_owned:
+        _write_json(path, {"stale": True})
+
+    result = create_hardware_preflight(
+        output_path=output,
+        requested_physical_index=1,
+        schedule_sha256=SCHEDULE_SHA,
+        sample_interval_seconds=0,
+        sampler=lambda _index: _sample(
+            utilization_gpu_percent=99,
+            compute_processes=[{"pid": 123, "owner": "other", "cwd": "/tmp", "cmdline": "python", "used_memory_bytes": 1}],
+        ),
+        sleeper=lambda _seconds: None,
+        probe_runner=_pass_probe,
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["reason_code"] == "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS"
+    assert output.is_file()
+    decision_path = tmp_path / "v4-preflight-decision.json"
+    assert result["preflight_decision_path"] == str(decision_path)
+    decision = load_json(decision_path)
+    assert decision["implementation_commit"] == IMPLEMENTATION_ANCHOR_COMMIT
+    assert decision["implementation_tree"] == IMPLEMENTATION_ANCHOR_TREE
+    assert decision["authorization_revision"] == "v4-gpu-selection-authorization"
+    assert decision["requested_physical_index"] == 1
+    assert decision["hardware_preflight_path"] == str(output)
+    assert decision["hardware_preflight_sha256"] == sha256_file(output)
+    assert decision["status"] == "BLOCKED"
+    assert decision["terminal_status"] == "BLOCKED"
+    assert decision["reason_code"] == "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS"
+    assert decision["terminal_reason_code"] == "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS"
+    assert decision["scientific_result"] == "NO_SCIENTIFIC_RESULT"
+    for path in stale_owned:
+        assert not path.exists()
     assert list(tmp_path.glob("*.partial")) == []
 
 
@@ -600,6 +645,80 @@ def test_invalid_staged_artifacts_are_not_promoted(tmp_path: Path) -> None:
             _atomic_json(path, payload, validator=validator)
         assert not path.exists()
         assert not path.with_name(path.name + ".partial").exists()
+
+
+def test_invalid_staged_preflight_decision_is_not_promoted(tmp_path: Path) -> None:
+    snapshot = tmp_path / "hardware.json"
+    _write_json(snapshot, {"schema_version": "georeliab-v4-hardware-preflight-1.0", "status": "FAIL", "reason_code": "blocked"})
+    target = tmp_path / "v4-preflight-decision.json"
+    payload = {
+        "schema_version": "georeliab-v4-preflight-decision-1.0",
+        "implementation_commit": IMPLEMENTATION_ANCHOR_COMMIT,
+        "implementation_tree": IMPLEMENTATION_ANCHOR_TREE,
+        "authorization_revision": "v4-gpu-selection-authorization",
+        "requested_physical_index": 1,
+        "hardware_preflight_path": str(snapshot),
+        "hardware_preflight_sha256": sha256_file(snapshot),
+        "status": "PASS",
+        "reason_code": "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+        "terminal_status": "PASS",
+        "terminal_reason_code": "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+        "scientific_result": "NO_SCIENTIFIC_RESULT",
+    }
+
+    with pytest.raises(V4ExecutionError, match="V4_PREFLIGHT_DECISION_BLOCKED_REQUIRED"):
+        _atomic_json(target, payload, validator=_validate_preflight_decision_payload)
+
+    assert not target.exists()
+    assert not target.with_name(target.name + ".partial").exists()
+
+
+@pytest.mark.parametrize(
+    "snapshot_updates",
+    [
+        {"status": "PASS"},
+        {"reason_code": "V4_GPU_MODEL_NOT_AUTHORIZED"},
+        {"project_commit": "1" * 40},
+        {"project_tree": "2" * 40},
+        {"requested_physical_index": 2},
+    ],
+)
+def test_staged_preflight_decision_rejects_snapshot_mismatch(
+    tmp_path: Path,
+    snapshot_updates: dict[str, object],
+) -> None:
+    snapshot = tmp_path / "hardware.json"
+    snapshot_payload = {
+        "schema_version": "georeliab-v4-hardware-preflight-1.0",
+        "status": "FAIL",
+        "reason_code": "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+        "project_commit": IMPLEMENTATION_ANCHOR_COMMIT,
+        "project_tree": IMPLEMENTATION_ANCHOR_TREE,
+        "requested_physical_index": 1,
+    }
+    snapshot_payload.update(snapshot_updates)
+    _write_json(snapshot, snapshot_payload)
+    target = tmp_path / "v4-preflight-decision.json"
+    payload = {
+        "schema_version": "georeliab-v4-preflight-decision-1.0",
+        "implementation_commit": IMPLEMENTATION_ANCHOR_COMMIT,
+        "implementation_tree": IMPLEMENTATION_ANCHOR_TREE,
+        "authorization_revision": "v4-gpu-selection-authorization",
+        "requested_physical_index": 1,
+        "hardware_preflight_path": str(snapshot),
+        "hardware_preflight_sha256": sha256_file(snapshot),
+        "status": "BLOCKED",
+        "reason_code": "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+        "terminal_status": "BLOCKED",
+        "terminal_reason_code": "V4_GPU_RECEIPT_NO_ACTIVE_COMPUTE_PROCESS",
+        "scientific_result": "NO_SCIENTIFIC_RESULT",
+    }
+
+    with pytest.raises(V4ExecutionError, match="V4_PREFLIGHT_DECISION_SNAPSHOT_MISMATCH"):
+        _atomic_json(target, payload, validator=_validate_preflight_decision_payload)
+
+    assert not target.exists()
+    assert not target.with_name(target.name + ".partial").exists()
 
 
 @pytest.mark.parametrize(

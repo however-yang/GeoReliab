@@ -107,3 +107,41 @@ DONE_WITH_CONCERNS
 - No GPU/model/scientific execution was run.
 - No protocol/config/split/corruption/metrics/adapters/evidence files were modified.
 - Remaining concern unchanged: broad `tests/test_v4*.py` is still not used as completion evidence because of pre-existing Windows temp/cache/staging ACL failures documented above.
+
+## Final Bounded Fix Addendum - 2026-08-01
+
+### Changes made
+- Added `georeliab-v4-preflight-decision-1.0` blocked-decision artifacts for failed preflight runs as `v4-preflight-decision.json` next to the hardware snapshot.
+- The blocked decision binds exact implementation anchor commit/tree, authorization revision, explicit requested index, hardware snapshot path and SHA, terminal `BLOCKED` status/reason, and `NO_SCIENTIFIC_RESULT`.
+- Decision artifacts are written through `_atomic_json` with `_validate_preflight_decision_payload`, which revalidates schema, anchor, revision, requested-index type, blocked terminal fields, no-science marker, and snapshot SHA before replace.
+- Failed preflight still removes stale PASS receipt/authorization/schedule artifacts; PASS preflight removes stale blocked decisions.
+- Removed only newly surfaced unused imports from `tests/test_v4_authorization.py` so scoped ruff passes.
+
+### Final bounded fix commands and exact results
+- `ruff check georeliab_mve\v4_authorization.py tests\test_v4_authorization.py` -> PASS: `All checks passed!`.
+- `python -m py_compile georeliab_mve\v4_authorization.py tests\test_v4_authorization.py` -> PASS.
+- `python -m pytest tests\test_v4_authorization.py -q` -> PASS: `39 passed`, with one pre-existing pytest-asyncio deprecation warning.
+- `git diff --check` -> PASS.
+
+### Final bounded fix self-review
+- No GPU/model/scientific execution was run.
+- No checkpoint/model-forward, protocol/config/split/corruption/metrics/adapters/evidence files were touched.
+- Decision artifacts are blocked-only; they are not PASS receipts, authorizations, or schedules.
+- Remaining concern unchanged: broad `tests/test_v4*.py` is still not used as completion evidence because of pre-existing Windows temp/cache/staging ACL failures documented above.
+
+## Final Bounded Fix Validator Strengthening - 2026-08-01
+
+### Additional requested tightening
+- Strengthened `_validate_preflight_decision_payload` to load the referenced hardware snapshot and require snapshot schema `georeliab-v4-hardware-preflight-1.0`, `status=FAIL`, matching `reason_code`, exact implementation anchor commit/tree, and matching requested physical index.
+- Added parameterized mismatch regressions for PASS snapshots, reason mismatch, commit mismatch, tree mismatch, and requested-index mismatch; each asserts no decision promotion and no `.partial` artifact.
+
+### Superseding final bounded fix commands and exact results
+- `ruff check georeliab_mve\v4_authorization.py tests\test_v4_authorization.py` -> PASS: `All checks passed!`.
+- `python -m py_compile georeliab_mve\v4_authorization.py tests\test_v4_authorization.py` -> PASS.
+- `python -m pytest tests\test_v4_authorization.py -q` -> PASS: `44 passed`, with one pre-existing pytest-asyncio deprecation warning.
+- `git diff --check` -> PASS.
+
+### Validator-strengthening self-review
+- No GPU/model/scientific execution was run.
+- No checkpoint/model-forward, protocol/config/split/corruption/metrics/adapters/evidence files were touched.
+- The blocked decision cannot bind an unrelated, PASS, stale-anchor, wrong-index, or wrong-reason snapshot even when the referenced snapshot SHA is self-consistent.

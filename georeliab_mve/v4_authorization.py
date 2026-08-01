@@ -45,6 +45,8 @@ IMPLEMENTATION_ANCHOR_COMMIT = "7381e60050143a78fca6a3ebde5706ae27d2c145"
 IMPLEMENTATION_ANCHOR_TREE = "f4e2b1104496c817693aaa5989d0276d2ebe03e9"
 V4_HARDWARE_PREFLIGHT_SCHEMA_VERSION = "georeliab-v4-hardware-preflight-1.0"
 V4_EXECUTION_AUTHORIZATION_SCHEMA_VERSION = "georeliab-v4-execution-authorization-1.0"
+V4_PREFLIGHT_DECISION_SCHEMA_VERSION = "georeliab-v4-preflight-decision-1.0"
+V4_AUTHORIZATION_REVISION = "v4-gpu-selection-authorization"
 AUTHORIZED_GPU_MODEL = "NVIDIA A100 80GB PCIe"
 MIN_FREE_MEMORY_BYTES = 16 * 1024 * 1024 * 1024
 AUTHORIZED_FINALIZER = "georeliab_mve.v4_execution:finalize_v4_scientific_bundle"
@@ -169,6 +171,38 @@ def _validate_authorization_payload(payload: Mapping[str, Any]) -> None:
         raise V4ExecutionError("V4_AUTHORIZATION_TAMPER")
     if payload.get("finalizer") != AUTHORIZED_FINALIZER:
         raise V4ExecutionError("V4_AUTHORIZATION_FINALIZER_MISMATCH")
+
+
+def _validate_preflight_decision_payload(payload: Mapping[str, Any]) -> None:
+    if payload.get("schema_version") != V4_PREFLIGHT_DECISION_SCHEMA_VERSION:
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_SCHEMA_REQUIRED")
+    if payload.get("implementation_commit") != IMPLEMENTATION_ANCHOR_COMMIT or payload.get("implementation_tree") != IMPLEMENTATION_ANCHOR_TREE:
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_ANCHOR_MISMATCH")
+    if payload.get("authorization_revision") != V4_AUTHORIZATION_REVISION:
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_REVISION_MISMATCH")
+    if not isinstance(payload.get("requested_physical_index"), int) or isinstance(payload.get("requested_physical_index"), bool):
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_SCHEMA_REQUIRED")
+    if payload.get("status") != "BLOCKED" or not isinstance(payload.get("reason_code"), str):
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_BLOCKED_REQUIRED")
+    if payload.get("terminal_status") != "BLOCKED" or payload.get("terminal_reason_code") != payload.get("reason_code"):
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_TERMINAL_REQUIRED")
+    if payload.get("scientific_result") != "NO_SCIENTIFIC_RESULT":
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_NO_SCIENTIFIC_RESULT_REQUIRED")
+    snapshot_path = Path(str(payload.get("hardware_preflight_path")))
+    if not snapshot_path.is_file():
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_SNAPSHOT_REQUIRED")
+    snapshot_sha = payload.get("hardware_preflight_sha256")
+    if not _is_sha(snapshot_sha) or sha256_file(snapshot_path) != snapshot_sha:
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_SNAPSHOT_TAMPER")
+    snapshot = load_json(snapshot_path)
+    if snapshot.get("schema_version") != V4_HARDWARE_PREFLIGHT_SCHEMA_VERSION or snapshot.get("status") != "FAIL":
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_SNAPSHOT_MISMATCH")
+    if snapshot.get("reason_code") != payload.get("reason_code"):
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_SNAPSHOT_MISMATCH")
+    if snapshot.get("project_commit") != IMPLEMENTATION_ANCHOR_COMMIT or snapshot.get("project_tree") != IMPLEMENTATION_ANCHOR_TREE:
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_SNAPSHOT_MISMATCH")
+    if snapshot.get("requested_physical_index") != payload.get("requested_physical_index"):
+        raise V4ExecutionError("V4_PREFLIGHT_DECISION_SNAPSHOT_MISMATCH")
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -459,6 +493,39 @@ def _remove_owned_preflight_siblings(output_path: Path) -> None:
             pass
 
 
+def _preflight_decision_path(output_path: Path) -> Path:
+    return output_path.with_name("v4-preflight-decision.json")
+
+
+def _write_blocked_preflight_decision(
+    *,
+    output_path: Path,
+    requested_physical_index: int,
+    reason_code: str,
+) -> dict[str, object]:
+    snapshot_sha = sha256_file(output_path)
+    decision_path = _preflight_decision_path(output_path)
+    payload = {
+        "schema_version": V4_PREFLIGHT_DECISION_SCHEMA_VERSION,
+        "implementation_commit": IMPLEMENTATION_ANCHOR_COMMIT,
+        "implementation_tree": IMPLEMENTATION_ANCHOR_TREE,
+        "authorization_revision": V4_AUTHORIZATION_REVISION,
+        "requested_physical_index": requested_physical_index,
+        "hardware_preflight_path": str(output_path),
+        "hardware_preflight_sha256": snapshot_sha,
+        "status": "BLOCKED",
+        "reason_code": reason_code,
+        "terminal_status": "BLOCKED",
+        "terminal_reason_code": reason_code,
+        "scientific_result": "NO_SCIENTIFIC_RESULT",
+    }
+    _atomic_json(decision_path, payload, validator=_validate_preflight_decision_payload)
+    return {
+        "preflight_decision_path": str(decision_path),
+        "preflight_decision_sha256": sha256_file(decision_path),
+    }
+
+
 def create_hardware_preflight(
     *,
     output_path: Path,
@@ -537,7 +604,16 @@ def create_hardware_preflight(
         "hardware_preflight_sha256": sha256_file(output_path),
     }
     if snapshot["status"] != "PASS":
+        result.update(_write_blocked_preflight_decision(
+            output_path=output_path,
+            requested_physical_index=requested_physical_index,
+            reason_code=str(snapshot["reason_code"]),
+        ))
         return result
+    try:
+        _preflight_decision_path(output_path).unlink()
+    except FileNotFoundError:
+        pass
     receipt = V4ExecutionReceipt(
         explicit_user_selection=True,
         project_commit=project_commit,
