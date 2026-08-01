@@ -61,6 +61,13 @@ from .execution_governance import (
 )
 from .science_lock import BASE_PROJECT_COMMIT
 from .v4_execution import V4ExecutionError
+from .v4_rectified_closure import (
+    V4RectifiedClosureError,
+    create_rectified_member_closure,
+    materialize_missing_rectified_members,
+    prepare_rectified_resource_schedule,
+    validate_rectified_member_closure,
+)
 from .v4_authorization import (
     create_attempt_execution_authorization,
     create_attempt_hardware_preflight,
@@ -531,7 +538,28 @@ def build_parser() -> argparse.ArgumentParser:
         'v4-attempt02-validate-execution-authorization'
     )
     attempt02_validate_auth.add_argument('authorization', type=Path)
+    bootstrap_rectified = subparsers.add_parser('v4-prepare-rectified-resource-schedule')
+    bootstrap_rectified.add_argument('--protocol', type=Path, required=True)
+    bootstrap_rectified.add_argument('--split-view-manifest', type=Path, required=True)
+    bootstrap_rectified.add_argument('--output-dir', type=Path, required=True)
+    rectified = subparsers.add_parser('v4-rectified-closure')
+    rectified.add_argument('--root', type=Path, required=True)
+    rectified.add_argument('--expected-set', type=Path, required=True)
+    rectified.add_argument('--output-dir', type=Path, required=True)
 
+    validate_rectified = subparsers.add_parser('v4-validate-rectified-closure')
+    validate_rectified.add_argument('--root', type=Path, required=True)
+    validate_rectified.add_argument('--expected-set', type=Path, required=True)
+    validate_rectified.add_argument('--manifest', type=Path, required=True)
+    validate_rectified.add_argument('--output-dir', type=Path, required=True)
+
+    materialize_rectified = subparsers.add_parser(
+        'v4-materialize-missing-rectified-members'
+    )
+    materialize_rectified.add_argument('--root', type=Path, required=True)
+    materialize_rectified.add_argument('--expected-set', type=Path, required=True)
+    materialize_rectified.add_argument('--official-rectified-archive', required=True)
+    materialize_rectified.add_argument('--output-dir', type=Path, required=True)
     return parser
 
 
@@ -542,8 +570,13 @@ def main(argv: list[str] | None = None) -> int:
 
         return runner_cli_main(raw_argv)
     command_hint = raw_argv[0] if raw_argv else None
+    rectified_commands = {
+        'v4-rectified-closure',
+        'v4-validate-rectified-closure',
+        'v4-materialize-missing-rectified-members',
+    }
     try:
-        if command_hint in ATTEMPT02_COMMANDS:
+        if command_hint in ATTEMPT02_COMMANDS or command_hint in rectified_commands:
             with redirect_stderr(StringIO()):
                 args = build_parser().parse_args(raw_argv)
         else:
@@ -555,6 +588,22 @@ def main(argv: list[str] | None = None) -> int:
                     {
                         'status': 'FAIL',
                         'reason_code': 'V4_ATTEMPT02_CLI_ARGUMENT_ERROR',
+                        'error_type': 'ArgumentParserError',
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 2
+        if command_hint in rectified_commands and exc.code != 0:
+            reason_code = 'V4_RECTIFIED_CLI_ARGUMENT_ERROR'
+            if '--expected-set' not in raw_argv:
+                reason_code = 'V4_RECTIFIED_EXPECTED_SET_REQUIRED'
+            print(
+                json.dumps(
+                    {
+                        'status': 'FAIL',
+                        'reason_code': reason_code,
                         'error_type': 'ArgumentParserError',
                     },
                     indent=2,
@@ -600,6 +649,40 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == 'v4-attempt02-validate-execution-authorization':
             payload = validate_attempt_execution_authorization(
                 args.authorization
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == 'v4-prepare-rectified-resource-schedule':
+            payload = prepare_rectified_resource_schedule(
+                protocol_path=args.protocol,
+                split_view_manifest_path=args.split_view_manifest,
+                output_dir=args.output_dir,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == 'v4-rectified-closure':
+            payload = create_rectified_member_closure(
+                root=args.root,
+                output_dir=args.output_dir,
+                expected_set_path=args.expected_set,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == 'v4-validate-rectified-closure':
+            payload = validate_rectified_member_closure(
+                root=args.root,
+                manifest_path=args.manifest,
+                output_dir=args.output_dir,
+                expected_set_path=args.expected_set,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == 'v4-materialize-missing-rectified-members':
+            payload = materialize_missing_rectified_members(
+                root=args.root,
+                official_rectified_archive=args.official_rectified_archive,
+                output_dir=args.output_dir,
+                expected_set_path=args.expected_set,
             )
             print(json.dumps(payload, indent=2, sort_keys=True))
             return 0
@@ -819,11 +902,28 @@ def main(argv: list[str] | None = None) -> int:
                 }
             print(json.dumps(payload, indent=2, sort_keys=True))
             return 0 if payload.get('status') == 'PASS' else 2
-    except (KeyError, TypeError, ValueError, AuditError, StorageAuditError, ExecutionGovernanceError, V4ExecutionError, OSError, json.JSONDecodeError) as exc:
+    except (KeyError, TypeError, ValueError, AuditError, StorageAuditError, ExecutionGovernanceError, V4ExecutionError, V4RectifiedClosureError, OSError, json.JSONDecodeError) as exc:
         if args.command in ATTEMPT02_COMMANDS:
             print(
                 json.dumps(
                     _attempt02_failure_payload(exc),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 2
+        if str(args.command).startswith('v4-rectified') or args.command in {
+            'v4-prepare-rectified-resource-schedule',
+            'v4-materialize-missing-rectified-members',
+            'v4-validate-rectified-closure',
+        }:
+            print(
+                json.dumps(
+                    {
+                        'status': 'FAIL',
+                        'reason_code': str(exc) or type(exc).__name__,
+                        'error_type': type(exc).__name__,
+                    },
                     indent=2,
                     sort_keys=True,
                 )

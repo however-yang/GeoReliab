@@ -11,6 +11,7 @@ import pytest
 
 from georeliab_mve.v4_counterfactuals import (
     AssetEvidence,
+    DTU_LIGHTING_SEMANTIC_TO_PHYSICAL_TOKEN,
     DTU_OFFICIAL_SCENE_IDS,
     SCIENTIFIC_MODELS,
     SCIENTIFIC_STATES,
@@ -137,7 +138,7 @@ def _state(
     for view_id in ORDERED_VIEWS:
         if state_id in LIGHTING_STATES:
             member = (
-                f"Rectified/scan{scene_id}/rect_{view_id:03d}_{state_id[1:]}_r5000.png"
+                f"Rectified/scan{scene_id}/rect_{view_id:03d}_{DTU_LIGHTING_SEMANTIC_TO_PHYSICAL_TOKEN[state_id]}_r5000.png"
             )
         else:
             member = f"SyntheticFog/scan{scene_id}/{state_id}/view_{view_id:03d}.png"

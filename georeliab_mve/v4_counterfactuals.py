@@ -61,6 +61,23 @@ DTU_OFFICIAL_SCENE_IDS = (*range(1, 78), *range(82, 129))
 DTU_OFFICIAL_SCENE_SET = frozenset(DTU_OFFICIAL_SCENE_IDS)
 EXCLUDED_SUPPORT_SCENE_IDS = frozenset({4, 15})
 LIGHTING_STATES = ("L1", "L2", "L3", "L4", "L5", "L6", "L7")
+DTU_LIGHTING_SEMANTIC_TO_PHYSICAL_TOKEN = {
+    "L1": "1",
+    "L2": "2",
+    "L3": "3",
+    "L4": "4",
+    "L5": "5",
+    "L6": "6",
+    "L7": "0",
+}
+DTU_LIGHTING_MAPPING_PROVENANCE = {
+    "source": "DTU SampleSet/ReadMe Rectified lighting semantics",
+    "sample_set_readme_sha256": "2d437c34541be6110f2bbfafb399681e823d8ed775f461575e9ba941a3e08ea3",
+    "readme_statement": "most diffuse lighting condition is physical suffix _3_",
+    "archive_suffix_tokens": ["0", "1", "2", "3", "4", "5", "6"],
+    "frozen_reference_constraint": "L3 must remain bound to physical suffix _3_",
+    "bijection": "L1:1,L2:2,L3:3,L4:4,L5:5,L6:6,L7:0",
+}
 FOG_STATES = ("fog-s1", "fog-s2", "fog-s3")
 FOG_BOUNDARY_LAG_SEQUENCE = ("L3", *FOG_STATES)
 SCIENTIFIC_STATES = (*LIGHTING_STATES, *FOG_STATES)
@@ -745,7 +762,8 @@ def materialize_dtu_state_identity(
         rgb = rgb_inputs[view_id]
         if state_id in LIGHTING_STATES:
             expected_rgb = (
-                f"Rectified/scan{scene}/rect_{view_id:03d}_{state_id[1:]}_r5000.png"
+                f"Rectified/scan{scene}/rect_{view_id:03d}_"
+                f"{DTU_LIGHTING_SEMANTIC_TO_PHYSICAL_TOKEN[state_id]}_r5000.png"
             )
             if _normalize_member(rgb.member) != expected_rgb:
                 raise CounterfactualContractError(

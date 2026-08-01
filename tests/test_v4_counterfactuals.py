@@ -15,6 +15,7 @@ from georeliab_mve.v4_counterfactuals import (
     CounterfactualContractError,
     DatasetRole,
     FOG_BOUNDARY_LAG_SEQUENCE,
+    DTU_LIGHTING_SEMANTIC_TO_PHYSICAL_TOKEN,
     LIGHTING_STATES,
     MVE_GO_TO_EXTERNAL_VALIDATION,
     ModelIndependentState,
@@ -86,7 +87,7 @@ def _state(
     for view_id in views:
         if state_id in LIGHTING_STATES:
             member = (
-                f"Rectified/scan{scene_id}/rect_{view_id:03d}_{state_id[1:]}_r5000.png"
+                f"Rectified/scan{scene_id}/rect_{view_id:03d}_{DTU_LIGHTING_SEMANTIC_TO_PHYSICAL_TOKEN[state_id]}_r5000.png"
             )
         else:
             member = f"SyntheticFog/scan{scene_id}/{state_id}/view_{view_id:03d}.png"

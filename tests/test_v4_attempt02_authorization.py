@@ -26,6 +26,7 @@ from georeliab_mve.v4_authorization import (
 )
 from georeliab_mve.v4_counterfactuals import (
     AssetEvidence,
+    DTU_LIGHTING_SEMANTIC_TO_PHYSICAL_TOKEN,
     LIGHTING_STATES,
     SCIENTIFIC_MODELS,
     SCIENTIFIC_STATES,
@@ -385,7 +386,7 @@ def _state(scene_id: int, state_id: str):
         if state_id in LIGHTING_STATES:
             member = (
                 f'Rectified/scan{scene_id}/'
-                f'rect_{view_id:03d}_{state_id[1:]}_r5000.png'
+                f'rect_{view_id:03d}_{DTU_LIGHTING_SEMANTIC_TO_PHYSICAL_TOKEN[state_id]}_r5000.png'
             )
         else:
             member = (
