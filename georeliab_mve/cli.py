@@ -84,6 +84,12 @@ from .v4_attempt03_authorization import (
     revalidate_attempt03_resources,
     validate_attempt03_execution_authorization,
 )
+from .v4_attempt04_authorization import (
+    create_attempt04_execution_authorization,
+    create_attempt04_gpu_preflight,
+    revalidate_attempt04_resources,
+    validate_attempt04_execution_authorization,
+)
 from .v4_overlay_resource_resolution import (
     OverlayResolutionError,
     parse_resource_overrides,
@@ -107,6 +113,14 @@ ATTEMPT03_COMMANDS = frozenset(
         'v4-attempt03-gpu-preflight',
         'v4-attempt03-create-execution-authorization',
         'v4-attempt03-validate-execution-authorization',
+    }
+)
+ATTEMPT04_COMMANDS = frozenset(
+    {
+        'v4-attempt04-revalidate-resources',
+        'v4-attempt04-gpu-preflight',
+        'v4-attempt04-create-execution-authorization',
+        'v4-attempt04-validate-execution-authorization',
     }
 )
 OVERLAY_RESOLUTION_COMMANDS = frozenset(
@@ -619,6 +633,59 @@ def build_parser() -> argparse.ArgumentParser:
     )
     attempt03_validate.add_argument('authorization', type=Path)
 
+    attempt04_resources = subparsers.add_parser(
+        'v4-attempt04-revalidate-resources'
+    )
+    attempt04_resources.add_argument('--worktree', type=Path, required=True)
+    attempt04_resources.add_argument(
+        '--runtime-root', type=Path, required=True
+    )
+    attempt04_resources.add_argument(
+        '--rectified-root', type=Path, required=True
+    )
+    attempt04_resources.add_argument(
+        '--closure-root', type=Path, required=True
+    )
+    attempt04_resources.add_argument('--overlay', type=Path, required=True)
+    attempt04_resources.add_argument('--output', type=Path, required=True)
+
+    attempt04_preflight = subparsers.add_parser(
+        'v4-attempt04-gpu-preflight'
+    )
+    attempt04_preflight.add_argument('--worktree', type=Path, required=True)
+    attempt04_preflight.add_argument(
+        '--resource-receipt', type=Path, required=True
+    )
+    attempt04_preflight.add_argument('--output', type=Path, required=True)
+
+    attempt04_create = subparsers.add_parser(
+        'v4-attempt04-create-execution-authorization'
+    )
+    attempt04_create.add_argument('--worktree', type=Path, required=True)
+    attempt04_create.add_argument(
+        '--runtime-root', type=Path, required=True
+    )
+    attempt04_create.add_argument(
+        '--resource-receipt', type=Path, required=True
+    )
+    attempt04_create.add_argument(
+        '--hardware-snapshot', type=Path, required=True
+    )
+    attempt04_create.add_argument('--receipt', type=Path, required=True)
+    attempt04_create.add_argument(
+        '--authorization', type=Path, required=True
+    )
+    attempt04_create.add_argument('--run-root', type=Path, required=True)
+    attempt04_create.add_argument('--artifact-root', type=Path, required=True)
+    attempt04_create.add_argument('--gpu-ledger', type=Path, required=True)
+    attempt04_create.add_argument(
+        '--final-evidence-path', type=Path, required=True
+    )
+
+    attempt04_validate = subparsers.add_parser(
+        'v4-attempt04-validate-execution-authorization'
+    )
+    attempt04_validate.add_argument('authorization', type=Path)
     overlay_resolve = subparsers.add_parser(
         'v4-resolve-overlay-resources'
     )
@@ -680,6 +747,7 @@ def main(argv: list[str] | None = None) -> int:
         if (
             command_hint in ATTEMPT02_COMMANDS
             or command_hint in ATTEMPT03_COMMANDS
+            or command_hint in ATTEMPT04_COMMANDS
             or command_hint in OVERLAY_RESOLUTION_COMMANDS
             or command_hint in rectified_commands
         ):
@@ -707,6 +775,21 @@ def main(argv: list[str] | None = None) -> int:
                     {
                         'status': 'FAIL',
                         'reason_code': 'V4_ATTEMPT03_CLI_ARGUMENT_ERROR',
+                        'error_type': 'ArgumentParserError',
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 2
+        if command_hint in ATTEMPT04_COMMANDS and exc.code != 0:
+            print(
+                json.dumps(
+                    {
+                        'status': 'FAIL',
+                        'reason_code': 'V4_ATTEMPT04_CLI_ARGUMENT_ERROR',
+                        'attempt_id': 'attempt-04',
+                        'scientific_result': 'NO_SCIENTIFIC_RESULT',
                         'error_type': 'ArgumentParserError',
                     },
                     indent=2,
@@ -825,6 +908,50 @@ def main(argv: list[str] | None = None) -> int:
             'v4-attempt03-validate-execution-authorization'
         ):
             payload = validate_attempt03_execution_authorization(
+                args.authorization
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == 'v4-attempt04-revalidate-resources':
+            payload = revalidate_attempt04_resources(
+                worktree=args.worktree,
+                runtime_root=args.runtime_root,
+                rectified_root=args.rectified_root,
+                closure_root=args.closure_root,
+                overlay_path=args.overlay,
+                output_path=args.output,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0 if payload.get('status') == 'PASS' else 2
+        if args.command == 'v4-attempt04-gpu-preflight':
+            payload = create_attempt04_gpu_preflight(
+                worktree=args.worktree,
+                resource_receipt_path=args.resource_receipt,
+                output_path=args.output,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0 if payload.get('status') == 'PASS' else 2
+        if args.command == (
+            'v4-attempt04-create-execution-authorization'
+        ):
+            payload = create_attempt04_execution_authorization(
+                worktree=args.worktree,
+                runtime_root=args.runtime_root,
+                resource_receipt_path=args.resource_receipt,
+                hardware_snapshot_path=args.hardware_snapshot,
+                receipt_path=args.receipt,
+                authorization_path=args.authorization,
+                run_root=args.run_root,
+                artifact_root=args.artifact_root,
+                gpu_ledger_path=args.gpu_ledger,
+                final_evidence_path=args.final_evidence_path,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == (
+            'v4-attempt04-validate-execution-authorization'
+        ):
+            payload = validate_attempt04_execution_authorization(
                 args.authorization
             )
             print(json.dumps(payload, indent=2, sort_keys=True))
@@ -1103,6 +1230,21 @@ def main(argv: list[str] | None = None) -> int:
                     {
                         'status': 'FAIL',
                         'reason_code': str(exc) or type(exc).__name__,
+                        'scientific_result': 'NO_SCIENTIFIC_RESULT',
+                        'error_type': type(exc).__name__,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 2
+        if args.command in ATTEMPT04_COMMANDS:
+            print(
+                json.dumps(
+                    {
+                        'status': 'FAIL',
+                        'reason_code': str(exc) or type(exc).__name__,
+                        'attempt_id': 'attempt-04',
                         'scientific_result': 'NO_SCIENTIFIC_RESULT',
                         'error_type': type(exc).__name__,
                     },

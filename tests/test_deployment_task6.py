@@ -91,7 +91,8 @@ def test_a100_shell_scripts_are_executable_in_git() -> None:
 
 def test_a100_scripts_fail_closed_on_paths_and_disallowed_git_operations() -> None:
     assert {path.name for path in SCRIPTS} == {
-        'authorize_v4_attempt03.sh', 'common.sh', 'deploy_commit.sh',
+        'authorize_v4_attempt03.sh', 'authorize_v4_attempt04.sh', 'common.sh',
+        'deploy_commit.sh',
         'finalize_p6.sh', 'launch_stage.sh', 'resolve_v4_overlay_resources.sh', 'status.sh',
         'verify_prereqs.sh',
     }
