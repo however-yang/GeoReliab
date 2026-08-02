@@ -25,7 +25,9 @@ from .prepared_inputs import (
     parse_dtu_binary_ply,
 )
 from .preparation import CorruptionCalibration, deterministic_png
+from .preparation import PreparationError
 from .preparation_round2 import fog_render
+from .tartanair_range import extract_range_members_evidence, index_remote_zip
 from .v4_attempt04_authorization import MANIFEST_FILE_SHA256, SCHEDULE_FILE_SHA256
 from .v4_attempt05_execution import (
     Attempt05AuthorizedContext,
@@ -34,6 +36,7 @@ from .v4_attempt05_execution import (
 from .v4_counterfactuals import (
     AssetEvidence,
     DTU_LIGHTING_SEMANTIC_TO_PHYSICAL_TOKEN,
+    DTU_OFFICIAL_SCENE_SET,
     FOG_STATES,
     LIGHTING_STATES,
     SCIENTIFIC_MODELS,
@@ -53,6 +56,13 @@ ATTEMPT05_CALIBRATION_SCHEDULE_SCHEMA = (
     "georeliab-v4-attempt-05-calibration-schedule-1.0"
 )
 ATTEMPT05_FOG_BINDING_SCHEMA = "georeliab-v4-attempt-05-fog-binding-1.0"
+ATTEMPT05_CALIBRATION_L3_MATERIALIZATION_SCHEMA = (
+    "georeliab-v4-attempt-05-calibration-l3-materialization-1.0"
+)
+DTU_INVENTORY_SCHEMA = "dtu-official-inventory-v1"
+DTU_INVENTORY_FILE_SHA256 = (
+    "e0000c803279620f302d68b55f2321e6e31be2a2f02f2e690d7ecf3bac24d197"
+)
 
 
 class Attempt05InputClosureError(V4ExecutionError):
@@ -63,6 +73,30 @@ class Attempt05InputClosureError(V4ExecutionError):
 class _FogMaterializationResult:
     records: tuple[dict[str, object], ...]
     created_paths: tuple[Path, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedDtuInventory:
+    path: Path
+    file_sha256: str
+    rows: tuple[VerifiedSceneInventory, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _RectifiedArchiveBinding:
+    url: str
+    content_length: int
+    etag: str
+
+
+@dataclass(frozen=True, slots=True)
+class _CalibrationL3MaterializationResult:
+    records: tuple[dict[str, object], ...]
+    central_directory_sha256: str
+    observed_etag: str
+    normalized_etag: str
+    member_inventory_sha256: str
+    written_member_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +241,49 @@ def _resource_receipt_path(context: Attempt05AuthorizedContext) -> Path:
     if isinstance(expected, str) and expected and _sha256_file(path) != expected:
         raise Attempt05InputClosureError("V4_MVE_BLOCKED_INPUT_RESOURCE_RECEIPT_TAMPER")
     return path
+
+
+def _rectified_archive_binding(
+    context: Attempt05AuthorizedContext,
+) -> _RectifiedArchiveBinding:
+    receipt = _read_json(_resource_receipt_path(context))
+    resource_bindings = receipt.get("resource_bindings")
+    archives = (
+        resource_bindings.get("dtu_archives")
+        if isinstance(resource_bindings, Mapping)
+        else None
+    )
+    rectified = archives.get("Rectified") if isinstance(archives, Mapping) else None
+    central = (
+        rectified.get("central_directory_identity")
+        if isinstance(rectified, Mapping)
+        else None
+    )
+    if not isinstance(rectified, Mapping) or not isinstance(central, Mapping):
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_RECTIFIED_ARCHIVE_BINDING"
+        )
+    url = rectified.get("url")
+    content_length = rectified.get("bytes")
+    etag = rectified.get("etag")
+    if (
+        not isinstance(url, str)
+        or not url.startswith("https://")
+        or type(content_length) is not int
+        or content_length <= 0
+        or not isinstance(etag, str)
+        or not etag
+        or central.get("archive_bytes") != content_length
+        or central.get("archive_etag") != etag
+    ):
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_RECTIFIED_ARCHIVE_BINDING"
+        )
+    return _RectifiedArchiveBinding(
+        url=url,
+        content_length=content_length,
+        etag=etag,
+    )
 
 
 def _closure_schedule_path(context: Attempt05AuthorizedContext) -> Path:
@@ -439,28 +516,6 @@ def _scene_has_required_l3_assets(
     return True
 
 
-def _verified_complete_scenes(
-    root: Path,
-    closure_scenes: Iterable[int],
-    authoritative_view_order: Mapping[int, Sequence[int]],
-    *,
-    default_view_order: Sequence[int],
-) -> tuple[int, ...]:
-    candidates = set(int(scene) for scene in closure_scenes) | set(TEST_SCENE_IDS)
-    candidates.update(range(1, 78))
-    candidates.update(range(82, 129))
-    candidates.discard(4)
-    candidates.discard(15)
-    complete: list[int] = []
-    for scene in sorted(candidates):
-        ordered = authoritative_view_order.get(scene, default_view_order)
-        if _scene_has_required_l3_assets(root, scene, tuple(int(v) for v in ordered)):
-            complete.append(scene)
-    if len(complete) < 50:
-        raise Attempt05InputClosureError("V4_MVE_BLOCKED_INPUT_COMPLETE_SCENE_INVENTORY")
-    return tuple(complete)
-
-
 def _load_corruption_calibration(path: Path) -> tuple[CorruptionCalibration, str]:
     if not path.is_file():
         raise Attempt05InputClosureError("V4_MVE_BLOCKED_INPUT_CORRUPTION_CALIBRATION_MISSING")
@@ -660,13 +715,20 @@ def _make_inventory(
 
 def build_attempt05_v4_split_assignment(
     *,
-    complete_scene_ids: Iterable[int],
+    complete_scene_ids: Iterable[int] | None = None,
+    inventory: Iterable[VerifiedSceneInventory] | None = None,
     source_root: Path | None,
 ) -> V4SplitAssignment:
-    assignment = construct_v4_splits(
-        _make_inventory(complete_scene_ids),
-        source_root=source_root,
+    if (complete_scene_ids is None) == (inventory is None):
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_DTU_INVENTORY_REQUIRED"
+        )
+    rows = (
+        tuple(inventory)
+        if inventory is not None
+        else _make_inventory(complete_scene_ids or ())
     )
+    assignment = construct_v4_splits(rows, source_root=source_root)
     validate_v4_split_assignment(assignment)
     return assignment
 
@@ -674,6 +736,159 @@ def build_attempt05_v4_split_assignment(
 def _official_rgb_member(scene_id: int, view_id: int, state_id: str) -> str:
     token = DTU_LIGHTING_SEMANTIC_TO_PHYSICAL_TOKEN[state_id]
     return f"Rectified/scan{scene_id}/rect_{view_id:03d}_{token}_r5000.png"
+
+
+def _expected_calibration_l3_members(
+    *,
+    split_assignment: V4SplitAssignment,
+    ordered_views: Sequence[int],
+) -> tuple[str, ...]:
+    validate_v4_split_assignment(split_assignment)
+    views = tuple(int(view_id) for view_id in ordered_views)
+    if len(views) != 8 or len(set(views)) != 8:
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_CALIBRATION_VIEW_ORDER"
+        )
+    members = tuple(
+        _official_rgb_member(scene_id, view_id, "L3")
+        for scene_id in split_assignment.calibration
+        for view_id in views
+    )
+    if len(members) != 160 or len(set(members)) != 160:
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_CALIBRATION_L3_CARDINALITY"
+        )
+    return members
+
+
+def _normalize_strong_etag(value: str | None) -> str:
+    if not isinstance(value, str):
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_RECTIFIED_ARCHIVE_IDENTITY"
+        )
+    raw = value.strip()
+    if raw.startswith("W/"):
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_RECTIFIED_ARCHIVE_IDENTITY"
+        )
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        raw = raw[1:-1]
+    if not raw or '"' in raw:
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_RECTIFIED_ARCHIVE_IDENTITY"
+        )
+    return raw
+
+
+def _materialize_calibration_l3_members(
+    *,
+    dtu_root: Path,
+    split_assignment: V4SplitAssignment,
+    ordered_views: Sequence[int],
+    archive: _RectifiedArchiveBinding,
+) -> _CalibrationL3MaterializationResult:
+    members = _expected_calibration_l3_members(
+        split_assignment=split_assignment,
+        ordered_views=ordered_views,
+    )
+    for member in members:
+        output = dtu_root / member
+        if output.with_name(output.name + ".partial").exists():
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_CALIBRATION_L3_PARTIAL"
+            )
+    try:
+        index = index_remote_zip(archive.url)
+    except PreparationError as exc:
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_RECTIFIED_ARCHIVE_INDEX"
+        ) from exc
+    normalized_etag = _normalize_strong_etag(index.etag)
+    if (
+        index.content_length != archive.content_length
+        or normalized_etag != _normalize_strong_etag(archive.etag)
+        or not isinstance(index.central_directory_sha256, str)
+        or len(index.central_directory_sha256) != 64
+    ):
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_RECTIFIED_ARCHIVE_IDENTITY"
+        )
+    if any(member not in index.entries for member in members):
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_RECTIFIED_ARCHIVE_MEMBER_MISSING"
+        )
+    try:
+        evidence = extract_range_members_evidence(
+            archive.url,
+            index,
+            members,
+            dtu_root,
+        )
+    except PreparationError as exc:
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_RECTIFIED_ARCHIVE_EXTRACTION"
+        ) from exc
+    if set(evidence) != set(members):
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_RECTIFIED_ARCHIVE_RESULT_SET"
+        )
+    records: list[dict[str, object]] = []
+    for ordinal, member in enumerate(members):
+        raw = evidence.get(member)
+        entry = index.entries[member]
+        expected_path = (dtu_root / member).resolve(strict=False)
+        if not isinstance(raw, Mapping):
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_RECTIFIED_ARCHIVE_RESULT_SCHEMA"
+            )
+        path_raw = raw.get("path")
+        raw_sha = raw.get("raw_sha256")
+        disposition = raw.get("disposition")
+        try:
+            resolved = Path(str(path_raw)).resolve(strict=True)
+        except OSError as exc:
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_RECTIFIED_ARCHIVE_RESULT_PATH"
+            ) from exc
+        if (
+            resolved != expected_path
+            or not resolved.is_file()
+            or raw.get("member") != member
+            or raw.get("compressed_size") != entry.compressed_size
+            or raw.get("uncompressed_size") != entry.uncompressed_size
+            or raw.get("crc32") != f"{entry.crc32:08x}"
+            or not isinstance(raw_sha, str)
+            or len(raw_sha) != 64
+            or _sha256_file(resolved) != raw_sha
+            or disposition not in {"reused", "written"}
+        ):
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_RECTIFIED_ARCHIVE_RESULT_SCHEMA"
+            )
+        records.append(
+            {
+                "ordinal": ordinal,
+                "scene_id": split_assignment.calibration[ordinal // 8],
+                "view_id": int(Path(member).name.split("_")[1]),
+                "member": member,
+                "path": str(resolved),
+                "raw_sha256": raw_sha,
+                "compressed_size": entry.compressed_size,
+                "uncompressed_size": entry.uncompressed_size,
+                "crc32": f"{entry.crc32:08x}",
+                "disposition": disposition,
+            }
+        )
+    return _CalibrationL3MaterializationResult(
+        records=tuple(records),
+        central_directory_sha256=index.central_directory_sha256,
+        observed_etag=str(index.etag),
+        normalized_etag=normalized_etag,
+        member_inventory_sha256=_sha256_json(records),
+        written_member_count=sum(
+            record["disposition"] == "written" for record in records
+        ),
+    )
 
 
 def _fog_member(scene_id: int, view_id: int, state_id: str) -> str:
@@ -790,16 +1005,26 @@ def prepare_attempt05_inputs(
             raise Attempt05InputClosureError("V4_MVE_BLOCKED_INPUT_VIEW_CLOSURE")
     view_order = schedule_view_order
     global_view_order = _global_frozen_view_order(view_order)
-    complete_scenes = _verified_complete_scenes(
-        dtu_root,
-        view_order,
-        view_order,
-        default_view_order=global_view_order,
+    inventory = _load_verified_dtu_inventory(
+        context.runtime_root / "manifests" / "dtu_inventory.json"
     )
     split_assignment = build_attempt05_v4_split_assignment(
-        complete_scene_ids=complete_scenes,
+        inventory=inventory.rows,
         source_root=source_root,
     )
+    rectified_archive = _rectified_archive_binding(context)
+    calibration_materialization = _materialize_calibration_l3_members(
+        dtu_root=dtu_root,
+        split_assignment=split_assignment,
+        ordered_views=global_view_order,
+        archive=rectified_archive,
+    )
+    for scene_id in (*TEST_SCENE_IDS, *split_assignment.calibration):
+        ordered_views = view_order.get(scene_id, global_view_order)
+        if not _scene_has_required_l3_assets(dtu_root, scene_id, ordered_views):
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_ASSIGNED_SCENE_ASSET_MISSING"
+            )
     corruption_calibration_path = context.runtime_root / "manifests" / "corruption_calibration.json"
     corruption_calibration, corruption_calibration_sha = _load_corruption_calibration(
         corruption_calibration_path
@@ -875,6 +1100,9 @@ def prepare_attempt05_inputs(
         calibration_path = output_partial / "v4-calibration-l3-schedule-40.json"
         runtime_binding_path = output_partial / "v4-runtime-state-bindings.json"
         fog_binding_path = output_partial / "v4-fog-binding.json"
+        calibration_materialization_path = (
+            output_partial / "v4-calibration-l3-materialization.json"
+        )
         manifest_path = output_partial / "v4-attempt05-input-closure.json"
         split_sha = _write_atomic_json(split_path, split_assignment.to_dict())
         states_payload = {
@@ -892,6 +1120,34 @@ def prepare_attempt05_inputs(
             "calibration_l3_state_bindings": calibration_l3_bindings,
         }
         calibration_sha = _write_atomic_json(calibration_path, calibration_payload)
+        calibration_materialization_payload = {
+            "schema_version": ATTEMPT05_CALIBRATION_L3_MATERIALIZATION_SCHEMA,
+            "attempt_id": "attempt-05",
+            "source_inventory_path": str(inventory.path),
+            "source_inventory_sha256": inventory.file_sha256,
+            "archive": {
+                "url": rectified_archive.url,
+                "content_length": rectified_archive.content_length,
+                "etag": rectified_archive.etag,
+                "observed_etag": calibration_materialization.observed_etag,
+                "normalized_etag": calibration_materialization.normalized_etag,
+                "central_directory_sha256": (
+                    calibration_materialization.central_directory_sha256
+                ),
+            },
+            "member_count": len(calibration_materialization.records),
+            "written_member_count": (
+                calibration_materialization.written_member_count
+            ),
+            "member_inventory_sha256": (
+                calibration_materialization.member_inventory_sha256
+            ),
+            "members": list(calibration_materialization.records),
+        }
+        calibration_materialization_sha = _write_atomic_json(
+            calibration_materialization_path,
+            calibration_materialization_payload,
+        )
         fog_binding_payload = {
             "schema_version": ATTEMPT05_FOG_BINDING_SCHEMA,
             "attempt_id": "attempt-05",
@@ -918,9 +1174,15 @@ def prepare_attempt05_inputs(
                 states_path,
                 schedule_path,
                 calibration_path,
+                calibration_materialization_path,
                 fog_binding_path,
                 runtime_binding_path,
             }
+        )
+        budget_paths.update(
+            Path(str(record["path"])).resolve(strict=True)
+            for record in calibration_materialization.records
+            if record["disposition"] == "written"
         )
         input_logical_bytes = sum(path.stat().st_size for path in budget_paths)
         input_allocated_bytes = sum(_allocated_bytes(path) for path in budget_paths)
@@ -932,12 +1194,20 @@ def prepare_attempt05_inputs(
             "scientific_result": "NO_SCIENTIFIC_RESULT",
             "attempt04_authorization_sha256": context.authorization_sha256,
             "rectified_closure_manifest_sha256": _sha256_file(rectified_closure_manifest),
+            "dtu_inventory_path": str(inventory.path),
+            "dtu_inventory_sha256": inventory.file_sha256,
             "corruption_calibration_path": str(corruption_calibration_path),
             "corruption_calibration_sha256": corruption_calibration_sha,
             "split_assignment_sha256": split_sha,
             "state_inventory_sha256": states_sha,
             "scientific_schedule_sha256": schedule_sha,
             "calibration_schedule_sha256": calibration_sha,
+            "calibration_l3_materialization_sha256": (
+                calibration_materialization_sha
+            ),
+            "calibration_l3_member_inventory_sha256": (
+                calibration_materialization.member_inventory_sha256
+            ),
             "fog_binding_sha256": fog_binding_sha,
             "runtime_state_bindings_sha256": runtime_binding_sha,
             "scientific_units": len(scientific_schedule.units),
@@ -945,11 +1215,17 @@ def prepare_attempt05_inputs(
             "calibration_l3_units": len(calibration_schedule),
             "test_l3_reference_members": 160,
             "calibration_l3_reference_members": 160,
+            "calibration_l3_written_members": (
+                calibration_materialization.written_member_count
+            ),
             "rectified_non_l3_members": 960,
             "fog_png_members": 480,
             "max_model_execution_units": 440,
             "budgeted_input_storage": {
-                "scope": "FOG_PNG_AND_INPUT_CLOSURE_PAYLOADS_EXCLUDING_MANIFEST",
+                "scope": (
+                    "NEW_CALIBRATION_L3_FOG_PNG_AND_INPUT_CLOSURE_"
+                    "PAYLOADS_EXCLUDING_MANIFEST"
+                ),
                 "logical_bytes": input_logical_bytes,
                 "allocated_bytes": input_allocated_bytes,
                 "path_count": len(budget_paths),
@@ -959,6 +1235,9 @@ def prepare_attempt05_inputs(
                 "model_independent_states": states_path.name,
                 "scientific_schedule": schedule_path.name,
                 "calibration_schedule": calibration_path.name,
+                "calibration_l3_materialization": (
+                    calibration_materialization_path.name
+                ),
                 "fog_binding": fog_binding_path.name,
                 "runtime_state_bindings": runtime_binding_path.name,
             },
@@ -1003,6 +1282,7 @@ def validate_attempt05_input_closure(path: Path) -> dict[str, Any]:
         or payload.get("scientific_units") != 400
         or payload.get("scientific_state_count") != 200
         or payload.get("calibration_l3_units") != 40
+        or payload.get("calibration_l3_reference_members") != 160
         or payload.get("rectified_non_l3_members") != 960
         or payload.get("fog_png_members") != 480
         or payload.get("max_model_execution_units") != 440
@@ -1012,7 +1292,10 @@ def validate_attempt05_input_closure(path: Path) -> dict[str, Any]:
     if (
         not isinstance(storage, Mapping)
         or storage.get("scope")
-        != "FOG_PNG_AND_INPUT_CLOSURE_PAYLOADS_EXCLUDING_MANIFEST"
+        != (
+            "NEW_CALIBRATION_L3_FOG_PNG_AND_INPUT_CLOSURE_"
+            "PAYLOADS_EXCLUDING_MANIFEST"
+        )
         or type(storage.get("logical_bytes")) is not int
         or type(storage.get("allocated_bytes")) is not int
         or int(storage["logical_bytes"]) <= 0
@@ -1020,3 +1303,107 @@ def validate_attempt05_input_closure(path: Path) -> dict[str, Any]:
     ):
         raise Attempt05InputClosureError("V4_MVE_BLOCKED_INPUT_STORAGE_BINDING_INVALID")
     return payload
+
+
+def _load_verified_dtu_inventory(path: Path) -> _VerifiedDtuInventory:
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_DTU_INVENTORY_MISSING"
+        ) from exc
+    file_sha256 = _sha256_file(resolved)
+    if file_sha256 != DTU_INVENTORY_FILE_SHA256:
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_DTU_INVENTORY_HASH_MISMATCH"
+        )
+    payload = _read_json(resolved)
+    if set(payload) != {"schema_version", "scenes"} or payload.get(
+        "schema_version"
+    ) != DTU_INVENTORY_SCHEMA:
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_DTU_INVENTORY_SCHEMA"
+        )
+    scenes = payload.get("scenes")
+    if not isinstance(scenes, list) or len(scenes) != len(DTU_OFFICIAL_SCENE_SET):
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_DTU_INVENTORY_CARDINALITY"
+        )
+    rows: list[VerifiedSceneInventory] = []
+    seen: set[int] = set()
+    expected_camera_ids = {str(view_id) for view_id in range(1, 50)}
+    for raw in scenes:
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "scene_id",
+            "camera_centers",
+            "rgb_files",
+            "points_path",
+            "mask_path",
+        }:
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_DTU_INVENTORY_SCHEMA"
+            )
+        scene_id = raw.get("scene_id")
+        if type(scene_id) is not int or scene_id not in DTU_OFFICIAL_SCENE_SET:
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_DTU_INVENTORY_SCENE"
+            )
+        if scene_id in seen:
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_DTU_INVENTORY_DUPLICATE"
+            )
+        seen.add(scene_id)
+        centers = raw.get("camera_centers")
+        if not isinstance(centers, Mapping) or set(centers) != expected_camera_ids:
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_DTU_INVENTORY_CAMERA"
+            )
+        for center in centers.values():
+            if (
+                not isinstance(center, list)
+                or len(center) != 3
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not np.isfinite(float(value))
+                    for value in center
+                )
+            ):
+                raise Attempt05InputClosureError(
+                    "V4_MVE_BLOCKED_INPUT_DTU_INVENTORY_CAMERA"
+                )
+        rgb_files = raw.get("rgb_files")
+        expected_rgb = [
+            f"rect_{view_id:03d}_3_r5000.png" for view_id in range(1, 50)
+        ]
+        if rgb_files != expected_rgb:
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_DTU_INVENTORY_RGB"
+            )
+        if raw.get("points_path") != f"Points/stl/stl{scene_id:03d}_total.ply":
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_DTU_INVENTORY_POINTS"
+            )
+        if (
+            raw.get("mask_path")
+            != f"SampleSet/MVS Data/ObsMask/ObsMask{scene_id}_10.mat"
+        ):
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_DTU_INVENTORY_MASK"
+            )
+        rows.append(
+            VerifiedSceneInventory(
+                scene_id=scene_id,
+                verified_complete=True,
+                inventory_sha256=_sha256_json(dict(raw)),
+            )
+        )
+    if seen != DTU_OFFICIAL_SCENE_SET:
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_DTU_INVENTORY_SCENE_SET"
+        )
+    return _VerifiedDtuInventory(
+        path=resolved,
+        file_sha256=file_sha256,
+        rows=tuple(sorted(rows, key=lambda row: row.scene_id)),
+    )

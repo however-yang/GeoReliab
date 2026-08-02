@@ -7,26 +7,252 @@ import pytest
 
 from georeliab_mve.v4_attempt05_inputs import (
     Attempt05InputClosureError,
+    _RectifiedArchiveBinding,
     _camera_path,
+    _expected_calibration_l3_members,
     _global_frozen_view_order,
     _gt_path,
+    _load_verified_dtu_inventory,
     _load_corruption_calibration,
+    _materialize_calibration_l3_members,
     _materialize_fog_members,
     _mask_path,
     _rgb_path,
     _scene_has_required_l3_assets,
-    _verified_complete_scenes,
     _view_order_from_closure_manifest,
     _view_order_from_resource_schedule,
     build_attempt05_calibration_schedule,
     build_attempt05_v4_split_assignment,
     validate_attempt05_input_closure,
 )
-from georeliab_mve.v4_counterfactuals import TEST_SCENE_IDS
+from georeliab_mve.tartanair_range import RemoteZipEntry, RemoteZipIndex
+from georeliab_mve.v4_counterfactuals import DTU_OFFICIAL_SCENE_IDS, TEST_SCENE_IDS
 
 
 def _sha() -> str:
     return "a" * 64
+
+
+def _inventory_payload() -> dict[str, object]:
+    scenes = []
+    for scene_id in DTU_OFFICIAL_SCENE_IDS:
+        scenes.append(
+            {
+                "scene_id": scene_id,
+                "camera_centers": {
+                    str(view_id): [float(view_id), 0.0, 1.0]
+                    for view_id in range(1, 50)
+                },
+                "rgb_files": [
+                    f"rect_{view_id:03d}_3_r5000.png"
+                    for view_id in range(1, 50)
+                ],
+                "points_path": f"Points/stl/stl{scene_id:03d}_total.ply",
+                "mask_path": f"SampleSet/MVS Data/ObsMask/ObsMask{scene_id}_10.mat",
+            }
+        )
+    return {"schema_version": "dtu-official-inventory-v1", "scenes": scenes}
+
+
+def _write_inventory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    import georeliab_mve.v4_attempt05_inputs as inputs
+
+    path = tmp_path / "dtu_inventory.json"
+    path.write_text(json.dumps(_inventory_payload()), encoding="utf-8")
+    monkeypatch.setattr(inputs, "DTU_INVENTORY_FILE_SHA256", inputs._sha256_file(path))
+    return path
+
+
+def _sha256_file_for_test(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_frozen_inventory_drives_v4_split_without_local_rgb_presence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = _load_verified_dtu_inventory(_write_inventory(tmp_path, monkeypatch))
+    assignment = build_attempt05_v4_split_assignment(
+        inventory=inventory.rows,
+        source_root=Path.cwd(),
+    )
+
+    assert len(inventory.rows) == 124
+    assert assignment.calibration == (
+        82, 52, 74, 73, 94, 122, 105, 90, 115, 107,
+        5, 63, 76, 126, 92, 20, 127, 38, 17, 71,
+    )
+    assert inventory.file_sha256 == _sha256_file_for_test(inventory.path)
+
+
+@pytest.mark.parametrize("mutation", ["duplicate", "rgb_count", "camera_nan"])
+def test_frozen_inventory_rejects_schema_and_identity_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    import georeliab_mve.v4_attempt05_inputs as inputs
+
+    payload = _inventory_payload()
+    scenes = payload["scenes"]
+    assert isinstance(scenes, list)
+    if mutation == "duplicate":
+        scenes[-1] = dict(scenes[0])
+    elif mutation == "rgb_count":
+        scenes[0]["rgb_files"] = scenes[0]["rgb_files"][:-1]
+    else:
+        scenes[0]["camera_centers"]["1"][0] = float("nan")
+    path = tmp_path / "dtu_inventory.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(inputs, "DTU_INVENTORY_FILE_SHA256", inputs._sha256_file(path))
+
+    with pytest.raises(Attempt05InputClosureError, match="DTU_INVENTORY"):
+        _load_verified_dtu_inventory(path)
+
+
+def test_calibration_l3_expected_set_is_exactly_twenty_scenes_by_eight_views() -> None:
+    assignment = build_attempt05_v4_split_assignment(
+        complete_scene_ids=DTU_OFFICIAL_SCENE_IDS,
+        source_root=Path.cwd(),
+    )
+    members = _expected_calibration_l3_members(
+        split_assignment=assignment,
+        ordered_views=(1, 39, 45, 49, 6, 16, 42, 27),
+    )
+
+    assert len(members) == 160
+    assert len(set(members)) == 160
+    assert all("_3_r5000.png" in member for member in members)
+    assert {int(member.split("scan", 1)[1].split("/", 1)[0]) for member in members} == set(
+        assignment.calibration
+    )
+
+
+def _remote_index(
+    members: tuple[str, ...],
+    *,
+    length: int = 1234,
+    etag: str = '"frozen-etag"',
+) -> RemoteZipIndex:
+    entries = {
+        member: RemoteZipEntry(member, 0, 3, 3, 0, index)
+        for index, member in enumerate(members)
+    }
+    return RemoteZipIndex(length, etag, entries, "b" * 64)
+
+
+def test_calibration_l3_materialization_binds_archive_and_reuses_existing_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import georeliab_mve.v4_attempt05_inputs as inputs
+
+    assignment = build_attempt05_v4_split_assignment(
+        complete_scene_ids=DTU_OFFICIAL_SCENE_IDS,
+        source_root=Path.cwd(),
+    )
+    views = (1, 39, 45, 49, 6, 16, 42, 27)
+    members = _expected_calibration_l3_members(
+        split_assignment=assignment,
+        ordered_views=views,
+    )
+    monkeypatch.setattr(inputs, "index_remote_zip", lambda _url: _remote_index(members))
+
+    def extract(_url, _index, requested, destination):
+        result = {}
+        for ordinal, member in enumerate(requested):
+            path = destination / member
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"png")
+            result[member] = {
+                "member": member,
+                "path": str(path),
+                "compressed_size": 3,
+                "uncompressed_size": 3,
+                "crc32": "00000000",
+                "raw_sha256": _sha256_file_for_test(path),
+                "disposition": "reused" if ordinal == 0 else "written",
+            }
+        return result
+
+    monkeypatch.setattr(inputs, "extract_range_members_evidence", extract)
+    result = _materialize_calibration_l3_members(
+        dtu_root=tmp_path,
+        split_assignment=assignment,
+        ordered_views=views,
+        archive=_RectifiedArchiveBinding(
+            url="https://example.invalid/Rectified.zip",
+            content_length=1234,
+            etag="frozen-etag",
+        ),
+    )
+
+    assert len(result.records) == 160
+    assert result.records[0]["disposition"] == "reused"
+    assert result.written_member_count == 159
+    assert result.central_directory_sha256 == "b" * 64
+    assert result.observed_etag == '"frozen-etag"'
+    assert result.normalized_etag == "frozen-etag"
+
+
+@pytest.mark.parametrize("drift", ["bytes", "etag", "extra"])
+def test_calibration_l3_materialization_rejects_archive_or_result_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    import georeliab_mve.v4_attempt05_inputs as inputs
+
+    assignment = build_attempt05_v4_split_assignment(
+        complete_scene_ids=DTU_OFFICIAL_SCENE_IDS,
+        source_root=Path.cwd(),
+    )
+    views = (1, 39, 45, 49, 6, 16, 42, 27)
+    members = _expected_calibration_l3_members(
+        split_assignment=assignment,
+        ordered_views=views,
+    )
+    monkeypatch.setattr(
+        inputs,
+        "index_remote_zip",
+        lambda _url: _remote_index(
+            members,
+            length=1235 if drift == "bytes" else 1234,
+            etag='"changed-etag"' if drift == "etag" else '"frozen-etag"',
+        ),
+    )
+
+    def extract(_url, _index, requested, destination):
+        result = {
+            member: {
+                "member": member,
+                "path": str(destination / member),
+                "compressed_size": 3,
+                "uncompressed_size": 3,
+                "crc32": "00000000",
+                "raw_sha256": "c" * 64,
+                "disposition": "written",
+            }
+            for member in requested
+        }
+        if drift == "extra":
+            result["Rectified/scan999/extra.png"] = dict(next(iter(result.values())))
+        return result
+
+    monkeypatch.setattr(inputs, "extract_range_members_evidence", extract)
+    with pytest.raises(Attempt05InputClosureError, match="RECTIFIED_ARCHIVE"):
+        _materialize_calibration_l3_members(
+            dtu_root=tmp_path,
+            split_assignment=assignment,
+            ordered_views=views,
+            archive=_RectifiedArchiveBinding(
+                url="https://example.invalid/Rectified.zip",
+                content_length=1234,
+                etag="frozen-etag",
+            ),
+        )
 
 
 def test_v4_split_uses_twenty_calibration_and_scene_disjoint() -> None:
@@ -168,37 +394,6 @@ def test_resource_schedule_is_authoritative_for_ordered_views(tmp_path: Path, mo
     monkeypatch.setattr(inputs, "SCHEDULE_FILE_SHA256", inputs._sha256_file(schedule))
 
     assert _view_order_from_resource_schedule(schedule) == {scene: ordered for scene in TEST_SCENE_IDS}
-
-
-def test_calibration_reuses_frozen_global_view_order_without_all_49_cameras(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import georeliab_mve.v4_attempt05_inputs as inputs
-
-    root = tmp_path / "materialized"
-    ordered = (1, 39, 45, 49, 6, 16, 42, 27)
-    observed_orders: dict[int, tuple[int, ...]] = {}
-
-    def record_order(root: Path, scene_id: int, ordered_views: tuple[int, ...]) -> bool:
-        observed_orders[scene_id] = tuple(ordered_views)
-        return True
-
-    monkeypatch.setattr(inputs, "_scene_has_required_l3_assets", record_order)
-
-    authoritative = {scene: ordered for scene in TEST_SCENE_IDS}
-    global_order = _global_frozen_view_order(authoritative)
-    complete = _verified_complete_scenes(
-        root,
-        authoritative,
-        authoritative,
-        default_view_order=global_order,
-    )
-
-    assert global_order == ordered
-    assert 82 in complete
-    assert observed_orders[82] == ordered
-    assert not _camera_path(root, 2).exists()
 
 
 def test_frozen_global_view_order_rejects_scene_order_drift() -> None:
