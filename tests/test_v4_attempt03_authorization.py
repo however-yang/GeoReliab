@@ -415,7 +415,8 @@ def test_resource_revalidation_failure_publishes_immutable_blocker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     output = (
-        tmp_path / 'authorization-attempts' / ATTEMPT_ID / 'resource.json'
+        tmp_path / 'authorization-attempts' / ATTEMPT_ID
+        / 'v4-resource-revalidation.json'
     )
     monkeypatch.setattr(
         attempt03,
@@ -470,6 +471,26 @@ def test_resource_revalidation_failure_publishes_immutable_blocker(
             closure_root=tmp_path / 'closure',
             overlay_path=tmp_path / 'overlay.toml',
             output_path=output,
+        )
+
+
+def test_attempt03_revalidation_rejects_alternate_output_path(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        V4ExecutionError,
+        match='V4_ATTEMPT03_CANONICAL_OUTPUT_REQUIRED',
+    ):
+        attempt03.revalidate_attempt03_resources(
+            worktree=tmp_path,
+            runtime_root=tmp_path,
+            rectified_root=tmp_path / 'materialized',
+            closure_root=tmp_path / 'closure',
+            overlay_path=tmp_path / 'overlay.toml',
+            output_path=(
+                tmp_path / 'authorization-attempts' / ATTEMPT_ID
+                / 'alternate.json'
+            ),
         )
 
 

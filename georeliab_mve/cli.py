@@ -84,6 +84,12 @@ from .v4_attempt03_authorization import (
     revalidate_attempt03_resources,
     validate_attempt03_execution_authorization,
 )
+from .v4_overlay_resource_resolution import (
+    OverlayResolutionError,
+    parse_resource_overrides,
+    resolve_overlay_resources,
+    validate_overlay_resource_resolution,
+)
 
 
 DEFAULT_PROTOCOL = Path('configs/dual_mve_protocol.toml')
@@ -101,6 +107,12 @@ ATTEMPT03_COMMANDS = frozenset(
         'v4-attempt03-gpu-preflight',
         'v4-attempt03-create-execution-authorization',
         'v4-attempt03-validate-execution-authorization',
+    }
+)
+OVERLAY_RESOLUTION_COMMANDS = frozenset(
+    {
+        'v4-resolve-overlay-resources',
+        'v4-validate-overlay-resource-resolution',
     }
 )
 ATTEMPT02_REQUIRED_HISTORY_PATHS = (
@@ -607,6 +619,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     attempt03_validate.add_argument('authorization', type=Path)
 
+    overlay_resolve = subparsers.add_parser(
+        'v4-resolve-overlay-resources'
+    )
+    overlay_resolve.add_argument('--worktree', type=Path, required=True)
+    overlay_resolve.add_argument(
+        '--runtime-root', type=Path, required=True
+    )
+    overlay_resolve.add_argument('--overlay', type=Path, required=True)
+    overlay_resolve.add_argument(
+        '--frozen-materialization', type=Path, required=True
+    )
+    overlay_resolve.add_argument('--output-dir', type=Path, required=True)
+    overlay_resolve.add_argument(
+        '--resource-override', action='append', default=[]
+    )
+    overlay_validate = subparsers.add_parser(
+        'v4-validate-overlay-resource-resolution'
+    )
+    overlay_validate.add_argument('receipt', type=Path)
+
     bootstrap_rectified = subparsers.add_parser('v4-prepare-rectified-resource-schedule')
     bootstrap_rectified.add_argument('--protocol', type=Path, required=True)
     bootstrap_rectified.add_argument('--split-view-manifest', type=Path, required=True)
@@ -648,6 +680,7 @@ def main(argv: list[str] | None = None) -> int:
         if (
             command_hint in ATTEMPT02_COMMANDS
             or command_hint in ATTEMPT03_COMMANDS
+            or command_hint in OVERLAY_RESOLUTION_COMMANDS
             or command_hint in rectified_commands
         ):
             with redirect_stderr(StringIO()):
@@ -674,6 +707,20 @@ def main(argv: list[str] | None = None) -> int:
                     {
                         'status': 'FAIL',
                         'reason_code': 'V4_ATTEMPT03_CLI_ARGUMENT_ERROR',
+                        'error_type': 'ArgumentParserError',
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 2
+        if command_hint in OVERLAY_RESOLUTION_COMMANDS and exc.code != 0:
+            print(
+                json.dumps(
+                    {
+                        'status': 'FAIL',
+                        'reason_code': 'V4_OVERLAY_CLI_ARGUMENT_ERROR',
+                        'scientific_result': 'NO_SCIENTIFIC_RESULT',
                         'error_type': 'ArgumentParserError',
                     },
                     indent=2,
@@ -780,6 +827,23 @@ def main(argv: list[str] | None = None) -> int:
             payload = validate_attempt03_execution_authorization(
                 args.authorization
             )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == 'v4-resolve-overlay-resources':
+            payload = resolve_overlay_resources(
+                worktree=args.worktree,
+                runtime_root=args.runtime_root,
+                overlay_path=args.overlay,
+                frozen_materialization_path=args.frozen_materialization,
+                output_dir=args.output_dir,
+                resource_overrides=parse_resource_overrides(
+                    args.resource_override
+                ),
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == 'v4-validate-overlay-resource-resolution':
+            payload = validate_overlay_resource_resolution(args.receipt)
             print(json.dumps(payload, indent=2, sort_keys=True))
             return 0
         if args.command == 'v4-prepare-rectified-resource-schedule':
@@ -1032,7 +1096,21 @@ def main(argv: list[str] | None = None) -> int:
                 }
             print(json.dumps(payload, indent=2, sort_keys=True))
             return 0 if payload.get('status') == 'PASS' else 2
-    except (KeyError, TypeError, ValueError, AuditError, StorageAuditError, ExecutionGovernanceError, V4ExecutionError, V4RectifiedClosureError, OSError, json.JSONDecodeError) as exc:
+    except (KeyError, TypeError, ValueError, AuditError, StorageAuditError, ExecutionGovernanceError, V4ExecutionError, V4RectifiedClosureError, OverlayResolutionError, OSError, json.JSONDecodeError) as exc:
+        if args.command in OVERLAY_RESOLUTION_COMMANDS:
+            print(
+                json.dumps(
+                    {
+                        'status': 'FAIL',
+                        'reason_code': str(exc) or type(exc).__name__,
+                        'scientific_result': 'NO_SCIENTIFIC_RESULT',
+                        'error_type': type(exc).__name__,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 2
         if args.command in ATTEMPT03_COMMANDS:
             print(
                 json.dumps(

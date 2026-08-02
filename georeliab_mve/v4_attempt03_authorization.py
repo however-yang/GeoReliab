@@ -38,6 +38,10 @@ from .v4_science_lock import (
     V4ScienceLockError,
     validate_v4_science_lock,
 )
+from .v4_overlay_resource_resolution import (
+    OverlayResolutionError,
+    resolve_overlay_resource_identities,
+)
 
 
 ATTEMPT_ID = 'attempt-03'
@@ -337,6 +341,7 @@ def _read_overlay(path: Path) -> dict[str, Any]:
 
 def _resource_bindings(
     *,
+    worktree: Path,
     runtime_root: Path,
     overlay_path: Path,
     materialize_receipt_path: Path,
@@ -347,8 +352,18 @@ def _resource_bindings(
     resources = overlay.get('resources')
     if not isinstance(resources, Mapping):
         raise V4ExecutionError('V4_ATTEMPT03_OVERLAY_RESOURCES_REQUIRED')
-    sampleset = runtime_root / 'cache' / 'SampleSet.zip'
-    points = runtime_root / 'cache' / 'Points.zip'
+    resolved_archives = resolve_overlay_resource_identities(
+        worktree=worktree,
+        runtime_root=runtime_root,
+        overlay_path=overlay_path,
+        frozen_materialization_path=(
+            runtime_root / 'manifests' / 'frozen_materialization.json'
+        ),
+    )
+    sampleset_identity = resolved_archives['resources']['dtu_sampleset']
+    points_identity = resolved_archives['resources']['dtu_points']
+    sampleset = Path(str(sampleset_identity['realpath']))
+    points = Path(str(points_identity['realpath']))
     environment = (
         runtime_root / 'artifacts' / 'environment_locks'
         / 'a100_environment_lock.json'
@@ -453,8 +468,14 @@ def _resource_bindings(
         'overlay': _file_binding(overlay_path),
         'models': models,
         'dtu_archives': {
-            'SampleSet': _file_binding(sampleset),
-            'Points': _file_binding(points),
+            'SampleSet': {
+                **_file_binding(sampleset),
+                'overlay_resolution': sampleset_identity,
+            },
+            'Points': {
+                **_file_binding(points),
+                'overlay_resolution': points_identity,
+            },
             'Rectified': rectified,
         },
         'environment_lock': _file_binding(environment),
@@ -675,8 +696,32 @@ def _verify_resource_bindings(value: object) -> None:
     archives = value.get('dtu_archives')
     if not isinstance(archives, Mapping):
         raise V4ExecutionError('V4_ATTEMPT03_RESOURCE_RECEIPT_TAMPER')
-    _verify_file_binding(archives.get('SampleSet'))
-    _verify_file_binding(archives.get('Points'))
+    for archive_name, logical_id in (
+        ('SampleSet', 'dtu_sampleset'),
+        ('Points', 'dtu_points'),
+    ):
+        archive = archives.get(archive_name)
+        _verify_file_binding(archive)
+        if not isinstance(archive, Mapping):
+            raise V4ExecutionError(
+                'V4_ATTEMPT03_RESOURCE_RECEIPT_TAMPER'
+            )
+        resolution = archive.get('overlay_resolution')
+        if (
+            not isinstance(resolution, Mapping)
+            or resolution.get('logical_resource_id') != logical_id
+            or resolution.get('realpath') != archive.get('path')
+            or resolution.get('observed_sha256') != archive.get('sha256')
+            or resolution.get('expected_sha256') != archive.get('sha256')
+            or resolution.get('file_size') != archive.get('bytes')
+            or resolution.get('expected_bytes') != archive.get('bytes')
+            or resolution.get('root_containment') != 'PASS'
+            or resolution.get('resolution_rule_id')
+            != 'FROZEN_OVERLAY_RUNTIME_DATA_EXACT_BASENAME_V1'
+        ):
+            raise V4ExecutionError(
+                'V4_ATTEMPT03_RESOURCE_RECEIPT_TAMPER'
+            )
     rectified = archives.get('Rectified')
     if (
         not isinstance(rectified, Mapping)
@@ -786,6 +831,7 @@ def _revalidate_attempt03_resources_pass(
         raise V4ExecutionError('V4_RESOURCE_CLOSURE_REVALIDATION_FAILED')
     tooling_commit, tooling_tree = _tooling_revision(worktree)
     resources = _resource_bindings(
+        worktree=worktree,
         runtime_root=runtime_root,
         overlay_path=overlay_path,
         materialize_receipt_path=materialize_path,
@@ -854,6 +900,12 @@ def revalidate_attempt03_resources(
 ) -> dict[str, object]:
     runtime_root = runtime_root.resolve()
     output_path = _require_attempt_root(runtime_root, output_path)
+    canonical_output = (
+        _required_attempt_root(runtime_root)
+        / 'v4-resource-revalidation.json'
+    )
+    if output_path != canonical_output:
+        raise V4ExecutionError('V4_ATTEMPT03_CANONICAL_OUTPUT_REQUIRED')
     _require_fresh_artifact(output_path)
     tooling_commit, tooling_tree = _tooling_revision(worktree)
     try:
@@ -869,6 +921,7 @@ def revalidate_attempt03_resources(
         V4ExecutionError,
         V4RectifiedClosureError,
         V4ScienceLockError,
+        OverlayResolutionError,
         OSError,
         ValueError,
     ) as exc:
