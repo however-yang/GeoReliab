@@ -93,7 +93,8 @@ def test_a100_scripts_fail_closed_on_paths_and_disallowed_git_operations() -> No
     assert {path.name for path in SCRIPTS} == {
         'authorize_v4_attempt03.sh', 'authorize_v4_attempt04.sh', 'common.sh',
         'deploy_commit.sh',
-        'finalize_p6.sh', 'launch_stage.sh', 'resolve_v4_overlay_resources.sh', 'status.sh',
+        'finalize_p6.sh', 'launch_stage.sh', 'resolve_v4_overlay_resources.sh',
+        'run_v4_attempt05.sh', 'status.sh',
         'verify_prereqs.sh',
     }
     all_text = '\n'.join(path.read_text(encoding='utf-8') for path in SCRIPTS)

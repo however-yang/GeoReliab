@@ -7,9 +7,12 @@ from contextlib import redirect_stderr
 import hashlib
 from io import StringIO
 import json
+import os
 from pathlib import Path
 import platform
+import subprocess
 import sys
+import time
 from typing import Any, Mapping
 
 from .contracts import (
@@ -87,6 +90,7 @@ from .v4_attempt03_authorization import (
 from .v4_attempt04_authorization import (
     create_attempt04_execution_authorization,
     create_attempt04_gpu_preflight,
+    nvidia_smi_attempt04_inventory,
     revalidate_attempt04_resources,
     validate_attempt04_execution_authorization,
 )
@@ -96,6 +100,33 @@ from .v4_overlay_resource_resolution import (
     resolve_overlay_resources,
     validate_overlay_resource_resolution,
 )
+from .v4_attempt05_execution import (
+    ATTEMPT05_RUN_NAME,
+    build_attempt05_scientific_schedule,
+    create_attempt05_execution_preflight,
+    create_attempt05_start_receipt,
+    authorize_attempt05_next_dispatch,
+    evaluate_attempt05_resource_gate,
+    finalize_attempt05_scientific_bundle,
+    load_attempt05_authorized_context,
+    rehydrate_attempt05_ledger_totals,
+)
+from .v4_attempt05_inputs import (
+    prepare_attempt05_inputs,
+    validate_attempt05_input_closure,
+)
+from .v4_attempt05_orchestrator import (
+    construct_attempt05_runtime_bindings,
+    make_attempt05_runtime_executors,
+    run_attempt05_pipeline,
+)
+from .v4_counterfactuals import (
+    ModelIndependentState,
+    V4SplitAssignment,
+    parse_scientific_schedule,
+    validate_scientific_schedule,
+)
+from .v4_metrics import NativeWarningCalibration
 
 
 DEFAULT_PROTOCOL = Path('configs/dual_mve_protocol.toml')
@@ -127,6 +158,15 @@ OVERLAY_RESOLUTION_COMMANDS = frozenset(
     {
         'v4-resolve-overlay-resources',
         'v4-validate-overlay-resource-resolution',
+    }
+)
+ATTEMPT05_COMMANDS = frozenset(
+    {
+        'v4-attempt05-prepare-inputs',
+        'v4-attempt05-preflight',
+        'v4-attempt05-run',
+        'v4-attempt05-status',
+        'v4-attempt05-finalize',
     }
 )
 ATTEMPT02_REQUIRED_HISTORY_PATHS = (
@@ -201,6 +241,146 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b''):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _json_payload_or_list(path: Path) -> Any:
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+def _attempt05_json_list(path: Path, *keys: str) -> list[Any]:
+    payload = _json_payload_or_list(path)
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    raise ValueError(f'{path} must contain a JSON list or one of {keys}')
+
+
+def _attempt05_states(path: Path) -> tuple[ModelIndependentState, ...]:
+    return tuple(
+        ModelIndependentState.from_dict(row)
+        for row in _attempt05_json_list(path, 'states', 'model_independent_states')
+    )
+
+
+def _attempt05_schedule(path: Path):
+    return validate_scientific_schedule(
+        parse_scientific_schedule(path.read_text(encoding='utf-8'))
+    )
+
+
+def _attempt05_split(path: Path) -> V4SplitAssignment:
+    payload = _load_json(path)
+    splits = payload.get('splits')
+    if not isinstance(splits, Mapping):
+        raise ValueError('v4 split assignment requires splits object')
+    provenance = payload.get('protocol_provenance')
+    if not isinstance(provenance, Mapping):
+        raise ValueError('v4 split assignment requires protocol provenance')
+    return V4SplitAssignment(
+        protocol_provenance_items=tuple(sorted((str(k), str(v)) for k, v in provenance.items())),
+        calibration=tuple(int(v) for v in splits.get('calibration', ())),
+        dev=tuple(int(v) for v in splits.get('dev', ())),
+        reference=tuple(int(v) for v in splits.get('reference', ())),
+        test=tuple(int(v) for v in splits.get('test', ())),
+        excluded_incomplete=tuple(int(v) for v in payload.get('excluded_incomplete', ())),
+        unassigned_verified=tuple(int(v) for v in payload.get('unassigned_verified', ())),
+        inventory_sha256=str(payload.get('inventory_sha256')),
+        fingerprint_sha256=str(payload.get('fingerprint_sha256')),
+        schema_version=str(payload.get('schema_version')),
+    )
+
+
+def _attempt05_calibration_schedule(path: Path) -> tuple[Mapping[str, object], ...]:
+    return tuple(_attempt05_json_list(path, 'calibration_schedule', 'units'))
+
+
+def _attempt05_calibrations(path: Path) -> tuple[NativeWarningCalibration, ...]:
+    rows = _attempt05_json_list(path, 'native_warning_calibrations', 'calibrations')
+    return tuple(
+        NativeWarningCalibration(
+            model_id=str(row['model_id']),
+            scene_ids=tuple(int(v) for v in row['scene_ids']),
+            sorted_warning_scores=tuple(float(v) for v in row['sorted_warning_scores']),
+            alarm_threshold=float(row['alarm_threshold']),
+            split_fingerprint_sha256=str(row['split_fingerprint_sha256']),
+            inventory_sha256=str(row['inventory_sha256']),
+            calibration_identifier=str(row['calibration_identifier']),
+            schema_version=str(row.get('schema_version', 'georeliab-v4-native-warning-calibration-1.0')),
+        )
+        for row in rows
+    )
+
+def _attempt05_overlay_config_path(context: Any) -> Path:
+    raw_receipt = context.authorization.get("resource_receipt_path")
+    if not isinstance(raw_receipt, str) or not raw_receipt:
+        raise ValueError("Attempt-05 authorization requires resource receipt path")
+    receipt_path = Path(raw_receipt)
+    receipt = _load_json(receipt_path)
+    bindings = receipt.get("resource_bindings")
+    if not isinstance(bindings, Mapping):
+        raise ValueError("Attempt-05 resource receipt requires resource bindings")
+    overlay = bindings.get("overlay")
+    if not isinstance(overlay, Mapping):
+        raise ValueError("Attempt-05 resource receipt requires overlay binding")
+    raw_overlay_path = overlay.get("path") or overlay.get("overlay_descriptor_path")
+    if not isinstance(raw_overlay_path, str) or not raw_overlay_path:
+        raise ValueError("Attempt-05 resource receipt requires overlay path")
+    overlay_path = Path(raw_overlay_path)
+    expected_sha = overlay.get("sha256") or overlay.get("overlay_descriptor_sha256")
+    if (
+        isinstance(expected_sha, str)
+        and expected_sha
+        and hashlib.sha256(overlay_path.read_bytes()).hexdigest() != expected_sha
+    ):
+        raise ValueError("Attempt-05 overlay digest mismatch")
+    return overlay_path
+
+def _attempt05_cuda_mapping_probe(context: Any) -> Mapping[str, object]:
+    selected_index = int(context.selected_gpu["index"])
+    code = f"""
+import json
+import subprocess
+import torch
+visible = torch.cuda.device_count()
+props = torch.cuda.get_device_properties(0) if visible == 1 else None
+query = subprocess.check_output([
+    'nvidia-smi',
+    '--id={selected_index}',
+    '--query-gpu=uuid,pci.bus_id,name,memory.total',
+    '--format=csv,noheader,nounits',
+], text=True).strip()
+parts = [part.strip() for part in query.split(',')]
+print(json.dumps({{
+    'visible_device_count': visible,
+    'logical_device': 'cuda:0' if visible == 1 else None,
+    'mapped_uuid': parts[0] if len(parts) >= 1 else None,
+    'mapped_pci_bus_id': parts[1] if len(parts) >= 2 else None,
+    'mapped_name': props.name if props is not None else None,
+    'total_memory_mib': int(props.total_memory // (1024 * 1024)) if props is not None else None,
+    'model_loads': 0,
+    'model_forwards': 0,
+    'checkpoint_loads': 0,
+}}))
+"""
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(selected_index)
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    payload = json.loads(completed.stdout)
+    if not isinstance(payload, Mapping):
+        raise V4ExecutionError("V4_ATTEMPT05_CUDA_MAPPING_PROBE_INVALID")
+    return payload
+
 
 
 def _require_bool(payload: Mapping[str, Any], key: str) -> bool:
@@ -727,6 +907,43 @@ def build_parser() -> argparse.ArgumentParser:
     materialize_rectified.add_argument('--root', type=Path, required=True)
     materialize_rectified.add_argument('--expected-set', type=Path, required=True)
     materialize_rectified.add_argument('--official-rectified-archive', required=True)
+    attempt05_prepare = subparsers.add_parser('v4-attempt05-prepare-inputs')
+    attempt05_prepare.add_argument('--authorization', type=Path, required=True)
+    attempt05_prepare.add_argument('--dtu-root', type=Path, required=True)
+    attempt05_prepare.add_argument('--rectified-closure-manifest', type=Path, required=True)
+    attempt05_prepare.add_argument('--fog-root', type=Path, required=True)
+    attempt05_prepare.add_argument('--output-dir', type=Path, required=True)
+
+    attempt05_preflight = subparsers.add_parser('v4-attempt05-preflight')
+    attempt05_preflight.add_argument('--authorization', type=Path, required=True)
+    attempt05_preflight.add_argument('--states', type=Path, required=True)
+    attempt05_preflight.add_argument('--schedule', type=Path, required=True)
+    attempt05_preflight.add_argument('--split-assignment', type=Path, required=True)
+    attempt05_preflight.add_argument('--calibration-schedule', type=Path, required=True)
+    attempt05_preflight.add_argument('--input-closure', type=Path, required=True)
+    attempt05_preflight.add_argument('--tooling-commit', required=True)
+    attempt05_preflight.add_argument('--tooling-tree', required=True)
+    attempt05_preflight.add_argument('--resume', action='store_true')
+
+    attempt05_run = subparsers.add_parser('v4-attempt05-run')
+    attempt05_run.add_argument('--authorization', type=Path, required=True)
+    attempt05_run.add_argument('--input-closure-dir', type=Path, required=True)
+    attempt05_run.add_argument('--tooling-commit', required=True)
+    attempt05_run.add_argument('--tooling-tree', required=True)
+    attempt05_run.add_argument('--resume', action='store_true')
+
+    attempt05_status = subparsers.add_parser('v4-attempt05-status')
+    attempt05_status.add_argument('--authorization', type=Path, required=True)
+    attempt05_status.add_argument('--schedule', type=Path, required=True)
+
+    attempt05_finalize = subparsers.add_parser('v4-attempt05-finalize')
+    attempt05_finalize.add_argument('--authorization', type=Path, required=True)
+    attempt05_finalize.add_argument('--states', type=Path, required=True)
+    attempt05_finalize.add_argument('--schedule', type=Path, required=True)
+    attempt05_finalize.add_argument('--split-assignment', type=Path, required=True)
+    attempt05_finalize.add_argument('--native-warning-calibrations', type=Path, required=True)
+    attempt05_finalize.add_argument('--record-path', type=Path, action='append', required=True)
+
     materialize_rectified.add_argument('--output-dir', type=Path, required=True)
     return parser
 
@@ -749,6 +966,7 @@ def main(argv: list[str] | None = None) -> int:
             or command_hint in ATTEMPT03_COMMANDS
             or command_hint in ATTEMPT04_COMMANDS
             or command_hint in OVERLAY_RESOLUTION_COMMANDS
+            or command_hint in ATTEMPT05_COMMANDS
             or command_hint in rectified_commands
         ):
             with redirect_stderr(StringIO()):
@@ -803,6 +1021,21 @@ def main(argv: list[str] | None = None) -> int:
                     {
                         'status': 'FAIL',
                         'reason_code': 'V4_OVERLAY_CLI_ARGUMENT_ERROR',
+                        'scientific_result': 'NO_SCIENTIFIC_RESULT',
+                        'error_type': 'ArgumentParserError',
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 2
+        if command_hint in ATTEMPT05_COMMANDS and exc.code != 0:
+            print(
+                json.dumps(
+                    {
+                        'status': 'FAIL',
+                        'reason_code': 'V4_ATTEMPT05_CLI_ARGUMENT_ERROR',
+                        'attempt_id': 'attempt-05',
                         'scientific_result': 'NO_SCIENTIFIC_RESULT',
                         'error_type': 'ArgumentParserError',
                     },
@@ -1140,6 +1373,234 @@ def main(argv: list[str] | None = None) -> int:
             payload = validate_execution_authorization(args.authorization)
             print(json.dumps(payload, indent=2, sort_keys=True))
             return 0
+        if args.command == 'v4-attempt05-prepare-inputs':
+            context = load_attempt05_authorized_context(
+                authorization_path=args.authorization
+            )
+            closure = prepare_attempt05_inputs(
+                context=context,
+                dtu_root=args.dtu_root,
+                rectified_closure_manifest=args.rectified_closure_manifest,
+                fog_root=args.fog_root,
+                output_dir=args.output_dir,
+                source_root=Path(__file__).resolve().parents[1],
+            )
+            payload = {
+                'status': closure.status,
+                'attempt_id': 'attempt-05',
+                'run_name': ATTEMPT05_RUN_NAME,
+                'scientific_result': 'NO_SCIENTIFIC_RESULT',
+                'attempt04_authorization_sha256': context.authorization_sha256,
+                'input_closure_path': str(closure.manifest_path),
+                'input_closure_sha256': closure.manifest_sha256,
+                'split_assignment_path': str(closure.split_assignment_path),
+                'split_assignment_sha256': closure.split_assignment_sha256,
+                'state_inventory_path': str(closure.state_inventory_path),
+                'state_inventory_sha256': closure.state_inventory_sha256,
+                'scientific_schedule_path': str(closure.scientific_schedule_path),
+                'scientific_schedule_sha256': closure.scientific_schedule_sha256,
+                'calibration_schedule_path': str(closure.calibration_schedule_path),
+                'calibration_schedule_sha256': closure.calibration_schedule_sha256,
+                'runtime_binding_path': str(closure.runtime_binding_path),
+                'runtime_binding_sha256': closure.runtime_binding_sha256,
+                'model_independent_states': len(closure.model_independent_states),
+                'scientific_units': len(closure.scientific_schedule.units),
+                'calibration_l3_units': len(closure.calibration_schedule),
+                'max_model_execution_units': 440,
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == 'v4-attempt05-preflight':
+            context = load_attempt05_authorized_context(
+                authorization_path=args.authorization
+            )
+            states = _attempt05_states(args.states)
+            schedule = _attempt05_schedule(args.schedule)
+            rebuilt = build_attempt05_scientific_schedule(states)
+            if rebuilt.schedule_sha256 != schedule.schedule_sha256:
+                raise V4ExecutionError('V4_ATTEMPT05_SCHEDULE_STATE_MISMATCH')
+            split_assignment = _attempt05_split(args.split_assignment)
+            calibration_schedule = _attempt05_calibration_schedule(
+                args.calibration_schedule
+            )
+            input_closure = validate_attempt05_input_closure(args.input_closure)
+            input_storage = dict(input_closure["budgeted_input_storage"])
+            input_storage["input_closure_sha256"] = _sha256_file(
+                args.input_closure
+            )
+            preflight = create_attempt05_execution_preflight(
+                authorization_path=args.authorization,
+                attempt05_tooling_commit=args.tooling_commit,
+                attempt05_tooling_tree=args.tooling_tree,
+                nvidia_smi_sampler=nvidia_smi_attempt04_inventory,
+                sleeper=time.sleep,
+                cuda_mapping_probe=lambda: _attempt05_cuda_mapping_probe(context),
+            )
+            receipt = create_attempt05_start_receipt(
+                authorization_path=args.authorization,
+                schedule=schedule,
+                model_independent_states=states,
+                split_assignment=split_assignment,
+                calibration_schedule=calibration_schedule,
+                resume=args.resume,
+                attempt05_tooling_commit=args.tooling_commit,
+                attempt05_tooling_tree=args.tooling_tree,
+                input_storage=input_storage,
+            )
+            payload = {
+                'status': 'MVE_RUN_STARTED',
+                'attempt_id': 'attempt-05',
+                'scientific_result': 'NO_SCIENTIFIC_RESULT',
+                'execution_preflight_path': str(preflight['preflight_path']),
+                'execution_preflight_sha256': preflight['preflight_file_sha256'],
+                'start_receipt_sha256': receipt['start_receipt_sha256'],
+                'runtime_paths': receipt['runtime_paths'],
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == 'v4-attempt05-run':
+            input_dir = args.input_closure_dir
+            states = _attempt05_states(input_dir / 'v4-model-independent-states.json')
+            schedule = _attempt05_schedule(input_dir / 'v4-scientific-schedule-400.json')
+            split_assignment = _attempt05_split(input_dir / 'v4-split-assignment.json')
+            calibration_schedule = _attempt05_calibration_schedule(
+                input_dir / 'v4-calibration-l3-schedule-40.json'
+            )
+            input_closure_path = input_dir / 'v4-attempt05-input-closure.json'
+            input_closure = validate_attempt05_input_closure(input_closure_path)
+            input_storage = dict(input_closure["budgeted_input_storage"])
+            input_storage["input_closure_sha256"] = _sha256_file(
+                input_closure_path
+            )
+            decision = authorize_attempt05_next_dispatch(
+                authorization_path=args.authorization,
+                schedule=schedule,
+                resume=args.resume,
+            )
+            if decision.status != 'PASS':
+                payload = {
+                    'status': f'V4_MVE_FAILED_WITH_REASON={decision.reason_code}',
+                    'attempt_id': 'attempt-05',
+                    'scientific_result': 'NO_SCIENTIFIC_RESULT',
+                    'dispatch_gate_status': decision.status,
+                    'dispatch_gate_reason_code': decision.reason_code,
+                    'retry_count': 0,
+                }
+                print(json.dumps(payload, indent=2, sort_keys=True))
+                return 2
+            context = load_attempt05_authorized_context(
+                authorization_path=args.authorization
+            )
+            binding_set = construct_attempt05_runtime_bindings(
+                runtime_binding_path=input_dir / 'v4-runtime-state-bindings.json',
+                model_independent_states=states,
+                scientific_schedule=schedule,
+                calibration_schedule=calibration_schedule,
+                split_assignment=split_assignment,
+                context=context,
+                overlay_config_path=_attempt05_overlay_config_path(context),
+                attempt05_tooling_commit=args.tooling_commit,
+                attempt05_tooling_tree=args.tooling_tree,
+                resume=args.resume,
+            )
+            calibration_executor, scientific_executor = make_attempt05_runtime_executors(
+                calibration_bindings=binding_set.calibration_bindings,
+                scientific_bindings=binding_set.scientific_bindings,
+            )
+            try:
+                result = run_attempt05_pipeline(
+                    authorization_path=args.authorization,
+                    scientific_schedule=schedule,
+                    model_independent_states=states,
+                    split_assignment=split_assignment,
+                    calibration_schedule=calibration_schedule,
+                    attempt05_tooling_commit=args.tooling_commit,
+                    attempt05_tooling_tree=args.tooling_tree,
+                    ledger_path=context.gpu_ledger_path,
+                    calibration_executor=calibration_executor,
+                    scientific_executor=scientific_executor,
+                    resume=True,
+                    input_storage=input_storage,
+                )
+            finally:
+                provider = binding_set.adapter_provider
+                if provider is not None:
+                    provider.close()
+            payload = {
+                'status': result.status,
+                'attempt_id': 'attempt-05',
+                'scientific_result': 'SCIENTIFIC_RESULT_AVAILABLE'
+                if result.status == 'V4_MVE_COMPLETED'
+                else 'NO_SCIENTIFIC_RESULT',
+                'calibration_units_completed': result.calibration_units_completed,
+                'scientific_units_completed': result.scientific_units_completed,
+                'invalid_scientific_units': result.invalid_scientific_units,
+                'gpu_inference_seconds': result.gpu_inference_seconds,
+                'wall_runtime_seconds': result.wall_runtime_seconds,
+                'logical_bytes': result.logical_bytes,
+                'allocated_bytes': result.allocated_bytes,
+                'peak_memory_mb': result.peak_memory_mb,
+                'retry_count': 0,
+                'finalizer_result': result.finalizer_result,
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0 if result.status == 'V4_MVE_COMPLETED' else 2
+        if args.command == 'v4-attempt05-status':
+            context = load_attempt05_authorized_context(
+                authorization_path=args.authorization
+            )
+            schedule = _attempt05_schedule(args.schedule)
+            decision = authorize_attempt05_next_dispatch(
+                authorization_path=args.authorization,
+                schedule=schedule,
+                resume=True,
+            )
+            totals = rehydrate_attempt05_ledger_totals(context.gpu_ledger_path)
+            resource = evaluate_attempt05_resource_gate(
+                gpu_inference_seconds=totals.gpu_inference_seconds,
+                wall_runtime_seconds=totals.wall_runtime_seconds,
+                new_logical_bytes=totals.logical_bytes,
+                new_allocated_bytes=totals.allocated_bytes,
+            )
+            payload = {
+                'status': decision.status,
+                'reason_code': decision.reason_code,
+                'attempt_id': 'attempt-05',
+                'scientific_result': 'NO_SCIENTIFIC_RESULT',
+                'run_root': str(context.run_root),
+                'artifact_root': str(context.artifact_root),
+                'resource_gate': {'status': resource.status, 'reason_code': resource.reason_code},
+                'ledger': {
+                    'gpu_inference_seconds': totals.gpu_inference_seconds,
+                    'wall_runtime_seconds': totals.wall_runtime_seconds,
+                    'logical_bytes': totals.logical_bytes,
+                    'allocated_bytes': totals.allocated_bytes,
+                    'completed_units': totals.completed_units,
+                    'calibration_units_completed': totals.calibration_units_completed,
+                    'scientific_units_completed': totals.scientific_units_completed,
+                    'invalid_units': totals.invalid_units,
+                    'failed_units': totals.failed_units,
+                    'retry_count': 0,
+                    'peak_memory_mb': totals.peak_memory_mb,
+                    'run_started': totals.run_started,
+                    'finalized': totals.finalized,
+                },
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0 if decision.status != 'FAIL' else 2
+        if args.command == 'v4-attempt05-finalize':
+            result = finalize_attempt05_scientific_bundle(
+                authorization_path=args.authorization,
+                record_paths=tuple(args.record_path),
+                scientific_schedule=_attempt05_schedule(args.schedule),
+                model_independent_states=_attempt05_states(args.states),
+                split_assignment=_attempt05_split(args.split_assignment),
+                native_warning_calibrations=_attempt05_calibrations(
+                    args.native_warning_calibrations
+                ),
+            )
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
         source_root = Path(__file__).resolve().parents[1]
         if args.command == 'archive-superseded':
             payload = archive_superseded_results(
@@ -1238,6 +1699,21 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 2
+        if args.command in ATTEMPT05_COMMANDS:
+            print(
+                json.dumps(
+                    {
+                        'status': 'FAIL',
+                        'reason_code': str(exc) or type(exc).__name__,
+                        'attempt_id': 'attempt-05',
+                        'scientific_result': 'NO_SCIENTIFIC_RESULT',
+                        'error_type': type(exc).__name__,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 2
         if args.command in ATTEMPT04_COMMANDS:
             print(
                 json.dumps(
@@ -1297,3 +1773,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f'ERROR: {exc}', file=sys.stderr)
         return 2
     raise AssertionError('unreachable command')
+
+
+
