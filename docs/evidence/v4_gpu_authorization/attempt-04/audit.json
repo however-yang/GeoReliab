@@ -1,0 +1,63 @@
+{
+  "archive_semantics": "DERIVED_READ_ONLY_AUDIT",
+  "attempt_id": "attempt-04",
+  "authorization": {
+    "payload_sha256": "adf5df5328941969599f792e9ee5b6142054e1ecaa125bcf9b4f6a4fb137ad73",
+    "status": "V4_MVE_EXECUTION_AUTHORIZED",
+    "validation": "PASS"
+  },
+  "base_commit": "6e91a418983162d50a78a008fb41c540b8edf4c0",
+  "base_tree": "2f9b2641136ad864e3864eb92ad67ffc18e54056",
+  "dispatcher_called": false,
+  "execution_lock_created": false,
+  "gpu_inference_seconds": 0,
+  "gpu_ledger_created": false,
+  "hardware_sampling": {
+    "compute_process_count_each_sample": [0, 0, 0],
+    "inventory_sample_count": 3,
+    "nvidia_smi_invocations": 9,
+    "sample_interval_seconds": 5.0,
+    "utilization_gpu_percent_each_sample": [0, 0, 0]
+  },
+  "model_forwards": 0,
+  "model_loads": 0,
+  "raw_evidence": {
+    "v4-execution-authorization.json": {
+      "bytes": 3987,
+      "sha256": "b2535c32f41496fec1d4d9f5ff73bb4f5d7d3a2abcd56c4b72c7888705f2e456"
+    },
+    "v4-gpu-selection-decision.json": {
+      "bytes": 1696,
+      "sha256": "28702a3550d7acad14c891350b3b2fbc6e25098c9b1c4eb17535fb5df3abe4df"
+    },
+    "v4-gpu-selection-receipt.json": {
+      "bytes": 2455,
+      "sha256": "3b1766fa92e82673dc0a7ccf264354e6afa38f8d1f09d1eaccbb49054dc6b1ac"
+    },
+    "v4-hardware-snapshot.json": {
+      "bytes": 5977,
+      "sha256": "065c850bff59ae7efffcb2b201478b3d0816753ba571901e319eea42503e06e9"
+    },
+    "v4-resource-revalidation.json": {
+      "bytes": 11639,
+      "sha256": "02b52b0e53e6897ae54dca48d4c74d479aeb9dc73f107cafe35b4a74f326f76c"
+    }
+  },
+  "rectified_member_count": 960,
+  "run_artifacts_created": false,
+  "run_id": "4d17550f77cc4f6aa224b89cb560fa60",
+  "schema_version": "georeliab-v4-attempt-04-archive-audit-1.0",
+  "scientific_anchor_commit": "7381e60050143a78fca6a3ebde5706ae27d2c145",
+  "scientific_anchor_tree": "f4e2b1104496c817693aaa5989d0276d2ebe03e9",
+  "scientific_result": "NO_SCIENTIFIC_RESULT",
+  "selected_gpu": {
+    "current_index": 0,
+    "model": "NVIDIA A100 80GB PCIe",
+    "pci_bus_id": "00000000:4D:00.0",
+    "uuid": "GPU-6ae218e6-3d51-b748-e308-1f0509e87886"
+  },
+  "status": "V4_MVE_EXECUTION_AUTHORIZED",
+  "tooling_commit": "05fc40640fd5dcbf64e20220cbe50049fa1968de",
+  "tooling_tree": "a28db8d3aba73fc7b5a159fd71ef1d11d41acde9",
+  "torch_probe_invocations": 0
+}
