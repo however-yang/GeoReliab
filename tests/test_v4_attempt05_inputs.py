@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import zipfile
 
 import pytest
 
 from georeliab_mve.v4_attempt05_inputs import (
     Attempt05InputClosureError,
     _RectifiedArchiveBinding,
+    _complete_scene_ids_from_archive_members,
     _camera_path,
     _expected_calibration_l3_members,
     _global_frozen_view_order,
@@ -15,6 +17,7 @@ from georeliab_mve.v4_attempt05_inputs import (
     _load_verified_dtu_inventory,
     _load_corruption_calibration,
     _materialize_calibration_l3_members,
+    _materialize_assigned_support_assets,
     _materialize_fog_members,
     _mask_path,
     _rgb_path,
@@ -85,6 +88,116 @@ def test_frozen_inventory_drives_v4_split_without_local_rgb_presence(
         5, 63, 76, 126, 92, 20, 127, 38, 17, 71,
     )
     assert inventory.file_sha256 == _sha256_file_for_test(inventory.path)
+
+
+def test_complete_scene_set_comes_from_points_and_mask_archive_intersection() -> None:
+    sample_members = (
+        "SampleSet/MVS Data/ObsMask/ObsMask1_10.mat",
+        "SampleSet/MVS Data/ObsMask/ObsMask2_10.mat",
+        "SampleSet/MVS Data/ObsMask/ObsMask9_10.mat",
+        "SampleSet/MVS Data/ObsMask/README.txt",
+    )
+    point_members = (
+        "Points/stl/stl001_total.ply",
+        "Points/stl/stl002_total.ply",
+        "Points/stl/stl010_total.ply",
+    )
+
+    assert _complete_scene_ids_from_archive_members(
+        sample_members=sample_members,
+        point_members=point_members,
+    ) == frozenset({1, 2})
+
+
+def test_archive_complete_scene_set_rejects_case_collisions() -> None:
+    with pytest.raises(Attempt05InputClosureError, match="ARCHIVE_MEMBER_IDENTITY"):
+        _complete_scene_ids_from_archive_members(
+            sample_members=(
+                "SampleSet/MVS Data/ObsMask/ObsMask1_10.mat",
+                "sampleset/MVS Data/ObsMask/ObsMask1_10.mat",
+            ),
+            point_members=("Points/stl/stl001_total.ply",),
+        )
+
+
+def test_assigned_support_assets_materialize_atomically_and_then_reuse(
+    tmp_path: Path,
+) -> None:
+    sample_zip = tmp_path / "SampleSet.zip"
+    points_zip = tmp_path / "Points.zip"
+    with zipfile.ZipFile(sample_zip, "w") as archive:
+        archive.writestr(
+            "SampleSet/MVS Data/ObsMask/ObsMask1_10.mat",
+            b"mask",
+        )
+    with zipfile.ZipFile(points_zip, "w") as archive:
+        archive.writestr("Points/stl/stl001_total.ply", b"points")
+    archive_paths = {"SampleSet": sample_zip, "Points": points_zip}
+
+    first = _materialize_assigned_support_assets(
+        dtu_root=tmp_path / "materialized",
+        scene_ids=(1,),
+        archive_paths=archive_paths,
+    )
+    second = _materialize_assigned_support_assets(
+        dtu_root=tmp_path / "materialized",
+        scene_ids=(1,),
+        archive_paths=archive_paths,
+    )
+
+    assert len(first.records) == 2
+    assert len(first.written_paths) == 2
+    assert {row["disposition"] for row in first.records} == {"written"}
+    assert len(second.records) == 2
+    assert second.written_paths == ()
+    assert {row["disposition"] for row in second.records} == {"reused"}
+    assert not tuple((tmp_path / "materialized").rglob("*.partial"))
+
+
+def test_assigned_support_assets_refuse_conflicting_existing_file(
+    tmp_path: Path,
+) -> None:
+    sample_zip = tmp_path / "SampleSet.zip"
+    points_zip = tmp_path / "Points.zip"
+    with zipfile.ZipFile(sample_zip, "w") as archive:
+        archive.writestr(
+            "SampleSet/MVS Data/ObsMask/ObsMask1_10.mat",
+            b"mask",
+        )
+    with zipfile.ZipFile(points_zip, "w") as archive:
+        archive.writestr("Points/stl/stl001_total.ply", b"points")
+    root = tmp_path / "materialized"
+    conflict = _mask_path(root, 1)
+    conflict.parent.mkdir(parents=True)
+    conflict.write_bytes(b"not-the-authorized-member")
+
+    with pytest.raises(Attempt05InputClosureError, match="SUPPORT_ASSET_CONFLICT"):
+        _materialize_assigned_support_assets(
+            dtu_root=root,
+            scene_ids=(1,),
+            archive_paths={"SampleSet": sample_zip, "Points": points_zip},
+        )
+
+
+def test_inventory_marks_only_authorized_archive_complete_scenes_eligible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    complete = frozenset(DTU_OFFICIAL_SCENE_IDS) - {3}
+    inventory = _load_verified_dtu_inventory(
+        _write_inventory(tmp_path, monkeypatch),
+        complete_scene_ids=complete,
+    )
+    assignment = build_attempt05_v4_split_assignment(
+        inventory=inventory.rows,
+        source_root=Path.cwd(),
+    )
+
+    assert assignment.calibration == (
+        82, 52, 74, 73, 94, 122, 105, 90, 115, 107,
+        5, 63, 76, 126, 92, 20, 127, 38, 17, 71,
+    )
+    assert set(assignment.assigned_scene_ids) <= complete
 
 
 @pytest.mark.parametrize("mutation", ["duplicate", "rgb_count", "camera_nan"])

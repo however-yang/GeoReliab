@@ -14,7 +14,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any
+import zipfile
+import zlib
 
 import numpy as np
 
@@ -63,6 +66,10 @@ DTU_INVENTORY_SCHEMA = "dtu-official-inventory-v1"
 DTU_INVENTORY_FILE_SHA256 = (
     "e0000c803279620f302d68b55f2321e6e31be2a2f02f2e690d7ecf3bac24d197"
 )
+_MASK_MEMBER_RE = re.compile(
+    r"^SampleSet/MVS Data/ObsMask/ObsMask([0-9]+)_10[.]mat$"
+)
+_POINT_MEMBER_RE = re.compile(r"^Points/stl/stl([0-9]{3})_total[.]ply$")
 
 
 class Attempt05InputClosureError(V4ExecutionError):
@@ -97,6 +104,13 @@ class _CalibrationL3MaterializationResult:
     normalized_etag: str
     member_inventory_sha256: str
     written_member_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _SupportAssetMaterializationResult:
+    records: tuple[dict[str, object], ...]
+    written_paths: tuple[Path, ...]
+    member_inventory_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +297,210 @@ def _rectified_archive_binding(
         url=url,
         content_length=content_length,
         etag=etag,
+    )
+
+
+def _complete_scene_ids_from_archive_members(
+    *,
+    sample_members: Iterable[str],
+    point_members: Iterable[str],
+) -> frozenset[int]:
+    """Derive GT-complete DTU scenes from exact frozen archive membership."""
+
+    def scene_ids(members: Iterable[str], pattern: re.Pattern[str]) -> set[int]:
+        names = tuple(str(member) for member in members)
+        if len({name.casefold() for name in names}) != len(names):
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_ARCHIVE_MEMBER_IDENTITY"
+            )
+        result: set[int] = set()
+        for name in names:
+            match = pattern.fullmatch(name)
+            if match is None:
+                continue
+            scene_id = int(match.group(1))
+            if scene_id not in DTU_OFFICIAL_SCENE_SET or scene_id in result:
+                raise Attempt05InputClosureError(
+                    "V4_MVE_BLOCKED_INPUT_ARCHIVE_MEMBER_IDENTITY"
+                )
+            result.add(scene_id)
+        return result
+
+    masks = scene_ids(sample_members, _MASK_MEMBER_RE)
+    points = scene_ids(point_members, _POINT_MEMBER_RE)
+    return frozenset(masks & points)
+
+
+def _authorized_dtu_archive_paths(
+    context: Attempt05AuthorizedContext,
+) -> dict[str, Path]:
+    receipt = _read_json(_resource_receipt_path(context))
+    bindings = receipt.get("resource_bindings")
+    archives = bindings.get("dtu_archives") if isinstance(bindings, Mapping) else None
+    if not isinstance(archives, Mapping):
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_RESOURCE_RECEIPT_TAMPER"
+        )
+
+    resolved: dict[str, Path] = {}
+    for archive_name in ("SampleSet", "Points"):
+        row = archives.get(archive_name)
+        if not isinstance(row, Mapping):
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_RESOURCE_RECEIPT_TAMPER"
+            )
+        raw_path = row.get("path")
+        expected_bytes = row.get("bytes")
+        expected_sha = row.get("sha256")
+        if (
+            not isinstance(raw_path, str)
+            or type(expected_bytes) is not int
+            or expected_bytes <= 0
+            or not isinstance(expected_sha, str)
+            or len(expected_sha) != 64
+        ):
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_RESOURCE_RECEIPT_TAMPER"
+            )
+        try:
+            path = Path(raw_path).resolve(strict=True)
+        except OSError as exc:
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_RESOURCE_ARCHIVE_MISSING"
+            ) from exc
+        if (
+            not path.is_file()
+            or path.stat().st_size != expected_bytes
+            or _sha256_file(path) != expected_sha
+        ):
+            raise Attempt05InputClosureError(
+                "V4_MVE_BLOCKED_INPUT_RESOURCE_ARCHIVE_TAMPER"
+            )
+        resolved[archive_name] = path
+
+    return resolved
+
+
+def _authorized_complete_scene_ids(
+    archive_paths: Mapping[str, Path],
+) -> frozenset[int]:
+    try:
+        with zipfile.ZipFile(archive_paths["SampleSet"]) as sample_zip:
+            sample_members = tuple(info.filename for info in sample_zip.infolist())
+        with zipfile.ZipFile(archive_paths["Points"]) as point_zip:
+            point_members = tuple(info.filename for info in point_zip.infolist())
+    except (KeyError, OSError, zipfile.BadZipFile) as exc:
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_RESOURCE_ARCHIVE_UNREADABLE"
+        ) from exc
+    complete = _complete_scene_ids_from_archive_members(
+        sample_members=sample_members,
+        point_members=point_members,
+    )
+    if not set(TEST_SCENE_IDS) <= complete or len(complete) < 40:
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_COMPLETE_SCENE_CLOSURE"
+        )
+    return complete
+
+
+def _crc32_file(path: Path) -> int:
+    value = 0
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            value = zlib.crc32(block, value)
+    return value & 0xFFFFFFFF
+
+
+def _materialize_assigned_support_assets(
+    *,
+    dtu_root: Path,
+    scene_ids: Iterable[int],
+    archive_paths: Mapping[str, Path],
+) -> _SupportAssetMaterializationResult:
+    assignments = (
+        (
+            "SampleSet",
+            lambda scene_id: f"SampleSet/MVS Data/ObsMask/ObsMask{scene_id}_10.mat",
+            lambda scene_id: _mask_path(dtu_root, scene_id),
+        ),
+        (
+            "Points",
+            lambda scene_id: f"Points/stl/stl{scene_id:03d}_total.ply",
+            lambda scene_id: _gt_path(dtu_root, scene_id),
+        ),
+    )
+    records: list[dict[str, object]] = []
+    written: list[Path] = []
+    ordered_scenes = tuple(sorted({int(scene_id) for scene_id in scene_ids}))
+    try:
+        for archive_name, member_for_scene, path_for_scene in assignments:
+            with zipfile.ZipFile(archive_paths[archive_name]) as archive:
+                for scene_id in ordered_scenes:
+                    member = member_for_scene(scene_id)
+                    try:
+                        info = archive.getinfo(member)
+                    except KeyError as exc:
+                        raise Attempt05InputClosureError(
+                            "V4_MVE_BLOCKED_INPUT_SUPPORT_ARCHIVE_MEMBER_MISSING"
+                        ) from exc
+                    destination = path_for_scene(scene_id)
+                    partial = destination.with_name(destination.name + ".partial")
+                    if partial.exists():
+                        raise Attempt05InputClosureError(
+                            "V4_MVE_BLOCKED_INPUT_SUPPORT_ASSET_PARTIAL"
+                        )
+                    disposition = "reused"
+                    if destination.exists():
+                        if (
+                            not destination.is_file()
+                            or destination.stat().st_size != info.file_size
+                            or _crc32_file(destination) != info.CRC
+                        ):
+                            raise Attempt05InputClosureError(
+                                "V4_MVE_BLOCKED_INPUT_SUPPORT_ASSET_CONFLICT"
+                            )
+                    else:
+                        disposition = "written"
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        try:
+                            with archive.open(info) as source, partial.open("xb") as target:
+                                for block in iter(lambda: source.read(1024 * 1024), b""):
+                                    target.write(block)
+                                target.flush()
+                                os.fsync(target.fileno())
+                            if (
+                                partial.stat().st_size != info.file_size
+                                or _crc32_file(partial) != info.CRC
+                            ):
+                                raise Attempt05InputClosureError(
+                                    "V4_MVE_BLOCKED_INPUT_SUPPORT_ASSET_CRC"
+                                )
+                            partial.replace(destination)
+                            written.append(destination)
+                        except Exception:
+                            partial.unlink(missing_ok=True)
+                            raise
+                    records.append(
+                        {
+                            "archive": archive_name,
+                            "scene_id": scene_id,
+                            "member": member,
+                            "path": str(destination.resolve(strict=True)),
+                            "bytes": info.file_size,
+                            "crc32": f"{info.CRC:08x}",
+                            "sha256": _sha256_file(destination),
+                            "disposition": disposition,
+                        }
+                    )
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_SUPPORT_ARCHIVE_UNREADABLE"
+        ) from exc
+    return _SupportAssetMaterializationResult(
+        records=tuple(records),
+        written_paths=tuple(written),
+        member_inventory_sha256=_sha256_json(records),
     )
 
 
@@ -1005,8 +1223,11 @@ def prepare_attempt05_inputs(
             raise Attempt05InputClosureError("V4_MVE_BLOCKED_INPUT_VIEW_CLOSURE")
     view_order = schedule_view_order
     global_view_order = _global_frozen_view_order(view_order)
+    archive_paths = _authorized_dtu_archive_paths(context)
+    complete_scene_ids = _authorized_complete_scene_ids(archive_paths)
     inventory = _load_verified_dtu_inventory(
-        context.runtime_root / "manifests" / "dtu_inventory.json"
+        context.runtime_root / "manifests" / "dtu_inventory.json",
+        complete_scene_ids=complete_scene_ids,
     )
     split_assignment = build_attempt05_v4_split_assignment(
         inventory=inventory.rows,
@@ -1018,6 +1239,11 @@ def prepare_attempt05_inputs(
         split_assignment=split_assignment,
         ordered_views=global_view_order,
         archive=rectified_archive,
+    )
+    support_materialization = _materialize_assigned_support_assets(
+        dtu_root=dtu_root,
+        scene_ids=(*TEST_SCENE_IDS, *split_assignment.calibration),
+        archive_paths=archive_paths,
     )
     for scene_id in (*TEST_SCENE_IDS, *split_assignment.calibration):
         ordered_views = view_order.get(scene_id, global_view_order)
@@ -1103,6 +1329,9 @@ def prepare_attempt05_inputs(
         calibration_materialization_path = (
             output_partial / "v4-calibration-l3-materialization.json"
         )
+        support_materialization_path = (
+            output_partial / "v4-support-asset-materialization.json"
+        )
         manifest_path = output_partial / "v4-attempt05-input-closure.json"
         split_sha = _write_atomic_json(split_path, split_assignment.to_dict())
         states_payload = {
@@ -1148,6 +1377,22 @@ def prepare_attempt05_inputs(
             calibration_materialization_path,
             calibration_materialization_payload,
         )
+        support_materialization_payload = {
+            "schema_version": (
+                "georeliab-v4-attempt-05-support-asset-materialization-1.0"
+            ),
+            "attempt_id": "attempt-05",
+            "member_count": len(support_materialization.records),
+            "written_member_count": len(support_materialization.written_paths),
+            "member_inventory_sha256": (
+                support_materialization.member_inventory_sha256
+            ),
+            "members": list(support_materialization.records),
+        }
+        support_materialization_sha = _write_atomic_json(
+            support_materialization_path,
+            support_materialization_payload,
+        )
         fog_binding_payload = {
             "schema_version": ATTEMPT05_FOG_BINDING_SCHEMA,
             "attempt_id": "attempt-05",
@@ -1175,6 +1420,7 @@ def prepare_attempt05_inputs(
                 schedule_path,
                 calibration_path,
                 calibration_materialization_path,
+                support_materialization_path,
                 fog_binding_path,
                 runtime_binding_path,
             }
@@ -1184,6 +1430,7 @@ def prepare_attempt05_inputs(
             for record in calibration_materialization.records
             if record["disposition"] == "written"
         )
+        budget_paths.update(support_materialization.written_paths)
         input_logical_bytes = sum(path.stat().st_size for path in budget_paths)
         input_allocated_bytes = sum(_allocated_bytes(path) for path in budget_paths)
         manifest_payload = {
@@ -1207,6 +1454,14 @@ def prepare_attempt05_inputs(
             ),
             "calibration_l3_member_inventory_sha256": (
                 calibration_materialization.member_inventory_sha256
+            ),
+            "support_asset_materialization_sha256": support_materialization_sha,
+            "support_asset_member_inventory_sha256": (
+                support_materialization.member_inventory_sha256
+            ),
+            "support_asset_members": len(support_materialization.records),
+            "support_asset_written_members": len(
+                support_materialization.written_paths
             ),
             "fog_binding_sha256": fog_binding_sha,
             "runtime_state_bindings_sha256": runtime_binding_sha,
@@ -1238,6 +1493,7 @@ def prepare_attempt05_inputs(
                 "calibration_l3_materialization": (
                     calibration_materialization_path.name
                 ),
+                "support_asset_materialization": support_materialization_path.name,
                 "fog_binding": fog_binding_path.name,
                 "runtime_state_bindings": runtime_binding_path.name,
             },
@@ -1305,7 +1561,11 @@ def validate_attempt05_input_closure(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _load_verified_dtu_inventory(path: Path) -> _VerifiedDtuInventory:
+def _load_verified_dtu_inventory(
+    path: Path,
+    *,
+    complete_scene_ids: Iterable[int] = DTU_OFFICIAL_SCENE_SET,
+) -> _VerifiedDtuInventory:
     try:
         resolved = path.resolve(strict=True)
     except OSError as exc:
@@ -1328,6 +1588,11 @@ def _load_verified_dtu_inventory(path: Path) -> _VerifiedDtuInventory:
     if not isinstance(scenes, list) or len(scenes) != len(DTU_OFFICIAL_SCENE_SET):
         raise Attempt05InputClosureError(
             "V4_MVE_BLOCKED_INPUT_DTU_INVENTORY_CARDINALITY"
+        )
+    complete = frozenset(int(scene_id) for scene_id in complete_scene_ids)
+    if not set(TEST_SCENE_IDS) <= complete or not complete <= DTU_OFFICIAL_SCENE_SET:
+        raise Attempt05InputClosureError(
+            "V4_MVE_BLOCKED_INPUT_COMPLETE_SCENE_CLOSURE"
         )
     rows: list[VerifiedSceneInventory] = []
     seen: set[int] = set()
@@ -1394,7 +1659,7 @@ def _load_verified_dtu_inventory(path: Path) -> _VerifiedDtuInventory:
         rows.append(
             VerifiedSceneInventory(
                 scene_id=scene_id,
-                verified_complete=True,
+                verified_complete=scene_id in complete,
                 inventory_sha256=_sha256_json(dict(raw)),
             )
         )
