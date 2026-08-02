@@ -8,12 +8,14 @@ import pytest
 from georeliab_mve.v4_attempt05_inputs import (
     Attempt05InputClosureError,
     _camera_path,
+    _global_frozen_view_order,
     _gt_path,
     _load_corruption_calibration,
     _materialize_fog_members,
     _mask_path,
     _rgb_path,
     _scene_has_required_l3_assets,
+    _verified_complete_scenes,
     _view_order_from_closure_manifest,
     _view_order_from_resource_schedule,
     build_attempt05_calibration_schedule,
@@ -166,6 +168,42 @@ def test_resource_schedule_is_authoritative_for_ordered_views(tmp_path: Path, mo
     monkeypatch.setattr(inputs, "SCHEDULE_FILE_SHA256", inputs._sha256_file(schedule))
 
     assert _view_order_from_resource_schedule(schedule) == {scene: ordered for scene in TEST_SCENE_IDS}
+
+
+def test_calibration_reuses_frozen_global_view_order_without_all_49_cameras(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import georeliab_mve.v4_attempt05_inputs as inputs
+
+    root = tmp_path / "materialized"
+    ordered = (1, 39, 45, 49, 6, 16, 42, 27)
+    observed_orders: dict[int, tuple[int, ...]] = {}
+
+    def record_order(root: Path, scene_id: int, ordered_views: tuple[int, ...]) -> bool:
+        observed_orders[scene_id] = tuple(ordered_views)
+        return True
+
+    monkeypatch.setattr(inputs, "_scene_has_required_l3_assets", record_order)
+
+    authoritative = {scene: ordered for scene in TEST_SCENE_IDS}
+    global_order = _global_frozen_view_order(authoritative)
+    complete = _verified_complete_scenes(
+        root,
+        authoritative,
+        authoritative,
+        default_view_order=global_order,
+    )
+
+    assert global_order == ordered
+    assert 82 in complete
+    assert observed_orders[82] == ordered
+    assert not _camera_path(root, 2).exists()
+
+
+def test_frozen_global_view_order_rejects_scene_order_drift() -> None:
+    with pytest.raises(Attempt05InputClosureError, match="VIEW_ORDER_DRIFT"):
+        _global_frozen_view_order({1: tuple(range(1, 9)), 9: tuple(range(2, 10))})
 
 
 def test_corruption_calibration_is_loaded_and_bound_by_sha(tmp_path: Path) -> None:

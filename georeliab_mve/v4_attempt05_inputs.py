@@ -23,9 +23,8 @@ from .prepared_inputs import (
     decode_srgb_png,
     derive_dtu_depth,
     parse_dtu_binary_ply,
-    parse_dtu_projection,
 )
-from .preparation import CorruptionCalibration, select_fps_views, deterministic_png
+from .preparation import CorruptionCalibration, deterministic_png
 from .preparation_round2 import fog_render
 from .v4_attempt04_authorization import MANIFEST_FILE_SHA256, SCHEDULE_FILE_SHA256
 from .v4_attempt05_execution import (
@@ -398,30 +397,27 @@ def _runtime_binding_for_scene_state(
 
 
 
-def _camera_center_from_projection(path: Path) -> np.ndarray:
-    matrix = parse_dtu_projection(path)
-    _, _, vh = np.linalg.svd(matrix)
-    homogeneous = vh[-1]
-    if abs(float(homogeneous[-1])) < 1e-12:
-        raise Attempt05InputClosureError("V4_MVE_BLOCKED_INPUT_CAMERA_CENTER_INVALID")
-    center = homogeneous[:3] / homogeneous[-1]
-    if center.shape != (3,) or not np.isfinite(center).all():
-        raise Attempt05InputClosureError("V4_MVE_BLOCKED_INPUT_CAMERA_CENTER_INVALID")
-    return np.asarray(center, dtype=np.float64)
+def _global_frozen_view_order(
+    authoritative_view_order: Mapping[int, Sequence[int]],
+) -> tuple[int, ...]:
+    """Return the single DTU camera order already frozen by the schedule.
 
+    DTU calibration cameras are shared by every scan. Attempt-05 therefore
+    must not recompute FPS from 49 camera files after materialization retained
+    only the eight selected cameras. Every test scene must bind the same
+    ordered tuple, which is then reused for scene-disjoint calibration.
+    """
 
-def _fps_views_for_scene(root: Path, scene_id: int) -> tuple[int, ...]:
-    centers: dict[int, np.ndarray] = {}
-    for view_id in range(1, 50):
-        camera_path = _camera_path(root, view_id)
-        centers[view_id] = _camera_center_from_projection(camera_path)
-    try:
-        selected = select_fps_views(centers)
-    except Exception as exc:
-        raise Attempt05InputClosureError("V4_MVE_BLOCKED_INPUT_FPS_VIEW_DERIVATION") from exc
-    if len(selected) != 8:
-        raise Attempt05InputClosureError("V4_MVE_BLOCKED_INPUT_FPS_VIEW_DERIVATION")
-    return selected
+    orders = {
+        tuple(int(view_id) for view_id in ordered_views)
+        for ordered_views in authoritative_view_order.values()
+    }
+    if len(orders) != 1:
+        raise Attempt05InputClosureError("V4_MVE_BLOCKED_INPUT_VIEW_ORDER_DRIFT")
+    order = next(iter(orders))
+    if len(order) != 8 or len(set(order)) != 8:
+        raise Attempt05InputClosureError("V4_MVE_BLOCKED_INPUT_VIEW_ORDER_DRIFT")
+    return order
 
 
 def _scene_has_required_l3_assets(
@@ -447,6 +443,8 @@ def _verified_complete_scenes(
     root: Path,
     closure_scenes: Iterable[int],
     authoritative_view_order: Mapping[int, Sequence[int]],
+    *,
+    default_view_order: Sequence[int],
 ) -> tuple[int, ...]:
     candidates = set(int(scene) for scene in closure_scenes) | set(TEST_SCENE_IDS)
     candidates.update(range(1, 78))
@@ -455,12 +453,7 @@ def _verified_complete_scenes(
     candidates.discard(15)
     complete: list[int] = []
     for scene in sorted(candidates):
-        ordered = authoritative_view_order.get(scene)
-        if ordered is None:
-            try:
-                ordered = _fps_views_for_scene(root, scene)
-            except Attempt05InputClosureError:
-                continue
+        ordered = authoritative_view_order.get(scene, default_view_order)
         if _scene_has_required_l3_assets(root, scene, tuple(int(v) for v in ordered)):
             complete.append(scene)
     if len(complete) < 50:
@@ -796,7 +789,13 @@ def prepare_attempt05_inputs(
         if closure_views is None or set(closure_views) != set(ordered_views):
             raise Attempt05InputClosureError("V4_MVE_BLOCKED_INPUT_VIEW_CLOSURE")
     view_order = schedule_view_order
-    complete_scenes = _verified_complete_scenes(dtu_root, view_order, view_order)
+    global_view_order = _global_frozen_view_order(view_order)
+    complete_scenes = _verified_complete_scenes(
+        dtu_root,
+        view_order,
+        view_order,
+        default_view_order=global_view_order,
+    )
     split_assignment = build_attempt05_v4_split_assignment(
         complete_scene_ids=complete_scenes,
         source_root=source_root,
@@ -849,7 +848,7 @@ def prepare_attempt05_inputs(
         )
         calibration_l3_bindings = []
         for scene_id in split_assignment.calibration:
-            ordered_views = _fps_views_for_scene(dtu_root, scene_id)
+            ordered_views = global_view_order
             state = _state_for_scene(
                 root=dtu_root,
                 source_root=source_root,
