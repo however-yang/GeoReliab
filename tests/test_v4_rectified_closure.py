@@ -25,6 +25,7 @@ from georeliab_mve.v4_counterfactuals import (
 )
 from georeliab_mve.v4_rectified_closure import (
     V4RectifiedClosureError,
+    audit_rectified_member_closure_read_only,
     create_rectified_member_closure,
     prepare_rectified_resource_schedule,
     materialize_missing_rectified_members,
@@ -913,6 +914,31 @@ def test_expected_set_scene_state_fake_schedule_ids_are_fail_closed(
             expected_set_path=tampered_expected_set_path,
             output_dir=tmp_path / "tampered-validate",
         )
+
+def test_read_only_closure_audit_does_not_publish_artifacts(
+    tmp_path: Path,
+    states_and_schedule: tuple[list[dict[str, object]], dict[str, object]],
+) -> None:
+    result = _create(tmp_path, states_and_schedule)
+    before = sorted(
+        path.relative_to(tmp_path).as_posix()
+        for path in tmp_path.rglob('*')
+        if path.is_file()
+    )
+    audit = audit_rectified_member_closure_read_only(
+        root=tmp_path / 'runtime',
+        manifest_path=Path(str(result['manifest_path'])),
+        expected_set_path=Path(str(result['expected_set_path'])),
+    )
+    after = sorted(
+        path.relative_to(tmp_path).as_posix()
+        for path in tmp_path.rglob('*')
+        if path.is_file()
+    )
+    assert audit['manifest_rows'] == 960
+    assert audit['group_count'] == 160
+    assert before == after
+
 
 def test_rectified_cli_fail_closed_errors_are_structured_json(tmp_path: Path) -> None:
     completed = subprocess.run(

@@ -78,6 +78,12 @@ from .v4_authorization import (
     validate_attempt_resources,
     validate_execution_authorization,
 )
+from .v4_attempt03_authorization import (
+    create_attempt03_execution_authorization,
+    create_attempt03_gpu_preflight,
+    revalidate_attempt03_resources,
+    validate_attempt03_execution_authorization,
+)
 
 
 DEFAULT_PROTOCOL = Path('configs/dual_mve_protocol.toml')
@@ -87,6 +93,14 @@ ATTEMPT02_COMMANDS = frozenset(
         'v4-attempt02-gpu-preflight',
         'v4-attempt02-create-execution-authorization',
         'v4-attempt02-validate-execution-authorization',
+    }
+)
+ATTEMPT03_COMMANDS = frozenset(
+    {
+        'v4-attempt03-revalidate-resources',
+        'v4-attempt03-gpu-preflight',
+        'v4-attempt03-create-execution-authorization',
+        'v4-attempt03-validate-execution-authorization',
     }
 )
 ATTEMPT02_REQUIRED_HISTORY_PATHS = (
@@ -538,6 +552,61 @@ def build_parser() -> argparse.ArgumentParser:
         'v4-attempt02-validate-execution-authorization'
     )
     attempt02_validate_auth.add_argument('authorization', type=Path)
+
+    attempt03_resources = subparsers.add_parser(
+        'v4-attempt03-revalidate-resources'
+    )
+    attempt03_resources.add_argument('--worktree', type=Path, required=True)
+    attempt03_resources.add_argument(
+        '--runtime-root', type=Path, required=True
+    )
+    attempt03_resources.add_argument(
+        '--rectified-root', type=Path, required=True
+    )
+    attempt03_resources.add_argument(
+        '--closure-root', type=Path, required=True
+    )
+    attempt03_resources.add_argument('--overlay', type=Path, required=True)
+    attempt03_resources.add_argument('--output', type=Path, required=True)
+
+    attempt03_preflight = subparsers.add_parser(
+        'v4-attempt03-gpu-preflight'
+    )
+    attempt03_preflight.add_argument('--worktree', type=Path, required=True)
+    attempt03_preflight.add_argument(
+        '--resource-receipt', type=Path, required=True
+    )
+    attempt03_preflight.add_argument('--output', type=Path, required=True)
+
+    attempt03_create = subparsers.add_parser(
+        'v4-attempt03-create-execution-authorization'
+    )
+    attempt03_create.add_argument('--worktree', type=Path, required=True)
+    attempt03_create.add_argument(
+        '--runtime-root', type=Path, required=True
+    )
+    attempt03_create.add_argument(
+        '--resource-receipt', type=Path, required=True
+    )
+    attempt03_create.add_argument(
+        '--hardware-snapshot', type=Path, required=True
+    )
+    attempt03_create.add_argument('--receipt', type=Path, required=True)
+    attempt03_create.add_argument(
+        '--authorization', type=Path, required=True
+    )
+    attempt03_create.add_argument('--run-root', type=Path, required=True)
+    attempt03_create.add_argument('--artifact-root', type=Path, required=True)
+    attempt03_create.add_argument('--gpu-ledger', type=Path, required=True)
+    attempt03_create.add_argument(
+        '--final-evidence-path', type=Path, required=True
+    )
+
+    attempt03_validate = subparsers.add_parser(
+        'v4-attempt03-validate-execution-authorization'
+    )
+    attempt03_validate.add_argument('authorization', type=Path)
+
     bootstrap_rectified = subparsers.add_parser('v4-prepare-rectified-resource-schedule')
     bootstrap_rectified.add_argument('--protocol', type=Path, required=True)
     bootstrap_rectified.add_argument('--split-view-manifest', type=Path, required=True)
@@ -576,7 +645,11 @@ def main(argv: list[str] | None = None) -> int:
         'v4-materialize-missing-rectified-members',
     }
     try:
-        if command_hint in ATTEMPT02_COMMANDS or command_hint in rectified_commands:
+        if (
+            command_hint in ATTEMPT02_COMMANDS
+            or command_hint in ATTEMPT03_COMMANDS
+            or command_hint in rectified_commands
+        ):
             with redirect_stderr(StringIO()):
                 args = build_parser().parse_args(raw_argv)
         else:
@@ -588,6 +661,19 @@ def main(argv: list[str] | None = None) -> int:
                     {
                         'status': 'FAIL',
                         'reason_code': 'V4_ATTEMPT02_CLI_ARGUMENT_ERROR',
+                        'error_type': 'ArgumentParserError',
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 2
+        if command_hint in ATTEMPT03_COMMANDS and exc.code != 0:
+            print(
+                json.dumps(
+                    {
+                        'status': 'FAIL',
+                        'reason_code': 'V4_ATTEMPT03_CLI_ARGUMENT_ERROR',
                         'error_type': 'ArgumentParserError',
                     },
                     indent=2,
@@ -648,6 +734,50 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if payload.get('status') == 'PASS' else 2
         if args.command == 'v4-attempt02-validate-execution-authorization':
             payload = validate_attempt_execution_authorization(
+                args.authorization
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == 'v4-attempt03-revalidate-resources':
+            payload = revalidate_attempt03_resources(
+                worktree=args.worktree,
+                runtime_root=args.runtime_root,
+                rectified_root=args.rectified_root,
+                closure_root=args.closure_root,
+                overlay_path=args.overlay,
+                output_path=args.output,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0 if payload.get('status') == 'PASS' else 2
+        if args.command == 'v4-attempt03-gpu-preflight':
+            payload = create_attempt03_gpu_preflight(
+                worktree=args.worktree,
+                resource_receipt_path=args.resource_receipt,
+                output_path=args.output,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0 if payload.get('status') == 'PASS' else 2
+        if args.command == (
+            'v4-attempt03-create-execution-authorization'
+        ):
+            payload = create_attempt03_execution_authorization(
+                worktree=args.worktree,
+                runtime_root=args.runtime_root,
+                resource_receipt_path=args.resource_receipt,
+                hardware_snapshot_path=args.hardware_snapshot,
+                receipt_path=args.receipt,
+                authorization_path=args.authorization,
+                run_root=args.run_root,
+                artifact_root=args.artifact_root,
+                gpu_ledger_path=args.gpu_ledger,
+                final_evidence_path=args.final_evidence_path,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == (
+            'v4-attempt03-validate-execution-authorization'
+        ):
+            payload = validate_attempt03_execution_authorization(
                 args.authorization
             )
             print(json.dumps(payload, indent=2, sort_keys=True))
@@ -903,6 +1033,21 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(payload, indent=2, sort_keys=True))
             return 0 if payload.get('status') == 'PASS' else 2
     except (KeyError, TypeError, ValueError, AuditError, StorageAuditError, ExecutionGovernanceError, V4ExecutionError, V4RectifiedClosureError, OSError, json.JSONDecodeError) as exc:
+        if args.command in ATTEMPT03_COMMANDS:
+            print(
+                json.dumps(
+                    {
+                        'status': 'FAIL',
+                        'reason_code': str(exc) or type(exc).__name__,
+                        'attempt_id': 'attempt-03',
+                        'scientific_result': 'NO_SCIENTIFIC_RESULT',
+                        'error_type': type(exc).__name__,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 2
         if args.command in ATTEMPT02_COMMANDS:
             print(
                 json.dumps(

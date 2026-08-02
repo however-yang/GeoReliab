@@ -91,7 +91,9 @@ def test_a100_shell_scripts_are_executable_in_git() -> None:
 
 def test_a100_scripts_fail_closed_on_paths_and_disallowed_git_operations() -> None:
     assert {path.name for path in SCRIPTS} == {
-        'common.sh', 'deploy_commit.sh', 'finalize_p6.sh', 'launch_stage.sh', 'status.sh', 'verify_prereqs.sh',
+        'authorize_v4_attempt03.sh', 'common.sh', 'deploy_commit.sh',
+        'finalize_p6.sh', 'launch_stage.sh', 'status.sh',
+        'verify_prereqs.sh',
     }
     all_text = '\n'.join(path.read_text(encoding='utf-8') for path in SCRIPTS)
     assert 'guard_under_root' in all_text

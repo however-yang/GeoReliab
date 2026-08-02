@@ -1451,6 +1451,34 @@ def validate_rectified_member_closure(
     )
 
 
+def audit_rectified_member_closure_read_only(
+    *,
+    root: Path,
+    manifest_path: Path,
+    expected_set_path: Path,
+) -> dict[str, object]:
+    resolved_root = root.resolve()
+    expected_set, groups = _resolve_expected_set(
+        schedule_path=None,
+        state_inventory_path=None,
+        expected_set_path=expected_set_path,
+    )
+    _scan_unexpected_illuminations(resolved_root, groups)
+    audit = _validate_manifest_rows(
+        root=resolved_root,
+        expected_rows=_expected_member_rows(expected_set),
+        actual_rows=_read_manifest(manifest_path),
+        expected_set=expected_set,
+    )
+    return {
+        **audit,
+        'manifest_path': str(manifest_path.resolve()),
+        'manifest_sha256': _sha256_file(manifest_path),
+        'expected_set_path': str(expected_set_path.resolve()),
+        'expected_set_sha256': _sha256_file(expected_set_path),
+    }
+
+
 def _index_entries(index: object) -> Mapping[str, object]:
     if isinstance(index, RemoteZipIndex):
         return index.entries
