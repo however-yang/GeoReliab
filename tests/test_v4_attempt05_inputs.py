@@ -20,6 +20,9 @@ from georeliab_mve.v4_attempt05_inputs import (
     _materialize_assigned_support_assets,
     _materialize_fog_members,
     _mask_path,
+    _official_camera_member,
+    _official_gt_member,
+    _official_mask_member,
     _rgb_path,
     _scene_has_required_l3_assets,
     _view_order_from_closure_manifest,
@@ -177,6 +180,15 @@ def test_assigned_support_assets_refuse_conflicting_existing_file(
             scene_ids=(1,),
             archive_paths={"SampleSet": sample_zip, "Points": points_zip},
         )
+
+
+def test_official_member_identity_excludes_local_materialization_prefixes() -> None:
+    assert _official_gt_member(1) == "Points/stl/stl001_total.ply"
+    assert _official_mask_member(1) == "SampleSet/MVS Data/ObsMask/ObsMask1_10.mat"
+    assert (
+        _official_camera_member(1)
+        == "SampleSet/MVS Data/Calibration/cal18/pos_001.txt"
+    )
 
 
 def test_inventory_marks_only_authorized_archive_complete_scenes_eligible(

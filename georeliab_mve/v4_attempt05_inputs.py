@@ -237,6 +237,18 @@ def _camera_path(root: Path, view_id: int) -> Path:
     return _sample_root(root) / "Calibration" / "cal18" / f"pos_{view_id:03d}.txt"
 
 
+def _official_gt_member(scene_id: int) -> str:
+    return f"Points/stl/stl{scene_id:03d}_total.ply"
+
+
+def _official_mask_member(scene_id: int) -> str:
+    return f"SampleSet/MVS Data/ObsMask/ObsMask{scene_id}_10.mat"
+
+
+def _official_camera_member(view_id: int) -> str:
+    return f"SampleSet/MVS Data/Calibration/cal18/pos_{view_id:03d}.txt"
+
+
 def _rgb_path(root: Path, scene_id: int, view_id: int, state_id: str) -> Path:
     if state_id not in LIGHTING_STATES:
         raise Attempt05InputClosureError("V4_MVE_BLOCKED_INPUT_STATE_SCOPE")
@@ -639,15 +651,15 @@ def _runtime_binding_for_scene_state(
 ) -> dict[str, object]:
     gt = _asset_evidence(
         _gt_path(root, scene_id),
-        member=f"Points/Points/stl/stl{scene_id:03d}_total.ply",
+        member=_official_gt_member(scene_id),
     )
     mask = _asset_evidence(
         _mask_path(root, scene_id),
-        member=f"SampleSet/SampleSet/MVS Data/ObsMask/ObsMask{scene_id}_10.mat",
+        member=_official_mask_member(scene_id),
     )
     cameras = []
     for view_id in ordered_views:
-        cam_member = f"SampleSet/SampleSet/MVS Data/Calibration/cal18/pos_{view_id:03d}.txt"
+        cam_member = _official_camera_member(view_id)
         cam = _asset_evidence(_camera_path(root, view_id), member=cam_member)
         cameras.append({"view_id": view_id, "member": cam_member, "path": cam.source_uri, "sha256": cam.sha256})
     l3_by_view: dict[int, AssetEvidence] = {}
@@ -1125,17 +1137,17 @@ def _state_for_scene(
     cameras = {
         view_id: _asset_evidence(
             _camera_path(root, view_id),
-            member=f"SampleSet/SampleSet/MVS Data/Calibration/cal18/pos_{view_id:03d}.txt",
+            member=_official_camera_member(view_id),
         )
         for view_id in ordered_views
     }
     gt = _asset_evidence(
         _gt_path(root, scene_id),
-        member=f"Points/Points/stl/stl{scene_id:03d}_total.ply",
+        member=_official_gt_member(scene_id),
     )
     mask = _asset_evidence(
         _mask_path(root, scene_id),
-        member=f"SampleSet/SampleSet/MVS Data/ObsMask/ObsMask{scene_id}_10.mat",
+        member=_official_mask_member(scene_id),
     )
     l3_source = {
         view_id: _asset_evidence(
