@@ -1,0 +1,23 @@
+{
+  "attempt_id": "attempt-03",
+  "evidence_files": [
+    {
+      "bytes": 1256,
+      "path": "v4-resource-revalidation.json",
+      "role": "IMMUTABLE_RUNTIME_FAIL_EVIDENCE",
+      "sha256": "f8e34fd93857f017bfb2d5495180fb57c3a868af4aacb19e7c4ad832c6e25131"
+    },
+    {
+      "path": "audit.json",
+      "role": "DERIVED_READ_ONLY_AUDIT"
+    },
+    {
+      "path": "README.md",
+      "role": "HUMAN_READABLE_BLOCKED_DECISION"
+    }
+  ],
+  "execution_authority_conferred": false,
+  "schema_version": "georeliab-v4-attempt-03-evidence-manifest-1.0",
+  "scientific_result": "NO_SCIENTIFIC_RESULT",
+  "status": "BLOCKED"
+}

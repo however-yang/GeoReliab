@@ -1,6 +1,23 @@
 # Current v4 GPU authorization evidence
 
-The current attempt-02 outcome is the additive resource-gate [BLOCKED evidence](./attempt-02-resource-blocked/resource-blocker.json), with the supporting [audit](./attempt-02-resource-blocked/audit.json). Its terminal reason is `V4_RESOURCE_RECTIFIED_MEMBER_CLOSURE_UNAVAILABLE`. GPU selection was not run, so this must not be reported as `V4_NO_ELIGIBLE_IDLE_GPU` and it grants no execution authority.
+The current Attempt-03 outcome is the immutable resource-gate
+[BLOCKED evidence](./attempt-03/v4-resource-revalidation.json), with its
+[derived audit](./attempt-03/audit.json). Its canonical terminal reason is
+`V4_RESOURCE_CLOSURE_REVALIDATION_FAILED`; the underlying reason is
+`V4_ATTEMPT03_RESOURCE_HASH_MISMATCH`.
+
+Read-only diagnosis confirmed that the frozen `SampleSet.zip` and `Points.zip`
+exist under the overlay-declared `data` root and match their expected hashes.
+Attempt-03 tooling instead resolved them under `cache`. Consequently this is a
+resource-binding implementation mismatch, not a GPU result and not scientific
+evidence. No `nvidia-smi` inventory sample, PASS receipt, execution
+authorization, GPU ledger, run, or scientific artifact was created. The
+Attempt-03 evidence is terminal and must not be overwritten or retried under
+the same attempt ID.
+
+## Retained attempt-02 history
+
+The attempt-02 outcome remains the additive resource-gate [BLOCKED evidence](./attempt-02-resource-blocked/resource-blocker.json), with the supporting [audit](./attempt-02-resource-blocked/audit.json). Its terminal reason is `V4_RESOURCE_RECTIFIED_MEMBER_CLOSURE_UNAVAILABLE`. GPU selection was not run, so this must not be reported as `V4_NO_ELIGIBLE_IDLE_GPU` and it grants no execution authority.
 
 ## Retained attempt-01 correction history
 

@@ -1,0 +1,35 @@
+{
+  "archive_semantics": "DERIVED_READ_ONLY_AUDIT",
+  "attempt_id": "attempt-03",
+  "canonical_reason_code": "V4_RESOURCE_CLOSURE_REVALIDATION_FAILED",
+  "execution_authorization_generated": false,
+  "gpu_inference_seconds": 0,
+  "gpu_ledger_created": false,
+  "hardware_snapshot_generated": false,
+  "model_forwards": 0,
+  "model_loads": 0,
+  "nvidia_smi_invocations": 0,
+  "pass_receipt_generated": false,
+  "raw_evidence": {
+    "bytes": 1256,
+    "path": "v4-resource-revalidation.json",
+    "sha256": "f8e34fd93857f017bfb2d5495180fb57c3a868af4aacb19e7c4ad832c6e25131"
+  },
+  "resource_diagnosis": {
+    "actual_points_path": "/srv/private/smli/GeoReliab/data/Points.zip",
+    "actual_points_sha256": "85862c8844978e8958040982b0071442d2a47fe67391aa1aca9a743153c9edc1",
+    "actual_sampleset_path": "/srv/private/smli/GeoReliab/data/SampleSet.zip",
+    "actual_sampleset_sha256": "f719a5259db9257c4716ce014964444c1bb82fbb893e0d100b5fa01b82c029c7",
+    "incorrect_resolved_root": "/srv/private/smli/GeoReliab/cache",
+    "overlay_declared_data_root": "/srv/private/smli/GeoReliab/data",
+    "result": "RESOURCE_BINDING_IMPLEMENTATION_MISMATCH"
+  },
+  "run_artifacts_created": false,
+  "schema_version": "georeliab-v4-attempt-03-archive-audit-1.0",
+  "scientific_result": "NO_SCIENTIFIC_RESULT",
+  "status": "BLOCKED",
+  "tooling_commit": "1d6d1d1d8400d2e1a857c1c6b4d4ada9849429c0",
+  "tooling_tree": "e688a5b991e5e5837d5c14d45ed2887eb1730f34",
+  "torch_probe_invocations": 0,
+  "underlying_reason_code": "V4_ATTEMPT03_RESOURCE_HASH_MISMATCH"
+}
