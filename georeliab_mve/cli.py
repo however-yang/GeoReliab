@@ -339,6 +339,33 @@ def _attempt05_overlay_config_path(context: Any) -> Path:
         raise ValueError("Attempt-05 overlay digest mismatch")
     return overlay_path
 
+def _attempt05_authorized_gpu_inventory(
+    context: Any,
+    *,
+    sampler: Any = nvidia_smi_attempt04_inventory,
+) -> Mapping[str, object]:
+    """Project a host inventory onto the one GPU bound by Attempt-04."""
+
+    raw = sampler()
+    devices = raw.get("devices") if isinstance(raw, Mapping) else None
+    if not isinstance(devices, list):
+        raise V4ExecutionError("V4_ATTEMPT05_PREFLIGHT_SAMPLE_INVALID")
+    selected = context.selected_gpu
+    matches = [
+        device
+        for device in devices
+        if isinstance(device, Mapping)
+        and device.get("uuid") == selected.get("uuid")
+        and device.get("pci_bus_id") == selected.get("pci_bus_id")
+        and device.get("index") == selected.get("index")
+    ]
+    if len(matches) != 1:
+        raise V4ExecutionError("V4_ATTEMPT05_PREFLIGHT_GPU_IDENTITY_MISMATCH")
+    projected = dict(raw)
+    projected["devices"] = [dict(matches[0])]
+    return projected
+
+
 def _attempt05_cuda_mapping_probe(context: Any) -> Mapping[str, object]:
     selected_index = int(context.selected_gpu["index"])
     code = f"""
@@ -1432,7 +1459,9 @@ def main(argv: list[str] | None = None) -> int:
                 authorization_path=args.authorization,
                 attempt05_tooling_commit=args.tooling_commit,
                 attempt05_tooling_tree=args.tooling_tree,
-                nvidia_smi_sampler=nvidia_smi_attempt04_inventory,
+                nvidia_smi_sampler=lambda: _attempt05_authorized_gpu_inventory(
+                    context
+                ),
                 sleeper=time.sleep,
                 cuda_mapping_probe=lambda: _attempt05_cuda_mapping_probe(context),
             )

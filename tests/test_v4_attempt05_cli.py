@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from georeliab_mve.cli import ATTEMPT05_COMMANDS, build_parser, main
+import pytest
+
+from georeliab_mve.cli import (
+    ATTEMPT05_COMMANDS, _attempt05_authorized_gpu_inventory, build_parser, main,
+)
+from georeliab_mve.v4_attempt05_execution import V4ExecutionError
 
 
 def test_attempt05_cli_commands_are_registered() -> None:
@@ -24,6 +29,83 @@ def test_attempt05_cli_argument_errors_are_fail_closed(capsys) -> None:
         "scientific_result": "NO_SCIENTIFIC_RESULT",
         "status": "FAIL",
     }
+
+
+def test_attempt05_gpu_inventory_projects_only_the_authorized_device() -> None:
+    class Context:
+        selected_gpu = {
+            "uuid": "GPU-authorized",
+            "pci_bus_id": "00000000:4D:00.0",
+            "index": 0,
+        }
+
+    host_inventory = {
+        "hostname": "test-host",
+        "devices": [
+            {
+                "uuid": "GPU-authorized",
+                "pci_bus_id": "00000000:4D:00.0",
+                "index": 0,
+                "compute_process_count": 0,
+            },
+            {
+                "uuid": "GPU-other",
+                "pci_bus_id": "00000000:B2:00.0",
+                "index": 1,
+                "compute_process_count": 1,
+            },
+        ],
+    }
+
+    projected = _attempt05_authorized_gpu_inventory(
+        Context(), sampler=lambda: host_inventory
+    )
+
+    assert projected["hostname"] == "test-host"
+    assert [row["uuid"] for row in projected["devices"]] == ["GPU-authorized"]
+    assert len(host_inventory["devices"]) == 2
+
+
+@pytest.mark.parametrize(
+    "devices",
+    [
+        [],
+        [
+            {
+                "uuid": "GPU-authorized",
+                "pci_bus_id": "00000000:4D:00.0",
+                "index": 1,
+            }
+        ],
+        [
+            {
+                "uuid": "GPU-authorized",
+                "pci_bus_id": "00000000:4D:00.0",
+                "index": 0,
+            },
+            {
+                "uuid": "GPU-authorized",
+                "pci_bus_id": "00000000:4D:00.0",
+                "index": 0,
+            },
+        ],
+    ],
+)
+def test_attempt05_gpu_inventory_requires_one_exact_authorized_match(devices) -> None:
+    class Context:
+        selected_gpu = {
+            "uuid": "GPU-authorized",
+            "pci_bus_id": "00000000:4D:00.0",
+            "index": 0,
+        }
+
+    with pytest.raises(
+        V4ExecutionError,
+        match="V4_ATTEMPT05_PREFLIGHT_GPU_IDENTITY_MISMATCH",
+    ):
+        _attempt05_authorized_gpu_inventory(
+            Context(), sampler=lambda: {"devices": devices}
+        )
 
 
 def test_attempt05_run_invokes_bound_serial_pipeline(monkeypatch, tmp_path, capsys) -> None:
