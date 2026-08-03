@@ -44,7 +44,11 @@ from .v4_counterfactuals import (
     validate_scientific_schedule,
     validate_v4_split_assignment,
 )
-from .v4_execution import V4ExecutionError, canonical_record_path
+from .v4_execution import (
+    V4ExecutionError,
+    admit_existing_task_record,
+    canonical_record_path,
+)
 from .v4_attempt05_runtime import (
     decompose_ordered_dtu_projections,
     execute_attempt05_calibration_l3,
@@ -54,6 +58,11 @@ from .v4_metrics import (
     CalibrationWarningSample,
     NativeWarningCalibration,
     fit_native_warning_calibration,
+)
+from .v4_records import (
+    Task3ContractError,
+    read_task_audit_record,
+    write_task_audit_record,
 )
 
 class Attempt05OrchestrationError(V4ExecutionError):
@@ -92,6 +101,9 @@ class Attempt05ScientificResult:
     allocated_bytes: int
     peak_memory_mb: float
     resumed: bool = False
+    projection_logical_bytes: int = 0
+    projection_allocated_bytes: int = 0
+    projection_created: bool = False
 
 
 
@@ -121,6 +133,8 @@ class Attempt05ScientificRuntimeBinding:
     observability_bb: Any | None = None
     observability_res: float | None = None
     resume: bool = False
+    legacy_output_dir: Path | None = None
+    run_root: Path | None = None
 
 @dataclass(frozen=True, slots=True)
 class Attempt05RuntimeBindingSet:
@@ -806,7 +820,15 @@ def construct_attempt05_runtime_bindings(
             if cached_signature != signature:
                 raise Attempt05OrchestrationError("V4_ATTEMPT05_SCENE_GT_BINDING_DRIFT")
         sample_key = SampleKey("dtu", "test", f"scan{unit.scene_id:03d}", "views-0001", unit.state_id, "0", "0")
-        output_dir = canonical_record_path(context.run_root, unit).parent
+        output_dir = (
+            context.run_root
+            / "stage"
+            / "SCIENTIFIC_MVE"
+            / "bundles"
+            / unit.model_id
+            / f"scan{unit.scene_id:03d}"
+            / unit.state_id
+        )
         scientific[(unit.model_id, unit.scene_id, unit.state_id)] = Attempt05ScientificRuntimeBinding(
             manifest=_manifest(
                 model_id=unit.model_id,
@@ -831,6 +853,8 @@ def construct_attempt05_runtime_bindings(
             observability_bb=gt[4],
             observability_res=gt[5],
             resume=resume,
+            legacy_output_dir=canonical_record_path(context.run_root, unit).parent,
+            run_root=context.run_root,
         )
     if len(calibration) != 40 or len(scientific) != 400:
         raise Attempt05OrchestrationError("V4_ATTEMPT05_BINDING_COUNT_MISMATCH")
@@ -944,6 +968,53 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _record_matches_unit(path: Path, unit: ScientificExecutionUnit) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        record = read_task_audit_record(path)
+    except Task3ContractError as exc:
+        raise Attempt05OrchestrationError(
+            "V4_ATTEMPT05_LEGACY_TASK_RECORD_INVALID"
+        ) from exc
+    return (
+        record.model_id == unit.model_id
+        and record.scene_id == unit.scene_id
+        and record.state_id == unit.state_id
+        and record.execution_unit_sha256 == unit.execution_unit_sha256
+        and record.state_identity_sha256 == unit.state_identity_sha256
+        and record.pair_identity_sha256 == unit.pair_identity_sha256
+    )
+
+
+def _publish_canonical_record(
+    *,
+    source_record: Any,
+    unit: ScientificExecutionUnit,
+    run_root: Path,
+) -> tuple[Path, bool, int, int]:
+    path = canonical_record_path(run_root, unit)
+    existed = path.exists()
+    try:
+        write_task_audit_record(path, source_record)
+        admitted = admit_existing_task_record(path, unit, root=run_root)
+    except (Task3ContractError, V4ExecutionError) as exc:
+        raise Attempt05OrchestrationError(
+            "V4_ATTEMPT05_CANONICAL_RECORD_PROJECTION_INVALID"
+        ) from exc
+    if admitted.record_sha256 != source_record.record_sha256:
+        raise Attempt05OrchestrationError(
+            "V4_ATTEMPT05_CANONICAL_RECORD_PROJECTION_INVALID"
+        )
+    stat = path.stat()
+    allocated = (
+        int(getattr(stat, "st_blocks", 0) * 512)
+        if getattr(stat, "st_blocks", 0)
+        else stat.st_size
+    )
+    return path, not existed, stat.st_size, allocated
+
+
 def make_attempt05_runtime_executors(
     *,
     calibration_bindings: Mapping[tuple[str, int], Attempt05CalibrationRuntimeBinding],
@@ -1000,6 +1071,16 @@ def make_attempt05_runtime_executors(
         if binding is None:
             raise Attempt05OrchestrationError("V4_ATTEMPT05_SCIENTIFIC_BINDING_MISSING")
         before = time.perf_counter()
+        execution_output_dir = binding.output_dir
+        if (
+            binding.resume
+            and not execution_output_dir.exists()
+            and binding.legacy_output_dir is not None
+            and _record_matches_unit(
+                binding.legacy_output_dir / "task_audit_record.json", unit
+            )
+        ):
+            execution_output_dir = binding.legacy_output_dir
         result = execute_attempt05_unit(
             unit=unit,
             manifest=binding.manifest,
@@ -1007,7 +1088,7 @@ def make_attempt05_runtime_executors(
             rendered_views=binding.rendered_views,
             adapter=binding.adapter,
             calibration=calibration,
-            output_dir=binding.output_dir,
+            output_dir=execution_output_dir,
             gt_points=binding.gt_points,
             gt_camera_c2w=binding.gt_camera_c2w,
             observability_mask=binding.observability_mask,
@@ -1019,16 +1100,26 @@ def make_attempt05_runtime_executors(
         wall = time.perf_counter() - before
         gpu_seconds, peak_mb = _prediction_runtime(result.prediction)
         resumed = result.prediction is None
+        canonical_path, projection_created, projection_logical, projection_allocated = (
+            _publish_canonical_record(
+                source_record=result.record,
+                unit=unit,
+                run_root=binding.run_root or binding.output_dir.parents[5],
+            )
+        )
         return Attempt05ScientificResult(
-            record_path=result.record_path,
+            record_path=canonical_path,
             status=result.status,
             task_record_sha256=result.record.record_sha256,
             gpu_inference_seconds=gpu_seconds,
             wall_runtime_seconds=0.0 if resumed else wall,
-            logical_bytes=0 if resumed else _tree_logical_bytes(binding.output_dir),
-            allocated_bytes=0 if resumed else _tree_allocated_bytes(binding.output_dir),
+            logical_bytes=0 if resumed else _tree_logical_bytes(execution_output_dir),
+            allocated_bytes=0 if resumed else _tree_allocated_bytes(execution_output_dir),
             peak_memory_mb=peak_mb,
             resumed=resumed,
+            projection_logical_bytes=projection_logical,
+            projection_allocated_bytes=projection_allocated,
+            projection_created=projection_created,
         )
 
     return calibration_executor, scientific_executor
@@ -1190,6 +1281,48 @@ def run_attempt05_pipeline(
         for unit in scientific_by_model[model]:
             _assert_pre_dispatch_budget(totals)
             result = scientific_executor(unit, calibrations[model])
+            projection_key = (unit.model_id, unit.scene_id, unit.state_id)
+            projection_ledgered = (
+                ledger_resume is not None
+                and projection_key in ledger_resume.projection_unit_keys
+            )
+            if projection_ledgered and result.projection_created:
+                raise Attempt05OrchestrationError(
+                    "V4_ATTEMPT05_CANONICAL_PROJECTION_LEDGER_MISMATCH"
+                )
+            if not projection_ledgered:
+                if (
+                    result.projection_logical_bytes <= 0
+                    or result.projection_allocated_bytes <= 0
+                ):
+                    raise Attempt05OrchestrationError(
+                        "V4_ATTEMPT05_CANONICAL_PROJECTION_ACCOUNTING_INVALID"
+                    )
+                totals.add(
+                    gpu_inference_seconds=0.0,
+                    wall_runtime_seconds=0.0,
+                    logical_bytes=result.projection_logical_bytes,
+                    allocated_bytes=result.projection_allocated_bytes,
+                    peak_memory_mb=0.0,
+                )
+                append_attempt05_ledger_event(
+                    ledger_path=ledger_path,
+                    event_type="CANONICAL_RECORD_PROJECTION",
+                    payload={
+                        "model_id": unit.model_id,
+                        "scene_id": unit.scene_id,
+                        "state_id": unit.state_id,
+                        "task_record_sha256": result.task_record_sha256,
+                        "projection_path": str(result.record_path),
+                        "retry_count": 0,
+                        "gpu_inference_seconds_total": totals.gpu_inference_seconds,
+                        "wall_runtime_seconds_total": totals.wall_runtime_seconds,
+                        "logical_bytes_total": totals.logical_bytes,
+                        "allocated_bytes_total": totals.allocated_bytes,
+                        "peak_memory_mb_total": totals.peak_memory_mb,
+                    },
+                )
+                _assert_pre_dispatch_budget(totals)
             if not result.resumed:
                 totals.add(
                     gpu_inference_seconds=result.gpu_inference_seconds,

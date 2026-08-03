@@ -587,16 +587,68 @@ def _allowed_record_paths(root: Path, units: Sequence[ScientificExecutionUnit]) 
     return {canonical_record_path(root, unit).resolve() for unit in units}
 
 
+_LEGACY_ATTEMPT05_BUNDLE_MEMBERS = frozenset(
+    {
+        "audit_record.json",
+        "dense_audit.npz",
+        "geometry_prediction.npz",
+        "gt_points.npz",
+        "native_confidence.npz",
+        "prediction_artifact.json",
+        "run_manifest.json",
+        "task_audit_record.json",
+        "valid_mask.npz",
+    }
+)
+
+
+def _validated_legacy_bundle_members(
+    root: Path,
+    units: Sequence[ScientificExecutionUnit],
+) -> set[Path]:
+    record_root = root / "stage" / SCIENTIFIC_MVE / "records"
+    by_key = {_unit_key(unit): unit for unit in units}
+    allowed: set[Path] = set()
+    if not record_root.exists():
+        return allowed
+    for task_path in record_root.glob("*/scan*/task_audit_record.json"):
+        record = _read_record(task_path)
+        unit = by_key.get(_record_key(record))
+        if unit is None:
+            raise V4ExecutionError("V4_RECORD_UNEXPECTED_EXTRA")
+        canonical = canonical_record_path(root, unit)
+        if (
+            not canonical.is_file()
+            or canonical.read_bytes() != task_path.read_bytes()
+        ):
+            raise V4ExecutionError("V4_LEGACY_BUNDLE_PROJECTION_MISMATCH")
+        observed_bundle_members = {
+            member.name
+            for member in task_path.parent.iterdir()
+            if member.is_file() and member.name in _LEGACY_ATTEMPT05_BUNDLE_MEMBERS
+        }
+        if observed_bundle_members != _LEGACY_ATTEMPT05_BUNDLE_MEMBERS:
+            raise V4ExecutionError("V4_LEGACY_BUNDLE_MEMBER_SET_MISMATCH")
+        for member in task_path.parent.iterdir():
+            if member.is_dir() or member.name not in _LEGACY_ATTEMPT05_BUNDLE_MEMBERS:
+                continue
+            allowed.add(member.resolve())
+    return allowed
+
+
 def _reject_extra_or_partial_record_files(root: Path, units: Sequence[ScientificExecutionUnit]) -> None:
     record_root = root / "stage" / SCIENTIFIC_MVE / "records"
     if not record_root.exists():
         return
     allowed = _allowed_record_paths(root, units)
+    legacy_allowed = _validated_legacy_bundle_members(root, units)
     for member in record_root.rglob("*"):
         if not member.is_file():
             continue
         if member.name.endswith(".partial") or ".partial" in member.name:
             raise V4ExecutionError("V4_RECORD_PARTIAL_ARTIFACT")
+        if member.resolve() in legacy_allowed:
+            continue
         if member.suffix == ".json" and member.resolve() not in allowed:
             raise V4ExecutionError("V4_RECORD_UNEXPECTED_EXTRA")
         if member.suffix != ".json":

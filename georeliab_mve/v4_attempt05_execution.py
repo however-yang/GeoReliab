@@ -971,6 +971,7 @@ class Attempt05LedgerResumeTotals:
     finalized: bool = False
     calibration_unit_keys: frozenset[tuple[str, int, str]] = frozenset()
     scientific_unit_keys: frozenset[tuple[str, int, str]] = frozenset()
+    projection_unit_keys: frozenset[tuple[str, int, str]] = frozenset()
 
 
 def _payload_float(payload: Mapping[str, object], *names: str) -> float | None:
@@ -1011,6 +1012,7 @@ def rehydrate_attempt05_ledger_totals(ledger_path: Path) -> Attempt05LedgerResum
     seen_units: set[tuple[str, str, int, str]] = set()
     calibration_unit_keys: set[tuple[str, int, str]] = set()
     scientific_unit_keys: set[tuple[str, int, str]] = set()
+    projection_unit_keys: set[tuple[str, int, str]] = set()
     for row in rows:
         payload = row.get("payload")
         if not isinstance(payload, Mapping):
@@ -1061,6 +1063,21 @@ def rehydrate_attempt05_ledger_totals(ledger_path: Path) -> Attempt05LedgerResum
             else:
                 scientific_completed += 1
                 scientific_unit_keys.add((model_id, scene_id, state_id))
+        if event_type == "CANONICAL_RECORD_PROJECTION":
+            model_id = payload.get("model_id")
+            scene_id = payload.get("scene_id")
+            state_id = payload.get("state_id")
+            if (
+                not isinstance(model_id, str)
+                or type(scene_id) is not int
+                or not isinstance(state_id, str)
+            ):
+                raise V4ExecutionError("V4_ATTEMPT05_LEDGER_UNIT_IDENTITY_INVALID")
+            key = (str(event_type), model_id, scene_id, state_id)
+            if key in seen_units:
+                raise V4ExecutionError("V4_ATTEMPT05_LEDGER_DUPLICATE_UNIT")
+            seen_units.add(key)
+            projection_unit_keys.add((model_id, scene_id, state_id))
         status = str(payload.get("status", ""))
         if status == "INVALID_FAILURE_RECORDED" or status == "RESUMED_INVALID_FAILURE_RECORDED":
             invalid += 1
@@ -1084,6 +1101,7 @@ def rehydrate_attempt05_ledger_totals(ledger_path: Path) -> Attempt05LedgerResum
         finalized=finalized,
         calibration_unit_keys=frozenset(calibration_unit_keys),
         scientific_unit_keys=frozenset(scientific_unit_keys),
+        projection_unit_keys=frozenset(projection_unit_keys),
     )
 
 

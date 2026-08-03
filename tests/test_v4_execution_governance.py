@@ -627,6 +627,38 @@ def test_admit_existing_artifact_requires_hash_identity_linkage_and_path(
         admit_existing_task_record(path, unit, root=tmp_path)
 
 
+def test_canonical_inventory_admits_only_a_byte_identical_legacy_attempt05_bundle(
+    schedule: ScientificSchedule,
+    tmp_path: Path,
+) -> None:
+    paths = [canonical_record_path(tmp_path, unit) for unit in schedule.units]
+    records = [_minimal_record(unit) for unit in schedule.units]
+    for path, record in zip(paths, records, strict=True):
+        _write_record(path, record)
+    legacy = paths[0].parent
+    (legacy / "task_audit_record.json").write_bytes(paths[0].read_bytes())
+    for name in (
+        "audit_record.json",
+        "prediction_artifact.json",
+        "run_manifest.json",
+    ):
+        (legacy / name).write_text("{}\n", encoding="utf-8")
+    for name in (
+        "dense_audit.npz",
+        "geometry_prediction.npz",
+        "gt_points.npz",
+        "native_confidence.npz",
+        "valid_mask.npz",
+    ):
+        (legacy / name).write_bytes(b"legacy")
+
+    assert canonical_record_inventory(schedule, paths, root=tmp_path) == tuple(records)
+
+    (legacy / "task_audit_record.json").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(V4ExecutionError):
+        canonical_record_inventory(schedule, paths, root=tmp_path)
+
+
 def test_resource_limits_stop_independently_and_fail_closed() -> None:
     under = V4ResourceLedger(
         gpu_inference_seconds=10.0,

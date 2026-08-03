@@ -670,8 +670,37 @@ def test_ledger_resume_totals_rehydrates_hash_chain_budget(tmp_path: Path) -> No
     assert totals.completed_units == 2
     assert totals.invalid_units == 1
     assert totals.peak_memory_mb == 10.5
+    assert totals.projection_unit_keys == frozenset()
     rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
     assert rows[0]["payload"]["retry_count"] == 0
+
+
+def test_projection_event_is_accounted_without_incrementing_scientific_units(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "projection-ledger.jsonl"
+    attempt05.append_attempt05_ledger_event(
+        ledger_path=ledger,
+        event_type="CANONICAL_RECORD_PROJECTION",
+        payload={
+            "model_id": "VGGT",
+            "scene_id": 1,
+            "state_id": "L1",
+            "task_record_sha256": "a" * 64,
+            "gpu_inference_seconds_total": 0.0,
+            "wall_runtime_seconds_total": 0.0,
+            "logical_bytes_total": 5,
+            "allocated_bytes_total": 8,
+            "peak_memory_mb_total": 0.0,
+        },
+    )
+
+    totals = attempt05.rehydrate_attempt05_ledger_totals(ledger)
+
+    assert totals.projection_unit_keys == frozenset({("VGGT", 1, "L1")})
+    assert totals.scientific_units_completed == 0
+    assert totals.logical_bytes == 5
+    assert totals.allocated_bytes == 8
 
 
 def test_finalizer_requires_exact_400_records_and_uses_authorized_path(

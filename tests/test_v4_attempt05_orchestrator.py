@@ -165,6 +165,9 @@ def test_orchestrator_runs_frozen_serial_order_and_finalizes(monkeypatch: pytest
             logical_bytes=3,
             allocated_bytes=4,
             peak_memory_mb=5.0,
+            projection_logical_bytes=1,
+            projection_allocated_bytes=1,
+            projection_created=True,
         )
 
     finalized: dict[str, Any] = {}
@@ -313,6 +316,7 @@ def _resume_totals(
     *,
     calibration_keys: frozenset[tuple[str, int, str]] = frozenset(),
     scientific_keys: frozenset[tuple[str, int, str]] = frozenset(),
+    projection_keys: frozenset[tuple[str, int, str]] = frozenset(),
 ) -> Any:
     return SimpleNamespace(
         gpu_inference_seconds=0.0,
@@ -327,6 +331,7 @@ def _resume_totals(
         finalized=False,
         calibration_unit_keys=calibration_keys,
         scientific_unit_keys=scientific_keys,
+        projection_unit_keys=projection_keys,
     )
 
 
@@ -439,6 +444,8 @@ def test_resume_blocks_promoted_scientific_artifact_without_ledger_event(
             allocated_bytes=0,
             peak_memory_mb=0.0,
             resumed=True,
+            projection_logical_bytes=1,
+            projection_allocated_bytes=1,
         )
 
     def fit(samples: Any, _split: Any) -> Any:
@@ -705,7 +712,15 @@ def test_construct_attempt05_runtime_bindings_materializes_truthful_lazy_binding
     assert sample.gt_points.shape == (2, 3)
     assert sample.gt_camera_c2w.shape == (8, 4, 4)
     assert sample.observability_mask.ndim == 3
-    assert sample.output_dir == context.run_root / "stage" / "SCIENTIFIC_MVE" / "records" / "VGGT" / "scan001"
+    assert sample.output_dir == (
+        context.run_root
+        / "stage"
+        / "SCIENTIFIC_MVE"
+        / "bundles"
+        / "VGGT"
+        / "scan001"
+        / "L3"
+    )
     assert sample.manifest.environment["device"] == "cuda:0"
     assert parser_counts == {"ply": 20, "mask": 20, "projection": 160}
     same_scene_l2 = bindings.scientific_bindings[("VGGT", 1, "L2")]
@@ -714,12 +729,91 @@ def test_construct_attempt05_runtime_bindings_materializes_truthful_lazy_binding
     assert same_scene_l2.observability_mask is sample.observability_mask
     assert same_scene_l2.gt_camera_c2w is sample.gt_camera_c2w
     assert same_scene_mast3r.gt_points is sample.gt_points
+    assert same_scene_l2.output_dir != sample.output_dir
+    assert len(
+        {
+            bindings.scientific_bindings[("VGGT", 1, state)].output_dir
+            for state in SCIENTIFIC_STATES
+        }
+    ) == 10
 
     assert factory_calls == []
     assert sample.adapter.predict_sample(None, None, None) == "VGGT"
     assert factory_calls == ["VGGT:cuda:0"]
     assert bindings.scientific_bindings[("MASt3R", 1, "L3")].adapter.predict_sample(None, None, None) == "MASt3R"
     assert factory_calls == ["VGGT:cuda:0", "MASt3R:cuda:0"]
+
+
+def test_runtime_executor_recovers_only_matching_legacy_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_root = tmp_path / "run"
+    legacy = run_root / "stage" / "SCIENTIFIC_MVE" / "records" / "VGGT" / "scan001"
+    outputs = {
+        state: run_root / "stage" / "SCIENTIFIC_MVE" / "bundles" / "VGGT" / "scan001" / state
+        for state in ("L1", "L2")
+    }
+    units = {state: _unit("VGGT", 1, state) for state in ("L1", "L2")}
+    calls: list[tuple[str, Path]] = []
+
+    def binding(state: str) -> orch.Attempt05ScientificRuntimeBinding:
+        return orch.Attempt05ScientificRuntimeBinding(
+            manifest=object(),
+            sample_key=object(),
+            rendered_views=(),
+            adapter=object(),
+            output_dir=outputs[state],
+            gt_points=object(),
+            gt_camera_c2w=object(),
+            observability_mask=object(),
+            gt_dtu_camera_c2w=object(),
+            resume=True,
+            legacy_output_dir=legacy,
+            run_root=run_root,
+        )
+
+    monkeypatch.setattr(
+        orch,
+        "_record_matches_unit",
+        lambda _path, unit: unit.state_id == "L1",
+    )
+
+    def execute(**kwargs: Any) -> Any:
+        unit = kwargs["unit"]
+        output_dir = kwargs["output_dir"]
+        calls.append((unit.state_id, output_dir))
+        record = FakeTaskRecord(unit.model_id, unit.scene_id, unit.state_id, "e" * 64)
+        return SimpleNamespace(
+            status="RESUMED_VALID_COMPLETE" if unit.state_id == "L1" else "VALID_COMPLETE",
+            prediction=None if unit.state_id == "L1" else SimpleNamespace(
+                runtime_seconds=1.0,
+                peak_memory_mb=2.0,
+            ),
+            record=record,
+        )
+
+    monkeypatch.setattr(orch, "execute_attempt05_unit", execute)
+    monkeypatch.setattr(
+        orch,
+        "_publish_canonical_record",
+        lambda source_record, unit, run_root: (
+            run_root / f"{unit.state_id}.json",
+            True,
+            1,
+            1,
+        ),
+    )
+    _, scientific = orch.make_attempt05_runtime_executors(
+        calibration_bindings={},
+        scientific_bindings={
+            ("VGGT", 1, state): binding(state) for state in ("L1", "L2")
+        },
+    )
+    calibration = SimpleNamespace(model_id="VGGT")
+    assert scientific(units["L1"], calibration).resumed is True
+    assert scientific(units["L2"], calibration).resumed is False
+    assert calls == [("L1", legacy), ("L2", outputs["L2"])]
 
 
 def test_construct_attempt05_runtime_bindings_rejects_materialized_digest_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
