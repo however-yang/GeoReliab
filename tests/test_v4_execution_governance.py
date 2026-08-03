@@ -659,6 +659,42 @@ def test_canonical_inventory_admits_only_a_byte_identical_legacy_attempt05_bundl
         canonical_record_inventory(schedule, paths, root=tmp_path)
 
 
+def test_first_incomplete_allows_valid_legacy_bundle_before_projection(
+    schedule: ScientificSchedule,
+    tmp_path: Path,
+) -> None:
+    unit = schedule.units[0]
+    record = _minimal_record(unit)
+    legacy = (
+        tmp_path
+        / "stage"
+        / SCIENTIFIC_MVE
+        / "records"
+        / unit.model_id
+        / f"scan{unit.scene_id:03d}"
+    )
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / "task_audit_record.json").write_bytes(record.canonical_json_bytes())
+    for name in (
+        "audit_record.json",
+        "prediction_artifact.json",
+        "run_manifest.json",
+    ):
+        (legacy / name).write_text("{}\n", encoding="utf-8")
+    for name in (
+        "dense_audit.npz",
+        "geometry_prediction.npz",
+        "gt_points.npz",
+        "native_confidence.npz",
+        "valid_mask.npz",
+    ):
+        (legacy / name).write_bytes(b"legacy")
+
+    decision = first_incomplete_unit(schedule, tmp_path)
+    assert decision.status == GPU_SELECTION_REQUIRED
+    assert decision.unit == unit
+
+
 def test_resource_limits_stop_independently_and_fail_closed() -> None:
     under = V4ResourceLedger(
         gpu_inference_seconds=10.0,

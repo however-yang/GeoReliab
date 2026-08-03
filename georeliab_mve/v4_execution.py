@@ -617,7 +617,7 @@ def _validated_legacy_bundle_members(
         if unit is None:
             raise V4ExecutionError("V4_RECORD_UNEXPECTED_EXTRA")
         canonical = canonical_record_path(root, unit)
-        if (
+        if canonical.exists() and (
             not canonical.is_file()
             or canonical.read_bytes() != task_path.read_bytes()
         ):
