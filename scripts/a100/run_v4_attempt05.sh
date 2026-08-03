@@ -76,12 +76,22 @@ if [[ -n "$recovery_from_commit" || -n "$recovery_from_tree" ]]; then
     echo "V4_MVE_FAILED_WITH_REASON=V4_ATTEMPT05_RECOVERY_REVISION_INVALID" >&2
     exit 2
   fi
-  "$python" -m georeliab_mve v4-attempt05-authorize-recovery \
-    --authorization "$authorization" \
-    --from-tooling-commit "$recovery_from_commit" \
-    --from-tooling-tree "$recovery_from_tree" \
-    --to-tooling-commit "$expected_tooling_commit" \
-    --to-tooling-tree "$expected_tooling_tree"
+  recovery_artifact="$(runtime_root "$overlay")/artifacts/v4-mve-attempt-05/v4-attempt05-recovery-revision.json"
+  if [[ -e "$recovery_artifact" ]]; then
+    "$python" -m georeliab_mve v4-attempt05-authorize-continuation \
+      --authorization "$authorization" \
+      --from-tooling-commit "$recovery_from_commit" \
+      --from-tooling-tree "$recovery_from_tree" \
+      --to-tooling-commit "$expected_tooling_commit" \
+      --to-tooling-tree "$expected_tooling_tree"
+  else
+    "$python" -m georeliab_mve v4-attempt05-authorize-recovery \
+      --authorization "$authorization" \
+      --from-tooling-commit "$recovery_from_commit" \
+      --from-tooling-tree "$recovery_from_tree" \
+      --to-tooling-commit "$expected_tooling_commit" \
+      --to-tooling-tree "$expected_tooling_tree"
+  fi
 fi
 
 if [[ -e "$input_closure_dir" || -e "${input_closure_dir}.partial" ]]; then

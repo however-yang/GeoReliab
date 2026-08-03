@@ -104,6 +104,7 @@ from .v4_attempt05_execution import (
     ATTEMPT05_RUN_NAME,
     build_attempt05_scientific_schedule,
     create_attempt05_recovery_revision,
+    create_attempt05_tooling_continuation,
     create_attempt05_execution_preflight,
     create_attempt05_start_receipt,
     authorize_attempt05_next_dispatch,
@@ -112,7 +113,7 @@ from .v4_attempt05_execution import (
     load_attempt05_authorized_context,
     rehydrate_attempt05_ledger_totals,
     validate_attempt05_execution_preflight,
-    validate_attempt05_recovery_revision,
+    _validate_attempt05_resume_tooling_lineage,
 )
 from .v4_attempt05_inputs import (
     prepare_attempt05_inputs,
@@ -392,8 +393,9 @@ def _attempt05_get_or_create_preflight(
             or preflight.get("attempt05_tooling_tree") != tooling_tree
         ):
             try:
-                recovery = validate_attempt05_recovery_revision(
-                    authorization_path=authorization_path,
+                _validate_attempt05_resume_tooling_lineage(
+                    context,
+                    preflight=preflight,
                     expected_tooling_commit=tooling_commit,
                     expected_tooling_tree=tooling_tree,
                 )
@@ -401,15 +403,6 @@ def _attempt05_get_or_create_preflight(
                 raise V4ExecutionError(
                     "V4_ATTEMPT05_TOOLING_REVISION_MISMATCH"
                 ) from exc
-            if (
-                recovery.get("from_tooling_commit")
-                != preflight.get("attempt05_tooling_commit")
-                or recovery.get("from_tooling_tree")
-                != preflight.get("attempt05_tooling_tree")
-            ):
-                raise V4ExecutionError(
-                    "V4_ATTEMPT05_RECOVERY_SOURCE_REVISION_MISMATCH"
-                )
         return preflight
     return create_attempt05_execution_preflight(
         authorization_path=authorization_path,
@@ -1016,6 +1009,15 @@ def build_parser() -> argparse.ArgumentParser:
     attempt05_recovery.add_argument('--to-tooling-commit', required=True)
     attempt05_recovery.add_argument('--to-tooling-tree', required=True)
 
+    attempt05_continuation = subparsers.add_parser(
+        'v4-attempt05-authorize-continuation'
+    )
+    attempt05_continuation.add_argument('--authorization', type=Path, required=True)
+    attempt05_continuation.add_argument('--from-tooling-commit', required=True)
+    attempt05_continuation.add_argument('--from-tooling-tree', required=True)
+    attempt05_continuation.add_argument('--to-tooling-commit', required=True)
+    attempt05_continuation.add_argument('--to-tooling-tree', required=True)
+
     attempt05_run = subparsers.add_parser('v4-attempt05-run')
     attempt05_run.add_argument('--authorization', type=Path, required=True)
     attempt05_run.add_argument('--input-closure-dir', type=Path, required=True)
@@ -1524,6 +1526,25 @@ def main(argv: list[str] | None = None) -> int:
                 'recovery_revision_path': recovery['recovery_revision_path'],
                 'recovery_revision_sha256': recovery[
                     'recovery_revision_sha256'
+                ],
+                'retry_count': 0,
+            }, indent=2, sort_keys=True))
+            return 0
+        if args.command == 'v4-attempt05-authorize-continuation':
+            continuation = create_attempt05_tooling_continuation(
+                authorization_path=args.authorization,
+                from_tooling_commit=args.from_tooling_commit,
+                from_tooling_tree=args.from_tooling_tree,
+                to_tooling_commit=args.to_tooling_commit,
+                to_tooling_tree=args.to_tooling_tree,
+            )
+            print(json.dumps({
+                'status': 'V4_ATTEMPT05_TOOLING_CONTINUATION_BOUND',
+                'attempt_id': 'attempt-05',
+                'scientific_result': 'NO_SCIENTIFIC_RESULT',
+                'continuation_path': continuation['continuation_path'],
+                'continuation_sha256': continuation[
+                    'tooling_continuation_sha256'
                 ],
                 'retry_count': 0,
             }, indent=2, sort_keys=True))

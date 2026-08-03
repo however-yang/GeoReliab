@@ -62,7 +62,9 @@ DTU_PROJECTION_SCHEMA = "georeliab-v4-attempt-05-dtu-projection-c2w-1.0"
 Q90_FREEZE_SCHEMA = "georeliab-v4-attempt-05-q90-freeze-1.0"
 PREFLIGHT_SCHEMA = "georeliab-v4-attempt-05-execution-preflight-1.0"
 RECOVERY_REVISION_SCHEMA = "georeliab-v4-attempt-05-recovery-revision-1.0"
+TOOLING_CONTINUATION_SCHEMA = "georeliab-v4-attempt-05-tooling-continuation-1.0"
 RECOVERY_REASON = "V4_ATTEMPT05_STATE_PATH_COLLISION_RECOVERY"
+TOOLING_CONTINUATION_REASON = "V4_ATTEMPT05_POST_RECOVERY_TOOLING_CONTINUATION"
 _RECOVERABLE_LEGACY_BUNDLE_MEMBERS = frozenset(
     {
         "audit_record.json",
@@ -683,18 +685,12 @@ def create_attempt05_start_receipt(
             preflight.get("attempt05_tooling_commit") != tooling_commit
             or preflight.get("attempt05_tooling_tree") != tooling_tree
         ):
-            recovery = validate_attempt05_recovery_revision(
-                authorization_path=authorization_path,
+            _validate_attempt05_resume_tooling_lineage(
+                context,
+                preflight=preflight,
                 expected_tooling_commit=tooling_commit,
                 expected_tooling_tree=tooling_tree,
             )
-            if (
-                recovery.get("from_tooling_commit")
-                != preflight.get("attempt05_tooling_commit")
-                or recovery.get("from_tooling_tree")
-                != preflight.get("attempt05_tooling_tree")
-            ):
-                raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_SOURCE_REVISION_MISMATCH")
         return _load_start_receipt(context)
     if (
         preflight.get("attempt05_tooling_commit") != tooling_commit
@@ -964,6 +960,252 @@ def validate_attempt05_recovery_revision(
         "file_sha256": _sha256_file(path),
     }
 
+
+
+def _tooling_continuation_path(
+    context: Attempt05AuthorizedContext,
+    *,
+    tooling_commit: str,
+    tooling_tree: str,
+) -> Path:
+    if not _is_sha(tooling_commit, 40) or not _is_sha(tooling_tree, 40):
+        raise V4ExecutionError("V4_ATTEMPT05_TOOLING_REVISION_REQUIRED")
+    return context.artifact_root / (
+        f"v4-attempt05-tooling-continuation-{tooling_commit}-{tooling_tree}.json"
+    )
+
+
+def validate_attempt05_tooling_continuation(
+    *,
+    authorization_path: Path,
+    from_tooling_commit: str,
+    from_tooling_tree: str,
+    expected_tooling_commit: str,
+    expected_tooling_tree: str,
+) -> dict[str, object]:
+    context = load_attempt05_authorized_context(authorization_path=authorization_path)
+    recovery = validate_attempt05_recovery_revision(
+        authorization_path=authorization_path,
+    )
+    if (
+        recovery.get("to_tooling_commit") != from_tooling_commit
+        or recovery.get("to_tooling_tree") != from_tooling_tree
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_CONTINUATION_SOURCE_REVISION_MISMATCH")
+    path = _tooling_continuation_path(
+        context,
+        tooling_commit=expected_tooling_commit,
+        tooling_tree=expected_tooling_tree,
+    )
+    payload = _load_json(path)
+    digest = payload.get("tooling_continuation_sha256")
+    unsigned = {
+        key: value for key, value in payload.items()
+        if key != "tooling_continuation_sha256"
+    }
+    if (
+        payload.get("schema_version") != TOOLING_CONTINUATION_SCHEMA
+        or payload.get("attempt_id") != ATTEMPT_ID
+        or payload.get("reason_code") != TOOLING_CONTINUATION_REASON
+        or payload.get("from_tooling_commit") != from_tooling_commit
+        or payload.get("from_tooling_tree") != from_tooling_tree
+        or payload.get("to_tooling_commit") != expected_tooling_commit
+        or payload.get("to_tooling_tree") != expected_tooling_tree
+        or payload.get("attempt04_authorization_sha256") != context.authorization_sha256
+        or payload.get("recovery_revision_file_sha256") != recovery.get("file_sha256")
+        or not _is_sha(payload.get("recovery_revision_sha256"))
+        or not _is_sha(payload.get("ledger_head_before_continuation"))
+        or not _is_sha(digest)
+        or _sha256_json(unsigned) != digest
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_TOOLING_CONTINUATION_TAMPER")
+    rows = _read_ledger_rows(context.gpu_ledger_path)
+    matching = [
+        row for row in rows
+        if row.get("event_type") == "TOOLING_CONTINUATION_REVISION"
+        and isinstance(row.get("payload"), Mapping)
+        and row["payload"].get("continuation_path") == str(path)
+    ]
+    if len(matching) != 1:
+        raise V4ExecutionError("V4_ATTEMPT05_TOOLING_CONTINUATION_LEDGER_REQUIRED")
+    event_payload = matching[0]["payload"]
+    if (
+        event_payload.get("continuation_file_sha256") != _sha256_file(path)
+        or event_payload.get("from_tooling_commit") != from_tooling_commit
+        or event_payload.get("to_tooling_commit") != expected_tooling_commit
+        or event_payload.get("to_tooling_tree") != expected_tooling_tree
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_TOOLING_CONTINUATION_LEDGER_MISMATCH")
+    return {
+        **payload,
+        "continuation_path": str(path),
+        "file_sha256": _sha256_file(path),
+    }
+
+
+def create_attempt05_tooling_continuation(
+    *,
+    authorization_path: Path,
+    from_tooling_commit: str,
+    from_tooling_tree: str,
+    to_tooling_commit: str,
+    to_tooling_tree: str,
+    revision_checker: Callable[[], Mapping[str, object]] | None = None,
+) -> dict[str, object]:
+    values = (
+        from_tooling_commit,
+        from_tooling_tree,
+        to_tooling_commit,
+        to_tooling_tree,
+    )
+    if any(not _is_sha(value, 40) for value in values) or (
+        from_tooling_commit,
+        from_tooling_tree,
+    ) == (to_tooling_commit, to_tooling_tree):
+        raise V4ExecutionError("V4_ATTEMPT05_TOOLING_CONTINUATION_INVALID")
+    context = load_attempt05_authorized_context(authorization_path=authorization_path)
+    recovery = validate_attempt05_recovery_revision(
+        authorization_path=authorization_path,
+    )
+    if (
+        recovery.get("to_tooling_commit") != from_tooling_commit
+        or recovery.get("to_tooling_tree") != from_tooling_tree
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_CONTINUATION_SOURCE_REVISION_MISMATCH")
+    path = _tooling_continuation_path(
+        context,
+        tooling_commit=to_tooling_commit,
+        tooling_tree=to_tooling_tree,
+    )
+    if path.exists():
+        return validate_attempt05_tooling_continuation(
+            authorization_path=authorization_path,
+            from_tooling_commit=from_tooling_commit,
+            from_tooling_tree=from_tooling_tree,
+            expected_tooling_commit=to_tooling_commit,
+            expected_tooling_tree=to_tooling_tree,
+        )
+    if path.with_name(path.name + ".partial").exists():
+        raise V4ExecutionError("V4_ATTEMPT05_TOOLING_CONTINUATION_IMMUTABLE")
+    other_continuations = tuple(
+        candidate
+        for candidate in context.artifact_root.glob(
+            "v4-attempt05-tooling-continuation-*.json"
+        )
+        if candidate != path
+    )
+    if other_continuations:
+        raise V4ExecutionError("V4_ATTEMPT05_TOOLING_CONTINUATION_IMMUTABLE")
+    _block_partial_outputs(context.run_root)
+    actual_revision = _validate_actual_revision(
+        (revision_checker or _default_revision_checker)(),
+        attempt05_tooling_commit=to_tooling_commit,
+        attempt05_tooling_tree=to_tooling_tree,
+    )
+    totals = rehydrate_attempt05_ledger_totals(context.gpu_ledger_path)
+    if (
+        not totals.run_started
+        or totals.finalized
+        or totals.failed_units != 0
+        or totals.calibration_units_completed != 40
+        or not 1 <= totals.scientific_units_completed < 400
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_BOUNDARY_INVALID")
+    rows = _read_ledger_rows(context.gpu_ledger_path)
+    if any(
+        row.get("event_type") == "TOOLING_CONTINUATION_REVISION"
+        for row in rows
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_TOOLING_CONTINUATION_IMMUTABLE")
+    ledger_head = str(rows[-1]["event_sha256"])
+    payload: dict[str, object] = {
+        "schema_version": TOOLING_CONTINUATION_SCHEMA,
+        "attempt_id": ATTEMPT_ID,
+        "reason_code": TOOLING_CONTINUATION_REASON,
+        "attempt04_authorization_sha256": context.authorization_sha256,
+        "from_tooling_commit": from_tooling_commit,
+        "from_tooling_tree": from_tooling_tree,
+        "to_tooling_commit": to_tooling_commit,
+        "to_tooling_tree": to_tooling_tree,
+        "recovery_revision_sha256": recovery["recovery_revision_sha256"],
+        "recovery_revision_file_sha256": recovery["file_sha256"],
+        "ledger_head_before_continuation": ledger_head,
+        "actual_tooling_revision": actual_revision,
+        "existing_artifacts_are_read_only": True,
+        "retry_count": 0,
+    }
+    payload["tooling_continuation_sha256"] = _sha256_json(payload)
+    _write_immutable_json(path, payload)
+    append_attempt05_ledger_event(
+        ledger_path=context.gpu_ledger_path,
+        event_type="TOOLING_CONTINUATION_REVISION",
+        payload={
+            "continuation_path": str(path),
+            "continuation_file_sha256": _sha256_file(path),
+            "from_tooling_commit": from_tooling_commit,
+            "from_tooling_tree": from_tooling_tree,
+            "to_tooling_commit": to_tooling_commit,
+            "to_tooling_tree": to_tooling_tree,
+            "gpu_inference_seconds_total": totals.gpu_inference_seconds,
+            "wall_runtime_seconds_total": totals.wall_runtime_seconds,
+            "logical_bytes_total": totals.logical_bytes,
+            "allocated_bytes_total": totals.allocated_bytes,
+            "peak_memory_mb_total": totals.peak_memory_mb,
+            "resource_accounting_mode": "TOTAL",
+            "retry_count": 0,
+        },
+    )
+    return validate_attempt05_tooling_continuation(
+        authorization_path=authorization_path,
+        from_tooling_commit=from_tooling_commit,
+        from_tooling_tree=from_tooling_tree,
+        expected_tooling_commit=to_tooling_commit,
+        expected_tooling_tree=to_tooling_tree,
+    )
+
+
+def _validate_attempt05_resume_tooling_lineage(
+    context: Attempt05AuthorizedContext,
+    *,
+    preflight: Mapping[str, object],
+    expected_tooling_commit: str,
+    expected_tooling_tree: str,
+    expected_source_commit: str | None = None,
+    expected_source_tree: str | None = None,
+) -> dict[str, object]:
+    source_commit = str(preflight.get("attempt05_tooling_commit"))
+    source_tree = str(preflight.get("attempt05_tooling_tree"))
+    if expected_source_commit is not None and (
+        source_commit != expected_source_commit
+        or source_tree != expected_source_tree
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_SOURCE_REVISION_MISMATCH")
+    if (source_commit, source_tree) == (
+        expected_tooling_commit,
+        expected_tooling_tree,
+    ):
+        return dict(preflight)
+    recovery = validate_attempt05_recovery_revision(
+        authorization_path=context.authorization_path,
+    )
+    if (
+        recovery.get("from_tooling_commit") != source_commit
+        or recovery.get("from_tooling_tree") != source_tree
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_SOURCE_REVISION_MISMATCH")
+    if (
+        recovery.get("to_tooling_commit") == expected_tooling_commit
+        and recovery.get("to_tooling_tree") == expected_tooling_tree
+    ):
+        return recovery
+    continuation = validate_attempt05_tooling_continuation(
+        authorization_path=context.authorization_path,
+        from_tooling_commit=str(recovery["to_tooling_commit"]),
+        from_tooling_tree=str(recovery["to_tooling_tree"]),
+        expected_tooling_commit=expected_tooling_commit,
+        expected_tooling_tree=expected_tooling_tree,
+    )
+    return continuation
 
 def create_attempt05_recovery_revision(
     *,
@@ -1235,18 +1477,17 @@ def create_attempt05_q90_freeze_artifact(
             existing.get("attempt05_tooling_commit") != attempt05_tooling_commit
             or existing.get("attempt05_tooling_tree") != attempt05_tooling_tree
         ):
-            recovery = validate_attempt05_recovery_revision(
-                authorization_path=authorization_path,
+            _validate_attempt05_resume_tooling_lineage(
+                context,
+                preflight=validate_attempt05_execution_preflight(
+                    _preflight_path(context),
+                    authorization_path=authorization_path,
+                ),
                 expected_tooling_commit=attempt05_tooling_commit,
                 expected_tooling_tree=attempt05_tooling_tree,
+                expected_source_commit=str(existing["attempt05_tooling_commit"]),
+                expected_source_tree=str(existing["attempt05_tooling_tree"]),
             )
-            if (
-                recovery.get("from_tooling_commit")
-                != existing.get("attempt05_tooling_commit")
-                or recovery.get("from_tooling_tree")
-                != existing.get("attempt05_tooling_tree")
-            ):
-                raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_SOURCE_REVISION_MISMATCH")
         return existing
     payload: dict[str, object] = {
         "schema_version": Q90_FREEZE_SCHEMA,
@@ -1503,6 +1744,7 @@ def rehydrate_attempt05_ledger_totals(ledger_path: Path) -> Attempt05LedgerResum
             if resource_accounting_mode not in (
                 None,
                 "ARTIFACT_ONLY_WITH_RUN_BASELINE",
+                "TOTAL",
             ):
                 raise V4ExecutionError(
                     "V4_ATTEMPT05_LEDGER_RESOURCE_ACCOUNTING_MODE_MISMATCH"

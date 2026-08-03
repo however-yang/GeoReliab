@@ -724,6 +724,48 @@ def test_recovery_revision_preserves_old_evidence_and_allows_truthful_resume(
         expected_tooling_commit=new_commit,
         expected_tooling_tree=new_tree,
     )
+    continuation_commit = "5" * 40
+    continuation_tree = "6" * 40
+    continuation = attempt05.create_attempt05_tooling_continuation(
+        authorization_path=authorization_path,
+        from_tooling_commit=new_commit,
+        from_tooling_tree=new_tree,
+        to_tooling_commit=continuation_commit,
+        to_tooling_tree=continuation_tree,
+        revision_checker=lambda: _revision(
+            commit=continuation_commit,
+            tree=continuation_tree,
+        ),
+    )
+    assert continuation["existing_artifacts_are_read_only"] is True
+    assert attempt05.create_attempt05_tooling_continuation(
+        authorization_path=authorization_path,
+        from_tooling_commit=new_commit,
+        from_tooling_tree=new_tree,
+        to_tooling_commit=continuation_commit,
+        to_tooling_tree=continuation_tree,
+    )["tooling_continuation_sha256"] == continuation[
+        "tooling_continuation_sha256"
+    ]
+    resumed_continuation = attempt05.create_attempt05_start_receipt(
+        authorization_path=authorization_path,
+        schedule=schedule,
+        model_independent_states=tuple(object() for _ in range(200)),
+        split_assignment=object(),
+        calibration_schedule=_calibration_schedule(),
+        resume=True,
+        attempt05_tooling_commit=continuation_commit,
+        attempt05_tooling_tree=continuation_tree,
+        input_storage=_input_storage(),
+    )
+    assert resumed_continuation["attempt05_tooling_commit"] == COMMIT
+    attempt05.validate_attempt05_tooling_continuation(
+        authorization_path=authorization_path,
+        from_tooling_commit=new_commit,
+        from_tooling_tree=new_tree,
+        expected_tooling_commit=continuation_commit,
+        expected_tooling_tree=continuation_tree,
+    )
     assert Path(context.run_root / "v4-attempt05-start-receipt.json").read_bytes() == old_start
     assert Path(freeze["q90_freeze_artifact_path"]).read_bytes() == old_q90
 
