@@ -184,10 +184,10 @@ def test_assigned_support_assets_refuse_conflicting_existing_file(
 
 def test_official_member_identity_excludes_local_materialization_prefixes() -> None:
     assert _official_gt_member(1) == "Points/stl/stl001_total.ply"
-    assert _official_mask_member(1) == "SampleSet/MVS Data/ObsMask/ObsMask1_10.mat"
+    assert _official_mask_member(1) == "MVS Data/ObsMask/ObsMask1_10.mat"
     assert (
         _official_camera_member(1)
-        == "SampleSet/MVS Data/Calibration/cal18/pos_001.txt"
+        == "MVS Data/Calibration/cal18/pos_001.txt"
     )
 
 

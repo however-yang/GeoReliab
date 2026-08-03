@@ -242,11 +242,14 @@ def _official_gt_member(scene_id: int) -> str:
 
 
 def _official_mask_member(scene_id: int) -> str:
-    return f"SampleSet/MVS Data/ObsMask/ObsMask{scene_id}_10.mat"
+    # AssetEvidence uses the official dataset member identity below the
+    # SampleSet archive container. The archive-only prefix remains in the
+    # extraction receipt, but is not part of counterfactual identity.
+    return f"MVS Data/ObsMask/ObsMask{scene_id}_10.mat"
 
 
 def _official_camera_member(view_id: int) -> str:
-    return f"SampleSet/MVS Data/Calibration/cal18/pos_{view_id:03d}.txt"
+    return f"MVS Data/Calibration/cal18/pos_{view_id:03d}.txt"
 
 
 def _rgb_path(root: Path, scene_id: int, view_id: int, state_id: str) -> Path:
