@@ -290,6 +290,8 @@ def test_attempt05_launcher_binds_future_tooling_revision_fail_closed() -> None:
     assert "if [[ $# -ne 7 && $# -ne 9 ]]" in script
     assert "v4-attempt05-authorize-recovery" in script
     assert 'recovery_from_commit="${8:-}"' in script
+    assert 'reusing immutable validated input closure' in script
+    assert 'V4_ATTEMPT05_INPUT_CLOSURE_RESUME_BOUNDARY_INVALID' in script
     assert "actual_commit=\"$(git rev-parse HEAD)\"" in script
     assert "actual_tree=\"$(git rev-parse 'HEAD^{tree}')\"" in script
     assert "V4_ATTEMPT05_TOOLING_REVISION_REQUIRED" in script

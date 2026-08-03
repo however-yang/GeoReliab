@@ -84,12 +84,20 @@ if [[ -n "$recovery_from_commit" || -n "$recovery_from_tree" ]]; then
     --to-tooling-tree "$expected_tooling_tree"
 fi
 
-"$python" -m georeliab_mve v4-attempt05-prepare-inputs \
-  --authorization "$authorization" \
-  --dtu-root "$dtu_root" \
-  --rectified-closure-manifest "$rectified_closure_manifest" \
-  --fog-root "$fog_root" \
-  --output-dir "$input_closure_dir"
+if [[ -e "$input_closure_dir" || -e "${input_closure_dir}.partial" ]]; then
+  if [[ ! -d "$input_closure_dir" || -e "${input_closure_dir}.partial" ]]; then
+    echo "V4_MVE_FAILED_WITH_REASON=V4_ATTEMPT05_INPUT_CLOSURE_RESUME_BOUNDARY_INVALID" >&2
+    exit 2
+  fi
+  info "reusing immutable validated input closure: $input_closure_dir"
+else
+  "$python" -m georeliab_mve v4-attempt05-prepare-inputs \
+    --authorization "$authorization" \
+    --dtu-root "$dtu_root" \
+    --rectified-closure-manifest "$rectified_closure_manifest" \
+    --fog-root "$fog_root" \
+    --output-dir "$input_closure_dir"
+fi
 
 "$python" -m georeliab_mve v4-attempt05-preflight \
   --authorization "$authorization" \
