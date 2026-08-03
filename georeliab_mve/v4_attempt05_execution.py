@@ -61,6 +61,21 @@ LEDGER_SCHEMA = "georeliab-v4-attempt-05-hash-chain-ledger-1.0"
 DTU_PROJECTION_SCHEMA = "georeliab-v4-attempt-05-dtu-projection-c2w-1.0"
 Q90_FREEZE_SCHEMA = "georeliab-v4-attempt-05-q90-freeze-1.0"
 PREFLIGHT_SCHEMA = "georeliab-v4-attempt-05-execution-preflight-1.0"
+RECOVERY_REVISION_SCHEMA = "georeliab-v4-attempt-05-recovery-revision-1.0"
+RECOVERY_REASON = "V4_ATTEMPT05_STATE_PATH_COLLISION_RECOVERY"
+_RECOVERABLE_LEGACY_BUNDLE_MEMBERS = frozenset(
+    {
+        "audit_record.json",
+        "dense_audit.npz",
+        "geometry_prediction.npz",
+        "gt_points.npz",
+        "native_confidence.npz",
+        "prediction_artifact.json",
+        "run_manifest.json",
+        "task_audit_record.json",
+        "valid_mask.npz",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,6 +409,10 @@ def _preflight_path(context: Attempt05AuthorizedContext) -> Path:
     return context.run_root / "v4-attempt05-execution-preflight.json"
 
 
+def _recovery_revision_path(context: Attempt05AuthorizedContext) -> Path:
+    return context.artifact_root / "v4-attempt05-recovery-revision.json"
+
+
 def _sample_device(sample: Mapping[str, object]) -> Mapping[str, object]:
     devices = sample.get("devices")
     if not isinstance(devices, Sequence) or isinstance(devices, (str, bytes, bytearray)) or len(devices) != 1:
@@ -655,15 +674,33 @@ def create_attempt05_start_receipt(
     tooling_tree = attempt05_tooling_tree
     if not _is_sha(tooling_commit, 40) or not _is_sha(tooling_tree, 40):
         raise V4ExecutionError("V4_ATTEMPT05_TOOLING_REVISION_REQUIRED")
-    preflight = validate_attempt05_execution_preflight(_preflight_path(context), authorization_path=authorization_path)
+    preflight = validate_attempt05_execution_preflight(
+        _preflight_path(context), authorization_path=authorization_path
+    )
+    receipt_path = _start_receipt_path(context)
+    if resume:
+        if (
+            preflight.get("attempt05_tooling_commit") != tooling_commit
+            or preflight.get("attempt05_tooling_tree") != tooling_tree
+        ):
+            recovery = validate_attempt05_recovery_revision(
+                authorization_path=authorization_path,
+                expected_tooling_commit=tooling_commit,
+                expected_tooling_tree=tooling_tree,
+            )
+            if (
+                recovery.get("from_tooling_commit")
+                != preflight.get("attempt05_tooling_commit")
+                or recovery.get("from_tooling_tree")
+                != preflight.get("attempt05_tooling_tree")
+            ):
+                raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_SOURCE_REVISION_MISMATCH")
+        return _load_start_receipt(context)
     if (
         preflight.get("attempt05_tooling_commit") != tooling_commit
         or preflight.get("attempt05_tooling_tree") != tooling_tree
     ):
         raise V4ExecutionError("V4_ATTEMPT05_PREFLIGHT_TOOLING_MISMATCH")
-    receipt_path = _start_receipt_path(context)
-    if resume:
-        return _load_start_receipt(context)
     closure = _cpu_input_closure(
         schedule=schedule,
         model_independent_states=model_independent_states,
@@ -780,6 +817,346 @@ def _load_start_receipt(context: Attempt05AuthorizedContext) -> dict[str, Any]:
     return payload
 
 
+def _scientific_legacy_inventory(
+    context: Attempt05AuthorizedContext,
+) -> tuple[dict[str, object], ...]:
+    root = context.run_root / "stage" / "SCIENTIFIC_MVE" / "records"
+    rows: list[dict[str, object]] = []
+    if not root.exists():
+        return ()
+    for path in sorted(
+        candidate
+        for candidate in root.rglob("*")
+        if candidate.is_file()
+        and candidate.name in _RECOVERABLE_LEGACY_BUNDLE_MEMBERS
+    ):
+        if ".partial" in path.name:
+            raise V4ExecutionError("V4_ATTEMPT05_RESUME_PARTIAL_BLOCKED")
+        rows.append(
+            {
+                "relative_path": path.relative_to(context.run_root).as_posix(),
+                "bytes": path.stat().st_size,
+                "sha256": _sha256_file(path),
+            }
+        )
+    return tuple(rows)
+
+
+def validate_attempt05_recovery_revision(
+    *,
+    authorization_path: Path,
+    expected_tooling_commit: str | None = None,
+    expected_tooling_tree: str | None = None,
+) -> dict[str, object]:
+    context = load_attempt05_authorized_context(authorization_path=authorization_path)
+    path = _recovery_revision_path(context)
+    payload = _load_json(path)
+    digest = payload.get("recovery_revision_sha256")
+    unsigned = {
+        key: value for key, value in payload.items() if key != "recovery_revision_sha256"
+    }
+    if (
+        payload.get("schema_version") != RECOVERY_REVISION_SCHEMA
+        or payload.get("attempt_id") != ATTEMPT_ID
+        or payload.get("reason_code") != RECOVERY_REASON
+        or payload.get("attempt04_authorization_sha256") != context.authorization_sha256
+        or not _is_sha(payload.get("from_tooling_commit"), 40)
+        or not _is_sha(payload.get("from_tooling_tree"), 40)
+        or not _is_sha(payload.get("to_tooling_commit"), 40)
+        or not _is_sha(payload.get("to_tooling_tree"), 40)
+        or not _is_sha(payload.get("ledger_head_before_recovery"))
+        or not _is_sha(payload.get("legacy_inventory_sha256"))
+        or not _is_sha(digest)
+        or _sha256_json(unsigned) != digest
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_REVISION_TAMPER")
+    hardware = payload.get("recovery_hardware_preflight")
+    if not isinstance(hardware, Mapping):
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_PREFLIGHT_TAMPER")
+    samples = hardware.get("samples")
+    probe = hardware.get("cuda_mapping_probe")
+    if (
+        hardware.get("actual_tooling_revision")
+        != {
+            "commit": payload.get("to_tooling_commit"),
+            "tree": payload.get("to_tooling_tree"),
+            "clean": True,
+        }
+        or hardware.get("authorized_gpu") != dict(context.selected_gpu)
+        or hardware.get("sample_count") != 3
+        or hardware.get("sample_interval_seconds") != 5.0
+        or not isinstance(samples, list)
+        or len(samples) != 3
+        or not isinstance(probe, Mapping)
+        or probe.get("visible_device_count") != 1
+        or probe.get("mapped_uuid") != context.selected_gpu.get("uuid")
+        or probe.get("mapped_pci_bus_id") != context.selected_gpu.get("pci_bus_id")
+        or probe.get("checkpoint_loads") != 0
+        or probe.get("model_loads") != 0
+        or probe.get("model_forwards") != 0
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_PREFLIGHT_TAMPER")
+    stable_memory: tuple[int, int] | None = None
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, Mapping):
+            raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_PREFLIGHT_TAMPER")
+        memory = (
+            sample.get("total_memory_bytes"),
+            sample.get("free_memory_bytes"),
+        )
+        if (
+            sample.get("sample_index") != index
+            or sample.get("uuid") != context.selected_gpu.get("uuid")
+            or sample.get("pci_bus_id") != context.selected_gpu.get("pci_bus_id")
+            or sample.get("index") != context.selected_gpu.get("index")
+            or sample.get("utilization_gpu_percent") != 0
+            or sample.get("compute_process_count") != 0
+            or type(memory[0]) is not int
+            or type(memory[1]) is not int
+            or memory[1] < 16 * 1024 * 1024 * 1024
+            or (stable_memory is not None and memory != stable_memory)
+        ):
+            raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_PREFLIGHT_TAMPER")
+        stable_memory = memory
+    if (
+        expected_tooling_commit is not None
+        and payload.get("to_tooling_commit") != expected_tooling_commit
+    ) or (
+        expected_tooling_tree is not None
+        and payload.get("to_tooling_tree") != expected_tooling_tree
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_REVISION_MISMATCH")
+    start = _load_start_receipt(context)
+    preflight = validate_attempt05_execution_preflight(
+        _preflight_path(context), authorization_path=authorization_path
+    )
+    q90 = validate_attempt05_q90_freeze_artifact(
+        _q90_freeze_path(context), authorization_path=authorization_path
+    )
+    if any(
+        artifact.get("attempt05_tooling_commit") != payload["from_tooling_commit"]
+        or artifact.get("attempt05_tooling_tree") != payload["from_tooling_tree"]
+        for artifact in (start, preflight, q90)
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_SOURCE_REVISION_MISMATCH")
+    inventory = _scientific_legacy_inventory(context)
+    if (
+        payload.get("legacy_inventory") != list(inventory)
+        or payload.get("legacy_inventory_sha256") != _sha256_json(inventory)
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_LEGACY_INVENTORY_MISMATCH")
+    rows = _read_ledger_rows(context.gpu_ledger_path)
+    matching_events = [
+        row for row in rows if row.get("event_type") == "TOOLING_RECOVERY_REVISION"
+    ]
+    if len(matching_events) != 1:
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_LEDGER_EVENT_REQUIRED")
+    event_payload = matching_events[0].get("payload")
+    if not isinstance(event_payload, Mapping) or (
+        event_payload.get("recovery_revision_file_sha256") != _sha256_file(path)
+        or event_payload.get("from_tooling_commit") != payload["from_tooling_commit"]
+        or event_payload.get("to_tooling_commit") != payload["to_tooling_commit"]
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_LEDGER_EVENT_MISMATCH")
+    return {
+        **payload,
+        "recovery_revision_path": str(path),
+        "file_sha256": _sha256_file(path),
+    }
+
+
+def create_attempt05_recovery_revision(
+    *,
+    authorization_path: Path,
+    from_tooling_commit: str,
+    from_tooling_tree: str,
+    to_tooling_commit: str,
+    to_tooling_tree: str,
+    reason_code: str = RECOVERY_REASON,
+    nvidia_smi_sampler: Callable[[], Mapping[str, object]] | None = None,
+    sleeper: Callable[[float], object] | None = None,
+    cuda_mapping_probe: Callable[[], Mapping[str, object]] | None = None,
+    revision_checker: Callable[[], Mapping[str, object]] | None = None,
+) -> dict[str, object]:
+    if reason_code != RECOVERY_REASON or any(
+        not _is_sha(value, 40)
+        for value in (
+            from_tooling_commit,
+            from_tooling_tree,
+            to_tooling_commit,
+            to_tooling_tree,
+        )
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_REVISION_INVALID")
+    if (from_tooling_commit, from_tooling_tree) == (
+        to_tooling_commit,
+        to_tooling_tree,
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_REVISION_INVALID")
+    context = load_attempt05_authorized_context(authorization_path=authorization_path)
+    path = _recovery_revision_path(context)
+    if path.exists():
+        existing = validate_attempt05_recovery_revision(
+            authorization_path=authorization_path,
+            expected_tooling_commit=to_tooling_commit,
+            expected_tooling_tree=to_tooling_tree,
+        )
+        if (
+            existing.get("from_tooling_commit") != from_tooling_commit
+            or existing.get("from_tooling_tree") != from_tooling_tree
+        ):
+            raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_SOURCE_REVISION_MISMATCH")
+        return existing
+    if path.with_name(path.name + ".partial").exists():
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_REVISION_IMMUTABLE")
+    _block_partial_outputs(context.run_root)
+    if (
+        nvidia_smi_sampler is None
+        or sleeper is None
+        or cuda_mapping_probe is None
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_PREFLIGHT_REQUIRED")
+    start = _load_start_receipt(context)
+    preflight = validate_attempt05_execution_preflight(
+        _preflight_path(context), authorization_path=authorization_path
+    )
+    q90 = validate_attempt05_q90_freeze_artifact(
+        _q90_freeze_path(context), authorization_path=authorization_path
+    )
+    if any(
+        artifact.get("attempt05_tooling_commit") != from_tooling_commit
+        or artifact.get("attempt05_tooling_tree") != from_tooling_tree
+        for artifact in (start, preflight, q90)
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_SOURCE_REVISION_MISMATCH")
+    actual_revision = _validate_actual_revision(
+        (revision_checker or _default_revision_checker)(),
+        attempt05_tooling_commit=to_tooling_commit,
+        attempt05_tooling_tree=to_tooling_tree,
+    )
+    selected = context.selected_gpu
+    samples: list[dict[str, object]] = []
+    stable_memory: tuple[int, int] | None = None
+    for index in range(3):
+        raw = nvidia_smi_sampler()
+        if not isinstance(raw, Mapping):
+            raise V4ExecutionError("V4_ATTEMPT05_PREFLIGHT_SAMPLE_INVALID")
+        device = _sample_device(raw)
+        total = device.get("total_memory_bytes")
+        free = device.get("free_memory_bytes")
+        memory = (total, free)
+        if (
+            device.get("uuid") != selected.get("uuid")
+            or device.get("pci_bus_id") != selected.get("pci_bus_id")
+            or device.get("index") != selected.get("index")
+        ):
+            raise V4ExecutionError("V4_ATTEMPT05_PREFLIGHT_GPU_IDENTITY_MISMATCH")
+        if _compute_process_count(device) != 0:
+            raise V4ExecutionError("V4_ATTEMPT05_PREFLIGHT_COMPUTE_PROCESS_PRESENT")
+        if device.get("utilization_gpu_percent") != 0:
+            raise V4ExecutionError("V4_ATTEMPT05_PREFLIGHT_GPU_NOT_IDLE")
+        if (
+            type(total) is not int
+            or type(free) is not int
+            or free < 16 * 1024 * 1024 * 1024
+            or (stable_memory is not None and memory != stable_memory)
+        ):
+            raise V4ExecutionError("V4_ATTEMPT05_PREFLIGHT_MEMORY_NOT_STABLE")
+        stable_memory = (total, free)
+        samples.append(
+            {
+                "sample_index": index,
+                "uuid": str(device["uuid"]),
+                "pci_bus_id": str(device["pci_bus_id"]),
+                "index": int(device["index"]),
+                "utilization_gpu_percent": 0,
+                "total_memory_bytes": total,
+                "free_memory_bytes": free,
+                "compute_process_count": 0,
+            }
+        )
+        if index != 2:
+            sleeper(5.0)
+    probe = cuda_mapping_probe()
+    if (
+        not isinstance(probe, Mapping)
+        or probe.get("visible_device_count") != 1
+        or probe.get("mapped_uuid") != selected.get("uuid")
+        or probe.get("mapped_pci_bus_id") != selected.get("pci_bus_id")
+        or probe.get("checkpoint_loads") != 0
+        or probe.get("model_loads") != 0
+        or probe.get("model_forwards") != 0
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_CUDA_MAPPING_PROBE_INVALID")
+    totals = rehydrate_attempt05_ledger_totals(context.gpu_ledger_path)
+    if (
+        not totals.run_started
+        or totals.finalized
+        or totals.failed_units != 0
+        or totals.calibration_units_completed != 40
+        or not 1 <= totals.scientific_units_completed < 400
+    ):
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_BOUNDARY_INVALID")
+    rows = _read_ledger_rows(context.gpu_ledger_path)
+    if any(row.get("event_type") == "TOOLING_RECOVERY_REVISION" for row in rows):
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_REVISION_IMMUTABLE")
+    inventory = _scientific_legacy_inventory(context)
+    if not inventory:
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_LEGACY_INVENTORY_REQUIRED")
+    ledger_head = str(rows[-1]["event_sha256"])
+    payload: dict[str, object] = {
+        "schema_version": RECOVERY_REVISION_SCHEMA,
+        "attempt_id": ATTEMPT_ID,
+        "reason_code": reason_code,
+        "attempt04_authorization_sha256": context.authorization_sha256,
+        "from_tooling_commit": from_tooling_commit,
+        "from_tooling_tree": from_tooling_tree,
+        "to_tooling_commit": to_tooling_commit,
+        "to_tooling_tree": to_tooling_tree,
+        "start_receipt_file_sha256": _sha256_file(_start_receipt_path(context)),
+        "preflight_file_sha256": _sha256_file(_preflight_path(context)),
+        "q90_freeze_file_sha256": _sha256_file(_q90_freeze_path(context)),
+        "ledger_head_before_recovery": ledger_head,
+        "calibration_units_completed": totals.calibration_units_completed,
+        "scientific_units_completed": totals.scientific_units_completed,
+        "legacy_inventory": list(inventory),
+        "legacy_inventory_sha256": _sha256_json(inventory),
+        "existing_artifacts_are_read_only": True,
+        "retry_count": 0,
+        "recovery_hardware_preflight": {
+            "actual_tooling_revision": actual_revision,
+            "authorized_gpu": dict(selected),
+            "sample_count": 3,
+            "sample_interval_seconds": 5.0,
+            "samples": samples,
+            "cuda_mapping_probe": dict(probe),
+        },
+    }
+    payload["recovery_revision_sha256"] = _sha256_json(payload)
+    _write_immutable_json(path, payload)
+    append_attempt05_ledger_event(
+        ledger_path=context.gpu_ledger_path,
+        event_type="TOOLING_RECOVERY_REVISION",
+        payload={
+            "recovery_revision_path": str(path),
+            "recovery_revision_file_sha256": _sha256_file(path),
+            "from_tooling_commit": from_tooling_commit,
+            "to_tooling_commit": to_tooling_commit,
+            "gpu_inference_seconds_total": totals.gpu_inference_seconds,
+            "wall_runtime_seconds_total": totals.wall_runtime_seconds,
+            "logical_bytes_total": totals.logical_bytes,
+            "allocated_bytes_total": totals.allocated_bytes,
+            "peak_memory_mb_total": totals.peak_memory_mb,
+            "retry_count": 0,
+        },
+    )
+    return validate_attempt05_recovery_revision(
+        authorization_path=authorization_path,
+        expected_tooling_commit=to_tooling_commit,
+        expected_tooling_tree=to_tooling_tree,
+    )
+
+
 
 def _q90_freeze_path(context: Attempt05AuthorizedContext) -> Path:
     return context.artifact_root / "v4-attempt05-q90-freeze.json"
@@ -850,11 +1227,25 @@ def create_attempt05_q90_freeze_artifact(
         existing = validate_attempt05_q90_freeze_artifact(path, authorization_path=authorization_path)
         if (
             existing.get("calibration_schedule_sha256") != calibration_schedule_sha256
-            or existing.get("attempt05_tooling_commit") != attempt05_tooling_commit
-            or existing.get("attempt05_tooling_tree") != attempt05_tooling_tree
             or existing.get("q90_calibrations") != expected_rows
         ):
             raise V4ExecutionError("V4_ATTEMPT05_Q90_FREEZE_MISMATCH")
+        if (
+            existing.get("attempt05_tooling_commit") != attempt05_tooling_commit
+            or existing.get("attempt05_tooling_tree") != attempt05_tooling_tree
+        ):
+            recovery = validate_attempt05_recovery_revision(
+                authorization_path=authorization_path,
+                expected_tooling_commit=attempt05_tooling_commit,
+                expected_tooling_tree=attempt05_tooling_tree,
+            )
+            if (
+                recovery.get("from_tooling_commit")
+                != existing.get("attempt05_tooling_commit")
+                or recovery.get("from_tooling_tree")
+                != existing.get("attempt05_tooling_tree")
+            ):
+                raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_SOURCE_REVISION_MISMATCH")
         return existing
     payload: dict[str, object] = {
         "schema_version": Q90_FREEZE_SCHEMA,

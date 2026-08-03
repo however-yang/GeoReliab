@@ -287,7 +287,9 @@ def test_attempt05_launcher_binds_future_tooling_revision_fail_closed() -> None:
 
     assert "b7faf490280c50bc821ab157e035a68bc64a3090" not in script
     assert "EXPECTED_TOOLING_COMMIT EXPECTED_TOOLING_TREE" in script
-    assert "if [[ $# -ne 7 ]]" in script
+    assert "if [[ $# -ne 7 && $# -ne 9 ]]" in script
+    assert "v4-attempt05-authorize-recovery" in script
+    assert 'recovery_from_commit="${8:-}"' in script
     assert "actual_commit=\"$(git rev-parse HEAD)\"" in script
     assert "actual_tree=\"$(git rev-parse 'HEAD^{tree}')\"" in script
     assert "V4_ATTEMPT05_TOOLING_REVISION_REQUIRED" in script

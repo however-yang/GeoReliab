@@ -7,8 +7,8 @@ set -euo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 . "${SCRIPT_DIR}/common.sh"
 
-if [[ $# -ne 7 ]]; then
-  echo "usage: $0 AUTHORIZATION DTU_ROOT RECTIFIED_CLOSURE_MANIFEST FOG_ROOT INPUT_CLOSURE_DIR EXPECTED_TOOLING_COMMIT EXPECTED_TOOLING_TREE" >&2
+if [[ $# -ne 7 && $# -ne 9 ]]; then
+  echo "usage: $0 AUTHORIZATION DTU_ROOT RECTIFIED_CLOSURE_MANIFEST FOG_ROOT INPUT_CLOSURE_DIR EXPECTED_TOOLING_COMMIT EXPECTED_TOOLING_TREE [RECOVERY_FROM_COMMIT RECOVERY_FROM_TREE]" >&2
   exit 2
 fi
 
@@ -19,6 +19,8 @@ fog_root="$4"
 input_closure_dir="$5"
 expected_tooling_commit="$6"
 expected_tooling_tree="$7"
+recovery_from_commit="${8:-}"
+recovery_from_tree="${9:-}"
 overlay=${GEORELIAB_OVERLAY:-${GEORELIAB_PROJECT_ROOT}/${DEFAULT_OVERLAY}}
 
 cd "${GEORELIAB_PROJECT_ROOT}"
@@ -69,6 +71,19 @@ if [[ "$resolved_gpu" != "$expected_gpu" ]]; then
   exit 2
 fi
 
+if [[ -n "$recovery_from_commit" || -n "$recovery_from_tree" ]]; then
+  if [[ ! "$recovery_from_commit" =~ $sha40_re || ! "$recovery_from_tree" =~ $sha40_re ]]; then
+    echo "V4_MVE_FAILED_WITH_REASON=V4_ATTEMPT05_RECOVERY_REVISION_INVALID" >&2
+    exit 2
+  fi
+  "$python" -m georeliab_mve v4-attempt05-authorize-recovery \
+    --authorization "$authorization" \
+    --from-tooling-commit "$recovery_from_commit" \
+    --from-tooling-tree "$recovery_from_tree" \
+    --to-tooling-commit "$expected_tooling_commit" \
+    --to-tooling-tree "$expected_tooling_tree"
+fi
+
 "$python" -m georeliab_mve v4-attempt05-prepare-inputs \
   --authorization "$authorization" \
   --dtu-root "$dtu_root" \
@@ -84,7 +99,8 @@ fi
   --calibration-schedule "$input_closure_dir/v4-calibration-l3-schedule-40.json" \
   --input-closure "$input_closure_dir/v4-attempt05-input-closure.json" \
   --tooling-commit "$expected_tooling_commit" \
-  --tooling-tree "$expected_tooling_tree"
+  --tooling-tree "$expected_tooling_tree" \
+  --resume
 
 "$python" -m georeliab_mve v4-attempt05-run \
   --authorization "$authorization" \

@@ -571,6 +571,186 @@ def test_q90_freeze_is_separate_immutable_post_calibration_artifact(
             attempt05_tooling_tree=TREE,
         )
 
+def test_recovery_revision_preserves_old_evidence_and_allows_truthful_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    schedule: ScientificSchedule,
+) -> None:
+    authorization_path = _patch_auth(monkeypatch, _authorization(tmp_path))
+    _create_preflight(authorization_path)
+    start = attempt05.create_attempt05_start_receipt(
+        authorization_path=authorization_path,
+        schedule=schedule,
+        model_independent_states=tuple(object() for _ in range(200)),
+        split_assignment=object(),
+        calibration_schedule=_calibration_schedule(),
+        attempt05_tooling_commit=COMMIT,
+        attempt05_tooling_tree=TREE,
+        input_storage=_input_storage(),
+    )
+    q90_rows = (
+        {
+            "model_id": "VGGT",
+            "state_id": "L3",
+            "scene_count": 20,
+            "quantile_probability": 0.90,
+            "quantile_method": "linear",
+            "alarm_threshold": 1.25,
+            "calibration_identifier": _sha("recovery:q90:vggt"),
+        },
+        {
+            "model_id": "MASt3R",
+            "state_id": "L3",
+            "scene_count": 20,
+            "quantile_probability": 0.90,
+            "quantile_method": "linear",
+            "alarm_threshold": 2.5,
+            "calibration_identifier": _sha("recovery:q90:mast3r"),
+        },
+    )
+    freeze = attempt05.create_attempt05_q90_freeze_artifact(
+        authorization_path=authorization_path,
+        calibration_schedule_sha256=start["calibration_schedule_sha256"],
+        q90_calibrations=q90_rows,
+        attempt05_tooling_commit=COMMIT,
+        attempt05_tooling_tree=TREE,
+    )
+    context = attempt05.load_attempt05_authorized_context(
+        authorization_path=authorization_path
+    )
+    attempt05.append_attempt05_ledger_event(
+        ledger_path=context.gpu_ledger_path,
+        event_type="MVE_RUN_STARTED",
+        payload={"gpu_inference_seconds_total": 0.0},
+    )
+    for index, row in enumerate(_calibration_schedule(), start=1):
+        attempt05.append_attempt05_ledger_event(
+            ledger_path=context.gpu_ledger_path,
+            event_type="CALIBRATION_UNIT_COMPLETE",
+            payload={
+                "model_id": row["model_id"],
+                "scene_id": row["scene_id"],
+                "state_id": "L3",
+                "gpu_inference_seconds_total": float(index),
+                "logical_bytes_total": index,
+                "allocated_bytes_total": index,
+            },
+        )
+    first = schedule.units[0]
+    attempt05.append_attempt05_ledger_event(
+        ledger_path=context.gpu_ledger_path,
+        event_type="SCIENTIFIC_UNIT_COMPLETE",
+        payload={
+            "model_id": first.model_id,
+            "scene_id": first.scene_id,
+            "state_id": first.state_id,
+            "status": "VALID_COMPLETE",
+            "gpu_inference_seconds_total": 41.0,
+            "logical_bytes_total": 41,
+            "allocated_bytes_total": 41,
+        },
+    )
+    legacy = (
+        context.run_root
+        / "stage"
+        / "SCIENTIFIC_MVE"
+        / "records"
+        / first.model_id
+        / f"scan{first.scene_id:03d}"
+    )
+    legacy.mkdir(parents=True)
+    (legacy / "task_audit_record.json").write_text(
+        "{\"immutable\":true}\n", encoding="utf-8"
+    )
+    old_start = Path(context.run_root / "v4-attempt05-start-receipt.json").read_bytes()
+    old_q90 = Path(freeze["q90_freeze_artifact_path"]).read_bytes()
+    new_commit = "3" * 40
+    new_tree = "4" * 40
+
+    recovery = attempt05.create_attempt05_recovery_revision(
+        authorization_path=authorization_path,
+        from_tooling_commit=COMMIT,
+        from_tooling_tree=TREE,
+        to_tooling_commit=new_commit,
+        to_tooling_tree=new_tree,
+        nvidia_smi_sampler=lambda: _sample(),
+        sleeper=lambda _seconds: None,
+        cuda_mapping_probe=lambda: {
+            "visible_device_count": 1,
+            "mapped_uuid": "GPU-attempt05",
+            "mapped_pci_bus_id": "00000000:17:00.0",
+            "checkpoint_loads": 0,
+            "model_loads": 0,
+            "model_forwards": 0,
+        },
+        revision_checker=lambda: _revision(
+            commit=new_commit,
+            tree=new_tree,
+        ),
+    )
+    assert recovery["scientific_units_completed"] == 1
+    assert recovery["existing_artifacts_are_read_only"] is True
+    assert attempt05.create_attempt05_recovery_revision(
+        authorization_path=authorization_path,
+        from_tooling_commit=COMMIT,
+        from_tooling_tree=TREE,
+        to_tooling_commit=new_commit,
+        to_tooling_tree=new_tree,
+    )["recovery_revision_sha256"] == recovery["recovery_revision_sha256"]
+    resumed = attempt05.create_attempt05_start_receipt(
+        authorization_path=authorization_path,
+        schedule=schedule,
+        model_independent_states=tuple(object() for _ in range(200)),
+        split_assignment=object(),
+        calibration_schedule=_calibration_schedule(),
+        resume=True,
+        attempt05_tooling_commit=new_commit,
+        attempt05_tooling_tree=new_tree,
+        input_storage=_input_storage(),
+    )
+    assert resumed["attempt05_tooling_commit"] == COMMIT
+    assert attempt05.create_attempt05_q90_freeze_artifact(
+        authorization_path=authorization_path,
+        calibration_schedule_sha256=start["calibration_schedule_sha256"],
+        q90_calibrations=q90_rows,
+        attempt05_tooling_commit=new_commit,
+        attempt05_tooling_tree=new_tree,
+    )["attempt05_tooling_commit"] == COMMIT
+    (legacy / f"{first.state_id}.json").write_text(
+        "{\"projection\":true}\n", encoding="utf-8"
+    )
+    attempt05.validate_attempt05_recovery_revision(
+        authorization_path=authorization_path,
+        expected_tooling_commit=new_commit,
+        expected_tooling_tree=new_tree,
+    )
+    assert Path(context.run_root / "v4-attempt05-start-receipt.json").read_bytes() == old_start
+    assert Path(freeze["q90_freeze_artifact_path"]).read_bytes() == old_q90
+
+
+def test_recovery_revision_rejects_partial_and_wrong_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authorization_path = _patch_auth(monkeypatch, _authorization(tmp_path))
+    context = attempt05.load_attempt05_authorized_context(
+        authorization_path=authorization_path
+    )
+    partial = context.run_root / "blocked.partial"
+    partial.parent.mkdir(parents=True)
+    partial.write_text("partial", encoding="utf-8")
+    with pytest.raises(
+        V4ExecutionError, match="V4_ATTEMPT05_RESUME_PARTIAL_BLOCKED"
+    ):
+        attempt05.create_attempt05_recovery_revision(
+            authorization_path=authorization_path,
+            from_tooling_commit=COMMIT,
+            from_tooling_tree=TREE,
+            to_tooling_commit="3" * 40,
+            to_tooling_tree="4" * 40,
+        )
+
+
 def test_resource_gate_enforces_targets_and_catastrophe_fuses() -> None:
     assert attempt05.evaluate_attempt05_resource_gate(
         gpu_inference_seconds=GPU_TARGET_SECONDS,
