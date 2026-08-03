@@ -110,6 +110,7 @@ from .v4_attempt05_execution import (
     finalize_attempt05_scientific_bundle,
     load_attempt05_authorized_context,
     rehydrate_attempt05_ledger_totals,
+    validate_attempt05_execution_preflight,
 )
 from .v4_attempt05_inputs import (
     prepare_attempt05_inputs,
@@ -364,6 +365,40 @@ def _attempt05_authorized_gpu_inventory(
     projected = dict(raw)
     projected["devices"] = [dict(matches[0])]
     return projected
+
+
+def _attempt05_get_or_create_preflight(
+    context: Any,
+    *,
+    authorization_path: Path,
+    tooling_commit: str,
+    tooling_tree: str,
+) -> Mapping[str, object]:
+    """Resume only from a validated immutable preflight boundary."""
+
+    preflight_path = context.run_root / "v4-attempt05-execution-preflight.json"
+    partial_path = preflight_path.with_name(preflight_path.name + ".partial")
+    if partial_path.exists():
+        raise V4ExecutionError("V4_ATTEMPT05_PREFLIGHT_PARTIAL_PRESENT")
+    if preflight_path.exists():
+        preflight = validate_attempt05_execution_preflight(
+            preflight_path,
+            authorization_path=authorization_path,
+        )
+        if (
+            preflight.get("attempt05_tooling_commit") != tooling_commit
+            or preflight.get("attempt05_tooling_tree") != tooling_tree
+        ):
+            raise V4ExecutionError("V4_ATTEMPT05_TOOLING_REVISION_MISMATCH")
+        return preflight
+    return create_attempt05_execution_preflight(
+        authorization_path=authorization_path,
+        attempt05_tooling_commit=tooling_commit,
+        attempt05_tooling_tree=tooling_tree,
+        nvidia_smi_sampler=lambda: _attempt05_authorized_gpu_inventory(context),
+        sleeper=time.sleep,
+        cuda_mapping_probe=lambda: _attempt05_cuda_mapping_probe(context),
+    )
 
 
 def _attempt05_cuda_mapping_probe(context: Any) -> Mapping[str, object]:
@@ -1455,15 +1490,11 @@ def main(argv: list[str] | None = None) -> int:
             input_storage["input_closure_sha256"] = _sha256_file(
                 args.input_closure
             )
-            preflight = create_attempt05_execution_preflight(
+            preflight = _attempt05_get_or_create_preflight(
+                context,
                 authorization_path=args.authorization,
-                attempt05_tooling_commit=args.tooling_commit,
-                attempt05_tooling_tree=args.tooling_tree,
-                nvidia_smi_sampler=lambda: _attempt05_authorized_gpu_inventory(
-                    context
-                ),
-                sleeper=time.sleep,
-                cuda_mapping_probe=lambda: _attempt05_cuda_mapping_probe(context),
+                tooling_commit=args.tooling_commit,
+                tooling_tree=args.tooling_tree,
             )
             receipt = create_attempt05_start_receipt(
                 authorization_path=args.authorization,

@@ -40,7 +40,8 @@ def _sha(label: str) -> str:
 
 def _input_storage() -> dict[str, object]:
     return {
-        "scope": "FOG_PNG_AND_INPUT_CLOSURE_PAYLOADS_EXCLUDING_MANIFEST",
+        "scope": "NEW_CALIBRATION_L3_FOG_PNG_AND_INPUT_CLOSURE_"
+        "PAYLOADS_EXCLUDING_MANIFEST",
         "logical_bytes": 0,
         "allocated_bytes": 0,
         "input_closure_sha256": "f" * 64,

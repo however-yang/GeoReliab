@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from georeliab_mve.cli import (
-    ATTEMPT05_COMMANDS, _attempt05_authorized_gpu_inventory, build_parser, main,
+    ATTEMPT05_COMMANDS,
+    _attempt05_authorized_gpu_inventory,
+    _attempt05_get_or_create_preflight,
+    build_parser,
+    main,
 )
 from georeliab_mve.v4_attempt05_execution import V4ExecutionError
 
@@ -105,6 +109,80 @@ def test_attempt05_gpu_inventory_requires_one_exact_authorized_match(devices) ->
     ):
         _attempt05_authorized_gpu_inventory(
             Context(), sampler=lambda: {"devices": devices}
+        )
+
+
+def test_attempt05_preflight_resume_reuses_validated_immutable_boundary(
+    monkeypatch, tmp_path
+) -> None:
+    preflight_path = tmp_path / "v4-attempt05-execution-preflight.json"
+    preflight_path.write_text("{}", encoding="utf-8")
+
+    class Context:
+        run_root = tmp_path
+
+    calls = {"validate": 0, "create": 0}
+
+    def validate(path, *, authorization_path):
+        calls["validate"] += 1
+        assert path == preflight_path
+        assert authorization_path == tmp_path / "authorization.json"
+        return {
+            "attempt05_tooling_commit": "a" * 40,
+            "attempt05_tooling_tree": "b" * 40,
+            "preflight_path": str(path),
+        }
+
+    monkeypatch.setattr(
+        "georeliab_mve.cli.validate_attempt05_execution_preflight", validate
+    )
+    monkeypatch.setattr(
+        "georeliab_mve.cli.create_attempt05_execution_preflight",
+        lambda **_kwargs: calls.__setitem__("create", calls["create"] + 1),
+    )
+
+    result = _attempt05_get_or_create_preflight(
+        Context(),
+        authorization_path=tmp_path / "authorization.json",
+        tooling_commit="a" * 40,
+        tooling_tree="b" * 40,
+    )
+
+    assert result["preflight_path"] == str(preflight_path)
+    assert calls == {"validate": 1, "create": 0}
+
+
+def test_attempt05_preflight_resume_rejects_partial_or_revision_drift(
+    monkeypatch, tmp_path
+) -> None:
+    class Context:
+        run_root = tmp_path
+
+    partial = tmp_path / "v4-attempt05-execution-preflight.json.partial"
+    partial.write_text("partial", encoding="utf-8")
+    with pytest.raises(V4ExecutionError, match="PREFLIGHT_PARTIAL_PRESENT"):
+        _attempt05_get_or_create_preflight(
+            Context(),
+            authorization_path=tmp_path / "authorization.json",
+            tooling_commit="a" * 40,
+            tooling_tree="b" * 40,
+        )
+    partial.unlink()
+    preflight = tmp_path / "v4-attempt05-execution-preflight.json"
+    preflight.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "georeliab_mve.cli.validate_attempt05_execution_preflight",
+        lambda *_args, **_kwargs: {
+            "attempt05_tooling_commit": "c" * 40,
+            "attempt05_tooling_tree": "b" * 40,
+        },
+    )
+    with pytest.raises(V4ExecutionError, match="TOOLING_REVISION_MISMATCH"):
+        _attempt05_get_or_create_preflight(
+            Context(),
+            authorization_path=tmp_path / "authorization.json",
+            tooling_commit="a" * 40,
+            tooling_tree="b" * 40,
         )
 
 

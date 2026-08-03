@@ -677,7 +677,8 @@ def create_attempt05_start_receipt(
     input_closure_sha256 = storage.get("input_closure_sha256")
     if (
         storage.get("scope")
-        != "FOG_PNG_AND_INPUT_CLOSURE_PAYLOADS_EXCLUDING_MANIFEST"
+        != "NEW_CALIBRATION_L3_FOG_PNG_AND_INPUT_CLOSURE_"
+        "PAYLOADS_EXCLUDING_MANIFEST"
         or
         type(logical_bytes) is not int
         or type(allocated_bytes) is not int
