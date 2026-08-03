@@ -751,6 +751,47 @@ def test_recovery_revision_rejects_partial_and_wrong_source(
         )
 
 
+def test_ledger_resume_normalizes_legacy_artifact_only_totals(tmp_path: Path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    attempt05.append_attempt05_ledger_event(
+        ledger_path=ledger,
+        event_type="MVE_RUN_STARTED",
+        payload={
+            "gpu_inference_seconds_total": 0.0,
+            "logical_bytes_total": 100,
+            "allocated_bytes_total": 200,
+        },
+    )
+    attempt05.append_attempt05_ledger_event(
+        ledger_path=ledger,
+        event_type="CALIBRATION_UNIT_COMPLETE",
+        payload={
+            "model_id": "VGGT",
+            "scene_id": 1,
+            "state_id": "L3",
+            "gpu_inference_seconds_total": 1.0,
+            "logical_bytes_total": 10,
+            "allocated_bytes_total": 20,
+        },
+    )
+    attempt05.append_attempt05_ledger_event(
+        ledger_path=ledger,
+        event_type="TOOLING_RECOVERY_REVISION",
+        payload={
+            "gpu_inference_seconds_total": 1.0,
+            "logical_bytes_total": 130,
+            "allocated_bytes_total": 240,
+            "resource_accounting_mode": "TOTAL",
+        },
+    )
+
+    totals = attempt05.rehydrate_attempt05_ledger_totals(ledger)
+
+    assert totals.resource_accounting_mode == "TOTAL"
+    assert totals.logical_bytes == 130
+    assert totals.allocated_bytes == 240
+
+
 def test_resource_gate_enforces_targets_and_catastrophe_fuses() -> None:
     assert attempt05.evaluate_attempt05_resource_gate(
         gpu_inference_seconds=GPU_TARGET_SECONDS,

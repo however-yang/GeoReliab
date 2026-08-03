@@ -1147,6 +1147,7 @@ def create_attempt05_recovery_revision(
             "logical_bytes_total": totals.logical_bytes,
             "allocated_bytes_total": totals.allocated_bytes,
             "peak_memory_mb_total": totals.peak_memory_mb,
+            "resource_accounting_mode": "TOTAL",
             "retry_count": 0,
         },
     )
@@ -1363,6 +1364,7 @@ class Attempt05LedgerResumeTotals:
     calibration_unit_keys: frozenset[tuple[str, int, str]] = frozenset()
     scientific_unit_keys: frozenset[tuple[str, int, str]] = frozenset()
     projection_unit_keys: frozenset[tuple[str, int, str]] = frozenset()
+    resource_accounting_mode: str = "TOTAL"
 
 
 def _payload_float(payload: Mapping[str, object], *names: str) -> float | None:
@@ -1404,6 +1406,11 @@ def rehydrate_attempt05_ledger_totals(ledger_path: Path) -> Attempt05LedgerResum
     calibration_unit_keys: set[tuple[str, int, str]] = set()
     scientific_unit_keys: set[tuple[str, int, str]] = set()
     projection_unit_keys: set[tuple[str, int, str]] = set()
+    baseline_logical = 0
+    baseline_allocated = 0
+    resource_accounting_mode: str | None = None
+    raw_logical_previous: int | None = None
+    raw_allocated_previous: int | None = None
     for row in rows:
         payload = row.get("payload")
         if not isinstance(payload, Mapping):
@@ -1421,6 +1428,61 @@ def rehydrate_attempt05_ledger_totals(ledger_path: Path) -> Attempt05LedgerResum
         next_wall = _payload_float(payload, "wall_runtime_seconds_total")
         next_logical = _payload_int(payload, "logical_bytes_total", "storage_bytes_total")
         next_allocated = _payload_int(payload, "allocated_bytes_total")
+        if event_type == "MVE_RUN_STARTED":
+            baseline_logical = next_logical or 0
+            baseline_allocated = next_allocated or 0
+        elif resource_accounting_mode is None and (
+            next_logical is not None or next_allocated is not None
+        ):
+            logical_artifact_only = (
+                next_logical is not None
+                and next_logical < baseline_logical
+            )
+            allocated_artifact_only = (
+                next_allocated is not None
+                and next_allocated < baseline_allocated
+            )
+            if (
+                next_logical is not None
+                and next_allocated is not None
+                and logical_artifact_only != allocated_artifact_only
+            ):
+                raise V4ExecutionError(
+                    "V4_ATTEMPT05_LEDGER_RESOURCE_ACCOUNTING_MODE_MISMATCH"
+                )
+            resource_accounting_mode = (
+                "ARTIFACT_ONLY_WITH_RUN_BASELINE"
+                if logical_artifact_only or allocated_artifact_only
+                else "TOTAL"
+            )
+        transition_to_total = (
+            event_type == "TOOLING_RECOVERY_REVISION"
+            and payload.get("resource_accounting_mode") == "TOTAL"
+        )
+        if (
+            resource_accounting_mode == "ARTIFACT_ONLY_WITH_RUN_BASELINE"
+            and not transition_to_total
+        ):
+            if next_logical is not None:
+                if (
+                    raw_logical_previous is not None
+                    and next_logical < raw_logical_previous
+                ):
+                    raise V4ExecutionError(
+                        "V4_ATTEMPT05_LEDGER_RESOURCE_NON_MONOTONIC"
+                    )
+                raw_logical_previous = next_logical
+                next_logical += baseline_logical
+            if next_allocated is not None:
+                if (
+                    raw_allocated_previous is not None
+                    and next_allocated < raw_allocated_previous
+                ):
+                    raise V4ExecutionError(
+                        "V4_ATTEMPT05_LEDGER_RESOURCE_NON_MONOTONIC"
+                    )
+                raw_allocated_previous = next_allocated
+                next_allocated += baseline_allocated
         if next_gpu is not None:
             if next_gpu < gpu:
                 raise V4ExecutionError("V4_ATTEMPT05_LEDGER_RESOURCE_NON_MONOTONIC")
@@ -1437,6 +1499,17 @@ def rehydrate_attempt05_ledger_totals(ledger_path: Path) -> Attempt05LedgerResum
             if next_allocated < allocated:
                 raise V4ExecutionError("V4_ATTEMPT05_LEDGER_RESOURCE_NON_MONOTONIC")
             allocated = next_allocated
+        if transition_to_total:
+            if resource_accounting_mode not in (
+                None,
+                "ARTIFACT_ONLY_WITH_RUN_BASELINE",
+            ):
+                raise V4ExecutionError(
+                    "V4_ATTEMPT05_LEDGER_RESOURCE_ACCOUNTING_MODE_MISMATCH"
+                )
+            resource_accounting_mode = "TOTAL"
+            raw_logical_previous = None
+            raw_allocated_previous = None
         peak = max(peak, _payload_float(payload, "peak_memory_mb_total", "peak_memory_mb") or 0.0)
         if event_type in {"CALIBRATION_UNIT_COMPLETE", "SCIENTIFIC_UNIT_COMPLETE"}:
             model_id = payload.get("model_id")
@@ -1493,6 +1566,7 @@ def rehydrate_attempt05_ledger_totals(ledger_path: Path) -> Attempt05LedgerResum
         calibration_unit_keys=frozenset(calibration_unit_keys),
         scientific_unit_keys=frozenset(scientific_unit_keys),
         projection_unit_keys=frozenset(projection_unit_keys),
+        resource_accounting_mode=resource_accounting_mode or "TOTAL",
     )
 
 

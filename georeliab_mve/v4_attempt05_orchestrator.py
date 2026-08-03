@@ -1199,16 +1199,21 @@ def run_attempt05_pipeline(
             },
         )
 
+    has_started_ledger = bool(ledger_resume and ledger_resume.run_started)
     totals = _ResourceTotals(
-        gpu_inference_seconds=ledger_resume.gpu_inference_seconds if ledger_resume else 0.0,
-        wall_runtime_seconds=ledger_resume.wall_runtime_seconds if ledger_resume else 0.0,
+        gpu_inference_seconds=(
+            ledger_resume.gpu_inference_seconds if has_started_ledger else 0.0
+        ),
+        wall_runtime_seconds=(
+            ledger_resume.wall_runtime_seconds if has_started_ledger else 0.0
+        ),
         logical_bytes=(
-            ledger_resume.logical_bytes if ledger_resume else baseline_logical
+            ledger_resume.logical_bytes if has_started_ledger else baseline_logical
         ),
         allocated_bytes=(
-            ledger_resume.allocated_bytes if ledger_resume else baseline_allocated
+            ledger_resume.allocated_bytes if has_started_ledger else baseline_allocated
         ),
-        peak_memory_mb=ledger_resume.peak_memory_mb if ledger_resume else 0.0,
+        peak_memory_mb=(ledger_resume.peak_memory_mb if has_started_ledger else 0.0),
     )
     calibration_samples: dict[str, list[CalibrationWarningSample]] = {
         model: [] for model in SCIENTIFIC_MODELS
