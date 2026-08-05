@@ -504,6 +504,7 @@ def test_recovery_smoke_manifest_is_deterministic_and_fail_closed(tmp_path: Path
                 "inference_start_count": expected,
                 "completion_count": 1,
                 "overwrite_count": 0,
+                "interruption_phase": manifest.interruption_plan.get(key),
                 "gpu_uuid": manifest.gpu_uuid,
                 "physical_gpu_index": manifest.physical_gpu_index,
                 "canonical_present": True,
@@ -596,7 +597,8 @@ def test_hourly_monitor_status_is_identity_and_budget_only() -> None:
     )
     assert status["external_monitor_interval_seconds"] == 3600
     assert status["internal_heartbeat_interval_seconds"] == 60
-    assert status["overall_progress"] == 0.5
+    assert status["overall_progress"] == 0.0025
+    assert status["historical_attempt05"] == "199/400 NON_RESUMABLE; NOT SCIENTIFIC EVIDENCE"
     assert status["gpu0_owners"] == ["pid-1", "pid-2"]
     assert status["gpu1_owners"] == []
     assert status["budget_status"]["gpu_target_exceeded"] is True
@@ -623,3 +625,43 @@ def test_torn_tail_emits_non_destructive_chain_bridge(tmp_path: Path) -> None:
     assert bridge["torn_tail_sha256"] == result["torn_tail_sha256"]
     assert isinstance(bridge["bridge_sha256"], str)
     assert ledger_path.read_bytes().endswith(b'{"torn":')
+
+def test_reconciler_defers_when_heartbeat_liveness_is_unproven(tmp_path: Path) -> None:
+    heartbeat = tmp_path / "heartbeat.json"
+    heartbeat.write_text("heartbeat", encoding="utf-8")
+    decision = reconcile_unit_transaction(
+        canonical_dir=tmp_path / "unit",
+        ledger_path=tmp_path / "ledger.jsonl",
+        idempotency_key="unit-1",
+        heartbeat_path=heartbeat,
+        heartbeat_max_age_seconds=0.0,
+        now_epoch=heartbeat.stat().st_mtime + 3600.0,
+    )
+    assert decision["state"] == recovery.ACTIVE_VALID_DEFER_NO_MUTATION
+    assert decision["recovery_decision"]["worker_alive"] is None
+
+
+def test_recovery_smoke_rejects_missing_interruption_phase() -> None:
+    manifest = build_recovery_smoke_manifest(
+        schedule_identity_sha256="a" * 64,
+        support_scene_ids=tuple(range(1, 10)),
+    )
+    rows = []
+    for unit_key in manifest.unit_keys:
+        rows.append(
+            {
+                "unit_key": unit_key,
+                "inference_start_count": manifest.expected_inference_starts[unit_key],
+                "completion_count": 1,
+                "overwrite_count": 0,
+                "interruption_phase": None,
+                "gpu_uuid": manifest.gpu_uuid,
+                "physical_gpu_index": manifest.physical_gpu_index,
+                "canonical_present": True,
+                "ledger_committed": True,
+                "scientific_marker": recovery.NO_SCIENTIFIC_RESULT,
+            }
+        )
+    result = evaluate_recovery_smoke(manifest, rows)
+    assert result["status"] == "V4_RECOVERY_RUNTIME_NOT_QUALIFIED"
+    assert result["inference_count_mismatches"]

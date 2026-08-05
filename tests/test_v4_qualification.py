@@ -116,6 +116,7 @@ def _smoke_rows(manifest):
             "inference_start_count": 2 if ordinal == 11 else 1,
             "completion_count": 1,
             "overwrite_count": 0,
+            "interruption_phase": manifest.interruption_plan.get(unit_id),
             "gpu_uuid": manifest.gpu_uuid,
             "physical_gpu_index": manifest.physical_gpu_index,
             "canonical_present": True,

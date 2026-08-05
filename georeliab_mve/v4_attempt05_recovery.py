@@ -25,6 +25,7 @@ import ctypes
 from pathlib import Path
 import signal
 import stat
+import time
 import traceback
 from typing import Any
 from uuid import uuid4
@@ -306,6 +307,13 @@ def _require_text(value: object, field_name: str) -> str:
     return value
 
 
+def _require_sha256(value: object, field_name: str) -> str:
+    text = _require_text(value, field_name)
+    if len(text) != 64 or text.lower() != text or any(char not in "0123456789abcdef" for char in text):
+        raise Attempt05RecoveryError(f"V4_RECOVERY_INVALID_{field_name.upper()}")
+    return text
+
+
 def _normalize_unit_key(value: object) -> str:
     if isinstance(value, str) and value:
         return value
@@ -377,7 +385,7 @@ class ScheduleIdentityManifest:
         semantic_sha = _domain_hash(SCHEDULE_SEMANTIC_HASH_DOMAIN, semantic_payload)
         ordered_sha = _domain_hash(ORDERED_UNIT_IDS_HASH_DOMAIN, normalized)
         unsigned = {
-            "raw_sha256": _require_text(raw_sha256, "raw_sha256"),
+            "raw_sha256": _require_sha256(raw_sha256, "raw_sha256"),
             "semantic_sha256": semantic_sha,
             "schema_version": _require_text(schema_version, "schema_version"),
             "canonicalizer_version": _require_text(canonicalizer_version, "canonicalizer_version"),
@@ -422,14 +430,14 @@ class ScheduleIdentityManifest:
         if type(unit_count) is not int or unit_count < 0:
             raise Attempt05RecoveryError("V4_RECOVERY_SCHEDULE_IDENTITY_COUNT_INVALID")
         payload = {
-            "raw_sha256": _require_text(value.get("raw_sha256"), "raw_sha256"),
-            "semantic_sha256": _require_text(value.get("semantic_sha256"), "semantic_sha256"),
+            "raw_sha256": _require_sha256(value.get("raw_sha256"), "raw_sha256"),
+            "semantic_sha256": _require_sha256(value.get("semantic_sha256"), "semantic_sha256"),
             "schema_version": _require_text(value.get("schema_version"), "schema_version"),
             "canonicalizer_version": _require_text(value.get("canonicalizer_version"), "canonicalizer_version"),
             "unit_count": unit_count,
-            "ordered_unit_ids_sha256": _require_text(value.get("ordered_unit_ids_sha256"), "ordered_unit_ids_sha256"),
+            "ordered_unit_ids_sha256": _require_sha256(value.get("ordered_unit_ids_sha256"), "ordered_unit_ids_sha256"),
         }
-        identity = _require_text(value.get("schedule_identity_sha256"), "schedule_identity_sha256")
+        identity = _require_sha256(value.get("schedule_identity_sha256"), "schedule_identity_sha256")
         if identity != _domain_hash(SCHEDULE_IDENTITY_HASH_DOMAIN, payload):
             raise Attempt05RecoveryError("V4_RECOVERY_SCHEDULE_IDENTITY_TAMPER")
         return cls(schedule_identity_sha256=identity, **payload)
@@ -653,7 +661,7 @@ class UnitTransactionReceipt:
             raise Attempt05RecoveryError("V4_RECOVERY_RECEIPT_STATE_INVALID")
         schedule_identity = value.get("schedule_identity_sha256")
         if schedule_identity is not None:
-            schedule_identity = _require_text(schedule_identity, "schedule_identity_sha256")
+            schedule_identity = _require_sha256(schedule_identity, "schedule_identity_sha256")
         schedule_domain = _require_text(value.get("schedule_hash_domain", SCHEDULE_IDENTITY_HASH_DOMAIN), "schedule_hash_domain")
         file_domain = _require_text(value.get("file_hash_domain", FILE_HASH_DOMAIN), "file_hash_domain")
         domains = value.get("hash_domains", {})
@@ -1148,7 +1156,7 @@ def build_monitor_status(
         raise Attempt05RecoveryError("V4_RECOVERY_AUTHORIZED_TOTAL_INVALID")
     if attempt05_valid_completed < 0 or attempt06_valid_completed < 0:
         raise Attempt05RecoveryError("V4_RECOVERY_COMPLETION_NEGATIVE")
-    completed = attempt05_valid_completed + attempt06_valid_completed
+    completed = attempt06_valid_completed
     if completed > authorized_total:
         raise Attempt05RecoveryError("V4_RECOVERY_COMPLETION_EXCEEDS_TOTAL")
     if attempt06_elapsed_seconds < 0 or cumulative_materialization_elapsed_seconds < 0:
@@ -1163,6 +1171,7 @@ def build_monitor_status(
         "internal_heartbeat_interval_seconds": INTERNAL_HEARTBEAT_INTERVAL_SECONDS,
         "authorized_total_units": authorized_total,
         "attempt05_valid_completed": attempt05_valid_completed,
+        "historical_attempt05": "199/400 NON_RESUMABLE; NOT SCIENTIFIC EVIDENCE",
         "attempt06_valid_completed": attempt06_valid_completed,
         "overall_completed_units": completed,
         "overall_progress": completed / authorized_total,
@@ -1413,7 +1422,34 @@ def reconcile_unit_transaction(
     live = worker_alive
     if live is None and worker_pid is not None:
         live = _process_is_alive(worker_pid)
-    if live:
+    heartbeat_age: float | None = None
+    heartbeat_uncertain = False
+    if heartbeat_path is not None:
+        if heartbeat_max_age_seconds is not None and (
+            type(heartbeat_max_age_seconds) not in (int, float)
+            or heartbeat_max_age_seconds < 0
+        ):
+            raise Attempt05RecoveryError("V4_RECOVERY_HEARTBEAT_MAX_AGE_INVALID")
+        try:
+            heartbeat_age = max(
+                0.0,
+                (time.time() if now_epoch is None else now_epoch)
+                - Path(heartbeat_path).stat().st_mtime,
+            )
+        except OSError:
+            heartbeat_uncertain = live is None
+        else:
+            max_age = (
+                2.0 * INTERNAL_HEARTBEAT_INTERVAL_SECONDS
+                if heartbeat_max_age_seconds is None
+                else float(heartbeat_max_age_seconds)
+            )
+            # A stale heartbeat cannot prove worker death. Without an
+            # explicit dead-process result, fail closed and do not mutate.
+            heartbeat_uncertain = live is None
+            if live is None and heartbeat_age <= max_age:
+                heartbeat_uncertain = True
+    if live or heartbeat_uncertain:
         return _reconciliation_result(
             state=ACTIVE_VALID_DEFER_NO_MUTATION,
             action=RECOVERY_ACTION_NOOP,
@@ -1422,8 +1458,9 @@ def reconcile_unit_transaction(
             pending_count=pending_count,
             reason="MATCHING_WORKER_ACTIVE_OR_HEARTBEAT_LIVENESS_UNCERTAIN",
             worker_pid=worker_pid,
-            worker_alive=True,
+            worker_alive=True if live else None,
             heartbeat_path=None if heartbeat_path is None else str(heartbeat_path),
+            heartbeat_age_seconds=heartbeat_age,
         )
 
     try:
@@ -2076,8 +2113,7 @@ class SameAttemptSessionUnionManifest:
     def __post_init__(self) -> None:
         if not self.attempt_id or self.attempt_id.lower() in {"attempt-05", "attempt05"} or "attempt05" in self.attempt_id.lower():
             raise Attempt05RecoveryError("V4_RECOVERY_ATTEMPT05_SOURCE_FORBIDDEN")
-        if not isinstance(self.schedule_identity_sha256, str) or len(self.schedule_identity_sha256) != 64:
-            raise Attempt05RecoveryError("V4_RECOVERY_SCHEDULE_IDENTITY_INVALID")
+        _require_sha256(self.schedule_identity_sha256, "schedule_identity_sha256")
         if type(self.expected_count) is not int or self.expected_count <= 0:
             raise Attempt05RecoveryError("V4_RECOVERY_UNION_COUNT_INVALID")
         if len(self.unit_keys) != self.expected_count or len(set(self.unit_keys)) != len(self.unit_keys):
@@ -2111,7 +2147,7 @@ class SameAttemptSessionUnionManifest:
             sessions[name] = tuple(_normalize_unit_key(item) for item in values)
         return cls(
             attempt_id=_require_text(value.get("attempt_id"), "attempt_id"),
-            schedule_identity_sha256=_require_text(value.get("schedule_identity_sha256"), "schedule_identity_sha256"),
+            schedule_identity_sha256=_require_sha256(value.get("schedule_identity_sha256"), "schedule_identity_sha256"),
             expected_count=value.get("expected_count"),  # type: ignore[arg-type]
             sessions=sessions,
             unit_keys=tuple(_normalize_unit_key(item) for item in raw_units),
@@ -2191,8 +2227,7 @@ class RecoverySmokeManifest:
     def __post_init__(self) -> None:
         if self.attempt_id != RECOVERY_SMOKE_ATTEMPT_ID:
             raise Attempt05RecoveryError("V4_RECOVERY_SMOKE_ATTEMPT_ID_INVALID")
-        if not isinstance(self.schedule_identity_sha256, str) or len(self.schedule_identity_sha256) != 64:
-            raise Attempt05RecoveryError("V4_RECOVERY_SCHEDULE_IDENTITY_INVALID")
+        _require_sha256(self.schedule_identity_sha256, "schedule_identity_sha256")
         if len(self.scene_ids) != 6 or len(set(self.scene_ids)) != 6:
             raise Attempt05RecoveryError("V4_RECOVERY_SMOKE_SCENE_COUNT_INVALID")
         if len(self.unit_keys) != 12 or len(set(self.unit_keys)) != 12:
@@ -2249,7 +2284,7 @@ class RecoverySmokeManifest:
             raise Attempt05RecoveryError("V4_RECOVERY_SMOKE_MANIFEST_INVALID")
         return cls(
             attempt_id=_require_text(value.get("attempt_id"), "attempt_id"),
-            schedule_identity_sha256=_require_text(value.get("schedule_identity_sha256"), "schedule_identity_sha256"),
+            schedule_identity_sha256=_require_sha256(value.get("schedule_identity_sha256"), "schedule_identity_sha256"),
             selector_version=_require_text(value.get("selector_version"), "selector_version"),
             scene_ids=tuple(int(item) for item in scenes),
             unit_keys=tuple(_normalize_unit_key(item) for item in units),
@@ -2273,8 +2308,7 @@ def select_recovery_smoke_scene_ids(
 
     if type(count) is not int or count != 6:
         raise Attempt05RecoveryError("V4_RECOVERY_SMOKE_SCENE_COUNT_INVALID")
-    if not isinstance(schedule_identity_sha256, str) or len(schedule_identity_sha256) != 64:
-        raise Attempt05RecoveryError("V4_RECOVERY_SCHEDULE_IDENTITY_INVALID")
+    schedule_identity_sha256 = _require_sha256(schedule_identity_sha256, "schedule_identity_sha256")
     unique = tuple(dict.fromkeys(int(item) for item in support_scene_ids))
     if len(unique) < count:
         raise Attempt05RecoveryError("V4_RECOVERY_SMOKE_SUPPORT_SCENES_INSUFFICIENT")
@@ -2284,7 +2318,7 @@ def select_recovery_smoke_scene_ids(
             f"{selector_version}\0{schedule_identity_sha256}\0{scene}".encode("utf-8")
         ).hexdigest(),
     )
-    return tuple(sorted(ordered[:count]))
+    return tuple(ordered[:count])
 
 
 def build_recovery_smoke_manifest(
@@ -2369,6 +2403,13 @@ def evaluate_recovery_smoke(
             if count != smoke.expected_inference_starts[key]:
                 mismatches.append(key)
         if row.get("completion_count") != 1 or row.get("overwrite_count") != 0:
+            mismatches.append(key)
+        expected_phase = smoke.interruption_plan.get(key)
+        observed_phase = row.get("interruption_phase")
+        if expected_phase is None:
+            if observed_phase not in (None, ""):
+                mismatches.append(key)
+        elif observed_phase != expected_phase:
             mismatches.append(key)
         if row.get("gpu_uuid") != smoke.gpu_uuid or row.get("physical_gpu_index") != smoke.physical_gpu_index:
             gpu_violations.append(key)
