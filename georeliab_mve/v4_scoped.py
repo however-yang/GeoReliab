@@ -558,7 +558,14 @@ def evaluate_pilot(
         and model.positive_warning_scene_count >= min_positive
         for model in models
     )
-    conflict = (models[0].auroc - 0.5) * (models[1].auroc - 0.5) < 0 or models[0].boundary_lag_median * models[1].boundary_lag_median < 0
+    conflict = any(
+        left * right < 0
+        for left, right in (
+            (models[0].auroc - 0.5, models[1].auroc - 0.5),
+            (models[0].boundary_lag_median, models[1].boundary_lag_median),
+            (models[0].late_warning_proportion - 0.5, models[1].late_warning_proportion - 0.5),
+        )
+    )
     loso_auc: list[float] = []
     loso_lag: list[float] = []
     for omitted in scenes:
@@ -1261,27 +1268,263 @@ def build_scoped_warning_evidence(
     return ScopedWarningEvidence(scope, input_record_inventory_sha256, input_record_count, evidence, source_attempt_id)
 
 
+def _coverage_item_count(value: object, scene_ids: tuple[int, ...]) -> int | None:
+    """Extract and validate one model's declared record coverage."""
+
+    expected_scene_ids = set(scene_ids)
+    expected_per_scene = len(SCIENTIFIC_STATES)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, Mapping):
+        declared_scenes = value.get("scene_ids")
+        if declared_scenes is not None:
+            try:
+                if set(int(scene) for scene in declared_scenes) != expected_scene_ids:
+                    return None
+            except (TypeError, ValueError):
+                return None
+        for key in ("record_count", "expected_record_count", "count", "completed_count", "n_records"):
+            declared = value.get(key)
+            if isinstance(declared, int) and not isinstance(declared, bool):
+                return declared if declared >= 0 else None
+        declared_states = value.get("state_ids")
+        if declared_scenes is not None and declared_states is not None:
+            try:
+                if set(str(state) for state in declared_states) == set(SCIENTIFIC_STATES):
+                    return len(scene_ids) * expected_per_scene
+            except (TypeError, ValueError):
+                return None
+        nested_records = value.get("records")
+        if nested_records is not None:
+            return _coverage_item_count(nested_records, scene_ids)
+        # A nested scene -> count mapping is accepted only when every selected
+        # scene is present and each scene covers all ten frozen states.
+        scene_counts: dict[int, int] = {}
+        for key, item in value.items():
+            try:
+                scene = int(key)
+            except (TypeError, ValueError):
+                continue
+            if scene in expected_scene_ids and isinstance(item, int) and not isinstance(item, bool):
+                scene_counts[scene] = item
+        if scene_counts:
+            if set(scene_counts) != expected_scene_ids or any(
+                count != expected_per_scene for count in scene_counts.values()
+            ):
+                return None
+            return sum(scene_counts.values())
+        return None
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        identities: set[tuple[object, ...]] = set()
+        for item in value:
+            if isinstance(item, Mapping):
+                try:
+                    if "model_id" in item:
+                        identity = (
+                            str(item["model_id"]),
+                            int(item["scene_id"]),
+                            str(item["state_id"]),
+                        )
+                    else:
+                        identity = (
+                            int(item["scene_id"]),
+                            str(item["state_id"]),
+                        )
+                except (KeyError, TypeError, ValueError):
+                    return None
+                if identity in identities:
+                    return None
+                identities.add(identity)
+            else:
+                identities.add((repr(item),))
+        return len(identities)
+    return None
+
+
+def _coverage_by_model(
+    coverage: object,
+    scene_ids: tuple[int, ...],
+) -> tuple[tuple[tuple[str, int], ...], bool]:
+    """Normalize direct or nested coverage declarations fail-closed."""
+
+    if isinstance(coverage, Mapping):
+        candidate = coverage.get("by_model", coverage.get("models", coverage))
+        if not isinstance(candidate, Mapping):
+            return (), False
+        if set(str(key) for key in candidate) != set(SCIENTIFIC_MODELS):
+            return (), False
+        counts = tuple(
+            (model, _coverage_item_count(candidate[model], scene_ids) or -1)
+            for model in SCIENTIFIC_MODELS
+        )
+    elif isinstance(coverage, Sequence) and not isinstance(coverage, (str, bytes, bytearray)):
+        grouped: dict[str, list[Mapping[str, object]]] = {model: [] for model in SCIENTIFIC_MODELS}
+        seen: set[tuple[str, int, str]] = set()
+        for item in coverage:
+            if not isinstance(item, Mapping):
+                return (), False
+            try:
+                identity = (str(item["model_id"]), int(item["scene_id"]), str(item["state_id"]))
+            except (KeyError, TypeError, ValueError):
+                return (), False
+            if identity in seen or identity[0] not in grouped or identity[1] not in scene_ids or identity[2] not in SCIENTIFIC_STATES:
+                return (), False
+            seen.add(identity)
+            grouped[identity[0]].append(item)
+        counts = tuple((model, len(grouped[model])) for model in SCIENTIFIC_MODELS)
+    else:
+        return (), False
+    expected = len(scene_ids) * len(SCIENTIFIC_STATES)
+    valid = all(count == expected for _, count in counts)
+    return counts, valid
+
+
+def _decision_status(value: object | None) -> object:
+    status = getattr(value, "status", None)
+    if status is None and isinstance(value, Mapping):
+        status = value.get("status")
+    return status
+
+
+def _parity_agrees(result: object, formal_decision: object | None) -> bool:
+    """Compare a parity callback result to the original evaluator decision."""
+
+    if isinstance(result, bool):
+        return result
+    if isinstance(result, Mapping) and isinstance(result.get("matches"), bool):
+        return bool(result["matches"])
+    if formal_decision is None:
+        return False
+    if result is formal_decision:
+        return True
+    result_payload = result.to_dict() if hasattr(result, "to_dict") else result
+    formal_payload = formal_decision.to_dict() if hasattr(formal_decision, "to_dict") else formal_decision
+    if isinstance(result_payload, Mapping) and isinstance(formal_payload, Mapping):
+        for key in ("status", "reason_code", "strong_model_id", "strong_family"):
+            if key in result_payload or key in formal_payload:
+                if result_payload.get(key) != formal_payload.get(key):
+                    return False
+        return True
+    result_status = _decision_status(result)
+    formal_status = _decision_status(formal_decision)
+    result_reason = getattr(result, "reason_code", None)
+    formal_reason = getattr(formal_decision, "reason_code", None)
+    return result_status == formal_status and (
+        result_reason is None or formal_reason is None or result_reason == formal_reason
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ScopedWarningGateDecision:
     protocol_decision: str
     reason_code: str
     formal_decision: object | None = None
     scope_sha256: str | None = None
+    scene_ids: tuple[int, ...] = ()
+    expected_count: int | None = None
+    input_record_count: int | None = None
+    coverage: tuple[tuple[str, int], ...] = ()
+    coverage_valid: bool = False
+    parity_required: bool = False
+    parity_checked: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        if hasattr(self.formal_decision, "to_dict"):
+            payload = self.formal_decision.to_dict()
+        elif isinstance(self.formal_decision, Mapping):
+            payload = dict(self.formal_decision)
+        elif self.formal_decision is None:
+            payload = None
+        else:
+            payload = {
+                key: getattr(self.formal_decision, key)
+                for key in ("status", "reason_code", "strong_model_id", "strong_family")
+                if hasattr(self.formal_decision, key)
+            }
+        if isinstance(payload, Mapping):
+            payload = dict(payload)
+            payload["scientific_result"] = "NO_SCIENTIFIC_RESULT"
+        return {
+            "protocol_decision": self.protocol_decision,
+            "status": self.protocol_decision,
+            "reason_code": self.reason_code,
+            "scope_sha256": self.scope_sha256,
+            "scene_ids": list(self.scene_ids),
+            "expected_count": self.expected_count,
+            "expected_record_count": self.expected_count,
+            "input_record_count": self.input_record_count,
+            "coverage": {model: count for model, count in self.coverage},
+            "coverage_valid": self.coverage_valid,
+            "parity_required": self.parity_required,
+            "parity_checked": self.parity_checked,
+            "formal_decision": payload,
+            "scientific_result": "NO_SCIENTIFIC_RESULT",
+        }
 
 
 def evaluate_scoped_warning_gate(
     scoped_evidence: ScopedWarningEvidence,
     *,
     formal_decision: object | None = None,
+    scene_ids: Sequence[int] | None = None,
+    expected_count: int | None = None,
+    coverage: object | None = None,
+    parity_evaluator: object | None = None,
 ) -> ScopedWarningGateDecision:
-    """Preserve the original gate decision while carrying scope provenance."""
+    """Validate scope closure before preserving the original gate decision.
+
+    This wrapper never recomputes or relaxes the frozen warning gate.  It only
+    proves that the requested scene scope and per-model record coverage close
+    exactly; a 20-scene scope additionally requires an explicit parity callback
+    whose result agrees with the original evaluator.
+    """
+
     if not isinstance(scoped_evidence, ScopedWarningEvidence):
         raise TypeError("scoped_evidence must be ScopedWarningEvidence")
-    status = getattr(formal_decision, "status", None)
-    if status is None and isinstance(formal_decision, Mapping):
-        status = formal_decision.get("status")
-    protocol = PROTOCOL_DECISION_GO if status in {"MVE_GO_TO_EXTERNAL_VALIDATION", PROTOCOL_DECISION_GO} else PROTOCOL_DECISION_NO_GO
-    return ScopedWarningGateDecision(protocol, "ORIGINAL_GATE_DECISION_PRESERVED", formal_decision, scoped_evidence.scope_sha256)
+    scenes = tuple(scoped_evidence.scope.scene_ids if scene_ids is None else scene_ids)
+    try:
+        normalized_scenes = _scene_ids(scenes)
+    except (TypeError, ValueError):
+        normalized_scenes = ()
+    expected = len(normalized_scenes) * len(SCIENTIFIC_MODELS) * len(SCIENTIFIC_STATES)
+    requested_expected = expected if expected_count is None else expected_count
+    counts, coverage_valid = _coverage_by_model(coverage, normalized_scenes) if coverage is not None else ((), False)
+    parity_required = len(normalized_scenes) == len(TEST_SCENE_IDS)
+    parity_checked = False
+    if normalized_scenes != tuple(scoped_evidence.scope.scene_ids):
+        reason = "SCOPED_SCENE_SCOPE_MISMATCH"
+    elif requested_expected != expected or scoped_evidence.input_record_count != expected:
+        reason = "SCOPED_EXPECTED_COUNT_MISMATCH"
+    elif not coverage_valid:
+        reason = "SCOPED_COVERAGE_MISMATCH"
+    elif parity_required and parity_evaluator is None:
+        reason = "SCOPED_20_SCENE_PARITY_REQUIRED"
+    else:
+        reason = "ORIGINAL_GATE_DECISION_PRESERVED"
+        if parity_required:
+            try:
+                parity_checked = _parity_agrees(parity_evaluator(scoped_evidence), formal_decision)
+            except Exception:
+                parity_checked = False
+            if not parity_checked:
+                reason = "SCOPED_20_SCENE_PARITY_MISMATCH"
+    status = _decision_status(formal_decision)
+    protocol = PROTOCOL_DECISION_GO if reason == "ORIGINAL_GATE_DECISION_PRESERVED" and status in {"MVE_GO_TO_EXTERNAL_VALIDATION", PROTOCOL_DECISION_GO} else PROTOCOL_DECISION_NO_GO
+    return ScopedWarningGateDecision(
+        protocol,
+        reason,
+        formal_decision,
+        scoped_evidence.scope_sha256,
+        normalized_scenes,
+        requested_expected,
+        scoped_evidence.input_record_count,
+        counts,
+        coverage_valid,
+        parity_required,
+        parity_checked,
+    )
 
 
 def build_pilot_partition_manifest(*args: object, **kwargs: object) -> PilotPartitionManifest:

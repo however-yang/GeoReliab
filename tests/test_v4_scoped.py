@@ -13,12 +13,14 @@ from georeliab_mve.v4_scoped import (
     V4_PILOT_INCONCLUSIVE,
     FULL_CONFIRMATION_FORBIDDEN,
     build_pilot_partition,
+    build_confirmation_scope_addendum,
     build_schedule_identity_manifest,
     build_scoped_warning_evidence,
     build_synthetic_power_design,
     classify_paper_claim,
     evaluate_pilot,
     evaluate_pilot_gate,
+    evaluate_scoped_warning_gate,
     qualify_boundary_lag_claim,
 )
 
@@ -162,6 +164,83 @@ def test_boundary_lag_claim_requires_ci_and_loso_support():
         loso_lag_medians=(0.5,),
     )
 
+
+def test_scoped_evaluator_closes_count_and_nested_coverage():
+    partition = build_pilot_partition("a" * 64)
+    scope = partition.primary_scope
+    evidence = build_scoped_warning_evidence(
+        {"development": True},
+        scope=scope,
+        input_record_inventory_sha256="c" * 64,
+        input_record_count=scope.expected_record_count,
+    )
+    formal = {"status": "MVE_GO_TO_EXTERNAL_VALIDATION", "reason_code": "OK"}
+    decision = evaluate_scoped_warning_gate(
+        evidence,
+        formal_decision=formal,
+        scene_ids=scope.scene_ids,
+        expected_count=scope.expected_record_count,
+        coverage={
+            "VGGT": {"scene_ids": list(scope.scene_ids), "record_count": 30},
+            "MASt3R": {"scene_ids": list(scope.scene_ids), "record_count": 30},
+        },
+    )
+    assert decision.protocol_decision == PROTOCOL_DECISION_GO
+    assert decision.coverage_valid and not decision.parity_required
+    assert decision.to_dict()["scientific_result"] == "NO_SCIENTIFIC_RESULT"
+    mismatch = evaluate_scoped_warning_gate(
+        evidence,
+        formal_decision=formal,
+        scene_ids=scope.scene_ids,
+        expected_count=scope.expected_record_count - 1,
+        coverage={"VGGT": 30, "MASt3R": 30},
+    )
+    assert mismatch.protocol_decision != PROTOCOL_DECISION_GO
+    assert mismatch.reason_code == "SCOPED_EXPECTED_COUNT_MISMATCH"
+
+
+def test_scoped_20_scene_requires_agreeing_parity_callback():
+    partition = build_pilot_partition("a" * 64)
+    all_scenes = tuple(sorted(partition.primary_scene_ids + partition.extension_scene_ids + partition.core_scene_ids))
+    scope = build_confirmation_scope_addendum(
+        schedule_identity_sha256="a" * 64,
+        protocol_sha256="b" * 64,
+        role="FULL20",
+        scene_ids=all_scenes,
+    )
+    evidence = build_scoped_warning_evidence(
+        {"development": True},
+        scope=scope,
+        input_record_inventory_sha256="c" * 64,
+        input_record_count=scope.expected_record_count,
+    )
+    formal = {"status": "MVE_GO_TO_EXTERNAL_VALIDATION", "reason_code": "OK"}
+    coverage = {model: {"scene_ids": list(all_scenes), "record_count": 200} for model in SCIENTIFIC_MODELS}
+    missing = evaluate_scoped_warning_gate(
+        evidence,
+        formal_decision=formal,
+        expected_count=400,
+        coverage=coverage,
+    )
+    assert missing.reason_code == "SCOPED_20_SCENE_PARITY_REQUIRED"
+    mismatch = evaluate_scoped_warning_gate(
+        evidence,
+        formal_decision=formal,
+        expected_count=400,
+        coverage=coverage,
+        parity_evaluator=lambda _: {"status": "MVE_SCIENTIFIC_NO_GO", "reason_code": "MISMATCH"},
+    )
+    assert mismatch.reason_code == "SCOPED_20_SCENE_PARITY_MISMATCH"
+    assert not mismatch.parity_checked
+    matched = evaluate_scoped_warning_gate(
+        evidence,
+        formal_decision=formal,
+        expected_count=400,
+        coverage=coverage,
+        parity_evaluator=lambda _: formal,
+    )
+    assert matched.protocol_decision == PROTOCOL_DECISION_GO
+    assert matched.parity_required and matched.parity_checked
 
 def test_extension_non_go_forbids_full_confirmation():
     partition = build_pilot_partition("a" * 64)
