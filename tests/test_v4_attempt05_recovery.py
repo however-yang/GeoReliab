@@ -608,3 +608,18 @@ def test_checkpoint_interval() -> None:
     assert checkpoint_due(5)
     assert checkpoint_due(10)
     assert not checkpoint_due(6)
+
+
+def test_torn_tail_emits_non_destructive_chain_bridge(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    ledger = JournaledLedger(ledger_path)
+    first = ledger.append("UNIT_EVENT", {"unit": "m|1|L3"})
+    with ledger_path.open("ab") as handle:
+        handle.write(b'{"torn":')
+    result = segment_torn_ledger_tail(ledger_path)
+    bridge = result["chain_bridge"]
+    assert bridge["next_sequence_index"] == 1
+    assert bridge["previous_event_sha256"] == first["event_sha256"]
+    assert bridge["torn_tail_sha256"] == result["torn_tail_sha256"]
+    assert isinstance(bridge["bridge_sha256"], str)
+    assert ledger_path.read_bytes().endswith(b'{"torn":')

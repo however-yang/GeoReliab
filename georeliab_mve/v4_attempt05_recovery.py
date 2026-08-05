@@ -853,6 +853,14 @@ def segment_torn_ledger_tail(
         "source_sha256": sha256_bytes(raw),
         "segment_path": None,
     }
+    result["chain_bridge"] = build_ledger_chain_bridge(
+        source_ledger_path=path,
+        committed_prefix_length=len(rows),
+        committed_prefix_sha256=str(result["committed_prefix_sha256"]),
+        previous_event_sha256=str(rows[-1]["event_sha256"]) if rows else "0" * 64,
+        torn_tail_sha256=None if not tail else str(result["torn_tail_sha256"]),
+        source_ledger_sha256=str(result["source_sha256"]),
+    )
     if not tail:
         return result
     digest = sha256_bytes(tail)
@@ -2641,3 +2649,44 @@ def classify_exit(return_code: int | None, signal_number: int | None) -> str:
     if return_code not in (None, 0):
         return "V4_ATTEMPT06_PROCESS_EXIT_NONZERO"
     return "V4_ATTEMPT06_PROCESS_EXIT_CLEAN"
+
+def build_ledger_chain_bridge(
+    *,
+    source_ledger_path: Path,
+    committed_prefix_length: int,
+    committed_prefix_sha256: str,
+    previous_event_sha256: str,
+    torn_tail_sha256: str | None,
+    source_ledger_sha256: str,
+) -> dict[str, object]:
+    """Describe how a future segment continues an immutable ledger prefix.
+
+    The bridge is metadata only: it never truncates or rewrites the source ledger.
+    """
+    if type(committed_prefix_length) is not int or committed_prefix_length < 0:
+        raise Attempt05RecoveryError("V4_RECOVERY_CHAIN_BRIDGE_PREFIX_INVALID")
+    for value, label in (
+        (committed_prefix_sha256, "committed_prefix_sha256"),
+        (previous_event_sha256, "previous_event_sha256"),
+        (source_ledger_sha256, "source_ledger_sha256"),
+    ):
+        if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value.lower()):
+            raise Attempt05RecoveryError(f"V4_RECOVERY_CHAIN_BRIDGE_{label.upper()}_INVALID")
+    if torn_tail_sha256 is not None and (
+        not isinstance(torn_tail_sha256, str)
+        or len(torn_tail_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in torn_tail_sha256.lower())
+    ):
+        raise Attempt05RecoveryError("V4_RECOVERY_CHAIN_BRIDGE_TORN_TAIL_INVALID")
+    payload: dict[str, object] = {
+        "schema_version": RECOVERY_SCHEMA,
+        "source_ledger_path": str(Path(source_ledger_path)),
+        "committed_prefix_length": committed_prefix_length,
+        "committed_prefix_sha256": committed_prefix_sha256,
+        "previous_event_sha256": previous_event_sha256,
+        "next_sequence_index": committed_prefix_length,
+        "torn_tail_sha256": torn_tail_sha256,
+        "source_ledger_sha256": source_ledger_sha256,
+    }
+    payload["bridge_sha256"] = _sha256_json(payload)
+    return payload
