@@ -34,7 +34,12 @@ from .contracts import (
     write_json_artifact,
 )
 from .v4_counterfactuals import FOG_STATES, SCIENTIFIC_STATES, ScientificExecutionUnit
-from .v4_attempt05_recovery import FailureEnvelope, atomic_write_bytes, failure_envelope_for
+from .v4_attempt05_recovery import (
+    FailureEnvelope,
+    atomic_write_bytes,
+    failure_envelope_for,
+    rename_noreplace,
+)
 from .v4_execution import V4ExecutionError
 from .v4_metrics import (
     NativeWarningCalibration,
@@ -75,17 +80,22 @@ class Attempt05RuntimeError(V4ExecutionError):
         *,
         stage: str,
         unit: ScientificExecutionUnit | None = None,
+        unit_key: tuple[str, int, str] | None = None,
         reason_code: str,
+        worker_pid: int | None = None,
+        heartbeat_age_seconds: float | None = None,
     ) -> "Attempt05RuntimeError":
-        unit_key = None
-        if unit is not None:
-            unit_key = (unit.model_id, unit.scene_id, unit.state_id)
+        resolved_unit_key = unit_key
+        if resolved_unit_key is None and unit is not None:
+            resolved_unit_key = (unit.model_id, unit.scene_id, unit.state_id)
         envelope = failure_envelope_for(
             exc,
             attempt_id="attempt-05",
             stage=stage,
-            unit_key=unit_key,
+            unit_key=resolved_unit_key,
             reason_code=reason_code,
+            worker_pid=worker_pid,
+            heartbeat_age_seconds=heartbeat_age_seconds,
         )
         return cls(envelope.reason_code, failure_envelope=envelope)
 
@@ -328,6 +338,33 @@ def _partial_dir(output_dir: Path) -> Path:
     return output_dir.with_name(output_dir.name + ".partial")
 
 
+def _promote_staging_dir(
+    staging_dir: Path,
+    output_dir: Path,
+    *,
+    stage: str,
+    unit: ScientificExecutionUnit | None = None,
+    unit_key: tuple[str, int, str] | None = None,
+) -> None:
+    """Promote a completed bundle without clobbering an existing identity."""
+
+    try:
+        rename_noreplace(staging_dir, output_dir)
+    except Attempt05RuntimeError:
+        raise
+    except Exception as exc:
+        key = unit_key
+        if key is None and unit is not None:
+            key = (unit.model_id, unit.scene_id, unit.state_id)
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage=stage,
+            unit=unit,
+            unit_key=key,
+            reason_code="V4_ATTEMPT05_ATOMIC_PROMOTION_FAILED",
+        ) from exc
+
+
 def _block_or_resume(output_dir: Path, *, resume: bool) -> TaskAuditRecord | None:
     record_path = _record_path(output_dir)
     if _partial_dir(output_dir).exists() or record_path.with_name(record_path.name + ".partial").exists():
@@ -364,6 +401,8 @@ def _native_warning_from_prediction(
     *,
     model_id: str,
     ordered_view_ids: Sequence[int],
+    unit: ScientificExecutionUnit | None = None,
+    unit_key: tuple[str, int, str] | None = None,
 ) -> float:
     try:
         geometry = _load_npz(
@@ -384,7 +423,15 @@ def _native_warning_from_prediction(
             ordered_view_ids=ordered_view_ids,
         )
     except Exception as exc:
-        raise Attempt05RuntimeError("V4_MVE_BLOCKED_NATIVE_WARNING_UNAVAILABLE") from exc
+        if isinstance(exc, Attempt05RuntimeError):
+            raise
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage="native_warning",
+            unit=unit,
+            unit_key=unit_key,
+            reason_code="V4_MVE_BLOCKED_NATIVE_WARNING_UNAVAILABLE",
+        ) from exc
     if not math.isfinite(float(score)):
         raise Attempt05RuntimeError("V4_MVE_BLOCKED_NATIVE_WARNING_UNAVAILABLE")
     return float(score)
@@ -431,37 +478,56 @@ def _audit_with_final_uris(audit: AuditRecord, *, bundle_dir: Path) -> AuditReco
     )
 
 
-def _copy_prediction_payloads(prediction: PredictionArtifact, staging_dir: Path) -> PredictionArtifact:
-    sources = {
-        "geometry_prediction_uri": _file_uri_path(prediction.geometry_prediction_uri, "geometry"),
-        "native_confidence_uri": _file_uri_path(prediction.native_confidence_uri, "confidence"),
-        "valid_mask_uri": _file_uri_path(prediction.valid_mask_uri, "valid_mask"),
-    }
-    targets = {
-        "geometry_prediction_uri": staging_dir / "geometry_prediction.npz",
-        "native_confidence_uri": staging_dir / "native_confidence.npz",
-        "valid_mask_uri": staging_dir / "valid_mask.npz",
-    }
-    labels = {
-        "geometry_prediction_uri": "geometry",
-        "native_confidence_uri": "confidence",
-        "valid_mask_uri": "valid_mask",
-    }
-    digests: dict[str, str] = {}
-    for key, source in sources.items():
-        expected = prediction.payload_digests.get(key, "")
-        if expected and _sha256_file(source) != expected:
-            raise Attempt05RuntimeError("V4_ATTEMPT05_PREDICTION_PAYLOAD_DIGEST_MISMATCH")
-        arrays = _load_npz(source.resolve().as_uri(), expected, labels[key])
-        write_deterministic_npz(targets[key], arrays)
-        digests[key] = _sha256_file(targets[key])
-    return _prediction_with_uris(
-        prediction,
-        geometry_path=targets["geometry_prediction_uri"],
-        confidence_path=targets["native_confidence_uri"],
-        valid_mask_path=targets["valid_mask_uri"],
-        payload_digests=digests,
-    )
+def _copy_prediction_payloads(
+    prediction: PredictionArtifact,
+    staging_dir: Path,
+    *,
+    unit: ScientificExecutionUnit | None = None,
+    unit_key: tuple[str, int, str] | None = None,
+) -> PredictionArtifact:
+    """Copy prediction payloads into the transaction tree with an envelope."""
+
+    try:
+        sources = {
+            "geometry_prediction_uri": _file_uri_path(prediction.geometry_prediction_uri, "geometry"),
+            "native_confidence_uri": _file_uri_path(prediction.native_confidence_uri, "confidence"),
+            "valid_mask_uri": _file_uri_path(prediction.valid_mask_uri, "valid_mask"),
+        }
+        targets = {
+            "geometry_prediction_uri": staging_dir / "geometry_prediction.npz",
+            "native_confidence_uri": staging_dir / "native_confidence.npz",
+            "valid_mask_uri": staging_dir / "valid_mask.npz",
+        }
+        labels = {
+            "geometry_prediction_uri": "geometry",
+            "native_confidence_uri": "confidence",
+            "valid_mask_uri": "valid_mask",
+        }
+        digests: dict[str, str] = {}
+        for key, source in sources.items():
+            expected = prediction.payload_digests.get(key, "")
+            if expected and _sha256_file(source) != expected:
+                raise Attempt05RuntimeError("V4_ATTEMPT05_PREDICTION_PAYLOAD_DIGEST_MISMATCH")
+            arrays = _load_npz(source.resolve().as_uri(), expected, labels[key])
+            write_deterministic_npz(targets[key], arrays)
+            digests[key] = _sha256_file(targets[key])
+        return _prediction_with_uris(
+            prediction,
+            geometry_path=targets["geometry_prediction_uri"],
+            confidence_path=targets["native_confidence_uri"],
+            valid_mask_path=targets["valid_mask_uri"],
+            payload_digests=digests,
+        )
+    except Attempt05RuntimeError:
+        raise
+    except Exception as exc:
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage="prediction_payload_copy",
+            unit=unit,
+            unit_key=unit_key,
+            reason_code="V4_ATTEMPT05_PREDICTION_PAYLOAD_COPY_FAILED",
+        ) from exc
 
 
 def _write_npz(path: Path, payload: Mapping[str, np.ndarray]) -> str:
@@ -469,7 +535,7 @@ def _write_npz(path: Path, payload: Mapping[str, np.ndarray]) -> str:
     return _sha256_file(path)
 
 
-def _prediction_record(
+def _prediction_record_impl(
     *,
     unit: ScientificExecutionUnit,
     manifest: RunManifest,
@@ -551,6 +617,7 @@ def _prediction_record(
             prediction,
             model_id=unit.model_id,
             ordered_view_ids=ordered_view_ids,
+            unit=unit,
         )
     except Exception as exc:
         raise Attempt05RuntimeError("V4_MVE_BLOCKED_NATIVE_WARNING_UNAVAILABLE") from exc
@@ -660,24 +727,51 @@ def _prediction_record(
     return _RecordBuildResult(record, dense_payload, gt_payload, audit_record)
 
 
+def _prediction_record(**kwargs: Any) -> _RecordBuildResult:
+    """Build a record while preserving the underlying failure envelope."""
+
+    unit = kwargs.get("unit")
+    try:
+        return _prediction_record_impl(**kwargs)
+    except Attempt05RuntimeError:
+        raise
+    except Exception as exc:
+        if not isinstance(unit, ScientificExecutionUnit):
+            unit = None
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage="prediction_record",
+            unit=unit,
+            reason_code="V4_ATTEMPT05_PREDICTION_RECORD_FAILED",
+        ) from exc
+
+
 def _validate_staged_bundle(
     *,
     staging_dir: Path,
     manifest: RunManifest,
     prediction: PredictionArtifact,
     build: _RecordBuildResult,
+    unit: ScientificExecutionUnit | None = None,
 ) -> TaskAuditRecord:
     try:
         validate_artifact_bundle(manifest, prediction, build.audit_record)
         reread = read_task_audit_record(staging_dir / "task_audit_record.json")
-    except (ContractError, Task3ContractError) as exc:
-        raise Attempt05RuntimeError("V4_ATTEMPT05_STAGED_BUNDLE_INVALID") from exc
-    if reread.record_sha256 != build.record.record_sha256:
-        raise Attempt05RuntimeError("V4_ATTEMPT05_TASK_RECORD_DIGEST_MISMATCH")
-    for name in ("geometry_prediction", "native_confidence", "valid_mask", "dense_audit", "gt_points"):
-        if not (staging_dir / f"{name}.npz").is_file():
-            raise Attempt05RuntimeError("V4_ATTEMPT05_STAGED_PAYLOAD_MISSING")
-    return reread
+        if reread.record_sha256 != build.record.record_sha256:
+            raise Attempt05RuntimeError("V4_ATTEMPT05_TASK_RECORD_DIGEST_MISMATCH")
+        for name in ("geometry_prediction", "native_confidence", "valid_mask", "dense_audit", "gt_points"):
+            if not (staging_dir / f"{name}.npz").is_file():
+                raise Attempt05RuntimeError("V4_ATTEMPT05_STAGED_PAYLOAD_MISSING")
+        return reread
+    except Attempt05RuntimeError:
+        raise
+    except Exception as exc:
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage="staged_bundle_validation",
+            unit=unit,
+            reason_code="V4_ATTEMPT05_STAGED_BUNDLE_INVALID",
+        ) from exc
 
 
 def _calibration_evidence_path(output_dir: Path) -> Path:
@@ -843,16 +937,36 @@ def execute_attempt05_calibration_l3(
 
     try:
         prediction = adapter.predict_sample(manifest, sample_key, tuple(rendered_views))
+    except Attempt05RuntimeError:
+        raise
     except Exception as exc:
-        raise Attempt05RuntimeError("V4_ATTEMPT05_ADAPTER_EXCEPTION") from exc
-    prediction = _validate_prediction(prediction, manifest=manifest, sample_key=sample_key)
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage="adapter_predict",
+            unit_key=(model_id, scene_id, "L3"),
+            reason_code="V4_ATTEMPT05_ADAPTER_EXCEPTION",
+        ) from exc
+    try:
+        prediction = _validate_prediction(prediction, manifest=manifest, sample_key=sample_key)
+    except Attempt05RuntimeError:
+        raise
+    except Exception as exc:
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage="prediction_validate",
+            unit_key=(model_id, scene_id, "L3"),
+            reason_code="V4_ATTEMPT05_PREDICTION_ARTIFACT_INVALID",
+        ) from exc
     if prediction.invalid_prediction:
         raise Attempt05RuntimeError('V4_ATTEMPT05_CALIBRATION_INVALID_PREDICTION')
-    staged_prediction = _copy_prediction_payloads(prediction, staging_dir)
+    staged_prediction = _copy_prediction_payloads(
+        prediction, staging_dir, unit_key=(model_id, scene_id, "L3")
+    )
     warning = _native_warning_from_prediction(
         staged_prediction,
         model_id=model_id,
         ordered_view_ids=ordered_view_ids,
+        unit_key=(model_id, scene_id, "L3"),
     )
     final_prediction = _prediction_with_uris(
         staged_prediction,
@@ -874,21 +988,40 @@ def execute_attempt05_calibration_l3(
         write_json_artifact(staging_dir / "run_manifest.json", manifest)
         write_json_artifact(staging_dir / "prediction_artifact.json", final_prediction)
         _write_json_payload(staging_dir / "native_warning_evidence.json", evidence)
-    except (ContractError, OSError) as exc:
-        raise Attempt05RuntimeError("V4_ATTEMPT05_STAGED_WRITE_FAILED") from exc
+    except Attempt05RuntimeError:
+        raise
+    except Exception as exc:
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage="calibration_staged_write",
+            unit_key=(model_id, scene_id, "L3"),
+            reason_code="V4_ATTEMPT05_STAGED_WRITE_FAILED",
+        ) from exc
     if (staging_dir / "task_audit_record.json").exists() or (staging_dir / "audit_record.json").exists():
         raise Attempt05RuntimeError("V4_ATTEMPT05_CALIBRATION_RECORD_FORBIDDEN")
-    try:
-        staging_dir.replace(output_dir)
-    except OSError as exc:
-        raise Attempt05RuntimeError("V4_ATTEMPT05_ATOMIC_PROMOTION_FAILED") from exc
-    final_evidence = _validate_calibration_bundle(
-        output_dir=output_dir,
-        manifest=manifest,
-        sample_key=sample_key,
-        model_id=model_id,
-        ordered_view_ids=ordered_view_ids,
+    _promote_staging_dir(
+        staging_dir,
+        output_dir,
+        stage="calibration_promotion",
+        unit_key=(model_id, scene_id, "L3"),
     )
+    try:
+        final_evidence = _validate_calibration_bundle(
+            output_dir=output_dir,
+            manifest=manifest,
+            sample_key=sample_key,
+            model_id=model_id,
+            ordered_view_ids=ordered_view_ids,
+        )
+    except Attempt05RuntimeError:
+        raise
+    except Exception as exc:
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage="calibration_final_validation",
+            unit_key=(model_id, scene_id, "L3"),
+            reason_code="V4_ATTEMPT05_FINAL_BUNDLE_INVALID",
+        ) from exc
     return Attempt05CalibrationResult(
         status="CALIBRATION_WARNING_RECORDED",
         evidence_path=evidence_path,
@@ -948,10 +1081,27 @@ def execute_attempt05_unit(
 
     try:
         prediction = adapter.predict_sample(manifest, sample_key, tuple(rendered_views))
+    except Attempt05RuntimeError:
+        raise
     except Exception as exc:
-        raise Attempt05RuntimeError("V4_ATTEMPT05_ADAPTER_EXCEPTION") from exc
-    prediction = _validate_prediction(prediction, manifest=manifest, sample_key=sample_key)
-    staged_prediction = _copy_prediction_payloads(prediction, staging_dir)
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage="adapter_predict",
+            unit=unit,
+            reason_code="V4_ATTEMPT05_ADAPTER_EXCEPTION",
+        ) from exc
+    try:
+        prediction = _validate_prediction(prediction, manifest=manifest, sample_key=sample_key)
+    except Attempt05RuntimeError:
+        raise
+    except Exception as exc:
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage="prediction_validate",
+            unit=unit,
+            reason_code="V4_ATTEMPT05_PREDICTION_ARTIFACT_INVALID",
+        ) from exc
+    staged_prediction = _copy_prediction_payloads(prediction, staging_dir, unit=unit)
     build = _prediction_record(
         unit=unit,
         manifest=manifest,
@@ -979,23 +1129,40 @@ def execute_attempt05_unit(
         write_json_artifact(staging_dir / "prediction_artifact.json", final_prediction)
         write_json_artifact(staging_dir / "audit_record.json", final_audit)
         write_task_audit_record(staging_dir / "task_audit_record.json", build.record)
-    except (ContractError, Task3ContractError, OSError) as exc:
-        raise Attempt05RuntimeError("V4_ATTEMPT05_STAGED_WRITE_FAILED") from exc
+    except Attempt05RuntimeError:
+        raise
+    except Exception as exc:
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage="unit_staged_write",
+            unit=unit,
+            reason_code="V4_ATTEMPT05_STAGED_WRITE_FAILED",
+        ) from exc
     staged_record = _validate_staged_bundle(
         staging_dir=staging_dir,
         manifest=manifest,
         prediction=staged_prediction,
         build=build,
+        unit=unit,
     )
-    try:
-        staging_dir.replace(output_dir)
-    except OSError as exc:
-        raise Attempt05RuntimeError("V4_ATTEMPT05_ATOMIC_PROMOTION_FAILED") from exc
+    _promote_staging_dir(
+        staging_dir,
+        output_dir,
+        stage="unit_promotion",
+        unit=unit,
+    )
     try:
         validate_artifact_bundle(manifest, final_prediction, final_audit)
         final_record = read_task_audit_record(record_path)
-    except (ContractError, Task3ContractError, OSError) as exc:
-        raise Attempt05RuntimeError("V4_ATTEMPT05_FINAL_BUNDLE_INVALID") from exc
+    except Attempt05RuntimeError:
+        raise
+    except Exception as exc:
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage="unit_final_validation",
+            unit=unit,
+            reason_code="V4_ATTEMPT05_FINAL_BUNDLE_INVALID",
+        ) from exc
     if final_record.record_sha256 != staged_record.record_sha256:
         raise Attempt05RuntimeError("V4_ATTEMPT05_TASK_RECORD_DIGEST_MISMATCH")
     return Attempt05UnitResult(

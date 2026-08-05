@@ -1,6 +1,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
 from pathlib import Path
 import signal
@@ -25,7 +27,15 @@ from georeliab_mve.v4_attempt05_recovery import (
     identity_only_audit,
     read_hash_chain,
     reconcile_unit_transaction,
-    repair_torn_ledger_tail,
+    archive_torn_ledger_tail,
+    RecoveryDecision,
+    SameAttemptSessionUnionManifest,
+    build_same_attempt_session_union,
+    segment_torn_ledger_tail,
+    sha256_file,
+    RecoverySmokeManifest,
+    build_recovery_smoke_manifest,
+    evaluate_recovery_smoke,
     write_forensic_bundle,
 )
 
@@ -57,7 +67,6 @@ def _append_valid_unit(ledger: JournaledLedger, run_root: Path, key: tuple[str, 
     }
     ledger.append("CANONICAL_RECORD_PROJECTION", payload)
     completion_payload = dict(payload)
-    completion_payload.pop("projection_path", None)
     ledger.append("SCIENTIFIC_UNIT_COMPLETE", completion_payload)
     return record
 
@@ -109,9 +118,16 @@ def test_journaled_ledger_recovers_pending_and_rejects_torn_tail(tmp_path: Path)
     assert len(read_hash_chain(ledger.ledger_path)) == 1
     with ledger.ledger_path.open("ab") as handle:
         handle.write(b"torn")
-    removed = repair_torn_ledger_tail(ledger.ledger_path)
-    assert removed == 4
-    assert len(read_hash_chain(ledger.ledger_path)) == 1
+    before = ledger.ledger_path.read_bytes()
+    segmented = segment_torn_ledger_tail(ledger.ledger_path)
+    assert segmented["torn_tail_bytes"] == 4
+    assert segmented["torn_tail_sha256"] is not None
+    assert ledger.ledger_path.read_bytes() == before
+    assert Path(str(segmented["segment_path"])).read_bytes() == b"torn"
+    # Compatibility API is also non-destructive and reports the segment size.
+    assert archive_torn_ledger_tail(ledger.ledger_path)["torn_tail_bytes"] == 4
+    with pytest.raises(Attempt05RecoveryError, match="TORN_TAIL"):
+        read_hash_chain(ledger.ledger_path)
 
 
 def test_unit_transaction_is_exactly_once_and_recoverable(tmp_path: Path) -> None:
@@ -158,27 +174,111 @@ def test_reconciler_distinguishes_incomplete_orphan_and_torn_tail(tmp_path: Path
         canonical_dir=tmp_path / "units" / "m-1-L3",
         ledger_path=tmp_path / "ledger.jsonl",
         idempotency_key="attempt-06:m|1|L3",
-    )["state"] == "INCOMPLETE"
+    )["state"] == "INCOMPLETE_SAFE_TO_RETRY"
     store.promote_unit(receipt)
     assert reconcile_unit_transaction(
         canonical_dir=tmp_path / "units" / "m-1-L3",
         ledger_path=tmp_path / "ledger.jsonl",
         idempotency_key="attempt-06:m|1|L3",
-    )["state"] == "INCOMPLETE"
+    )["state"] == "INCOMPLETE_SAFE_TO_RETRY"
     orphan = tmp_path / "units" / "orphan"
     orphan.mkdir()
     assert reconcile_unit_transaction(
         canonical_dir=orphan,
         ledger_path=tmp_path / "ledger.jsonl",
         idempotency_key="orphan",
-    )["state"] == "ORPHAN"
+    )["state"] == "ORPHAN_REQUIRES_QUARANTINE"
     with (tmp_path / "ledger.jsonl").open("ab") as handle:
         handle.write(b"torn")
     assert reconcile_unit_transaction(
         canonical_dir=tmp_path / "units" / "m-1-L3",
         ledger_path=tmp_path / "ledger.jsonl",
         idempotency_key="attempt-06:m|1|L3",
-    )["state"] == "TORN_LEDGER_TAIL"
+    )["state"] == "ORPHAN_REQUIRES_QUARANTINE"
+
+
+def test_recovery_decision_and_active_worker_guard_are_typed_and_non_mutating(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    ledger_path.write_bytes(b"not-a-valid-ledger-tail")
+    result = reconcile_unit_transaction(
+        canonical_dir=tmp_path / "unit",
+        ledger_path=ledger_path,
+        idempotency_key="attempt-06:m|1|L3",
+        worker_alive=True,
+        worker_pid=1234,
+    )
+    assert result["state"] == "ACTIVE_VALID_DEFER_NO_MUTATION"
+    decision = RecoveryDecision.from_reconciliation(result)
+    assert decision.recovery_action == "NOOP"
+    assert decision.worker_alive is True
+    assert ledger_path.read_bytes() == b"not-a-valid-ledger-tail"
+    assert result["recovery_decision"]["state"] == decision.state
+
+
+def test_no_clobber_promotion_rejects_existing_identity(tmp_path: Path) -> None:
+    ledger = JournaledLedger(tmp_path / "ledger.jsonl")
+    store = UnitTransactionStore(tmp_path / "units", attempt_id="attempt-06", ledger=ledger)
+    receipt = store.prepare_unit(
+        idempotency_key="attempt-06:m|1|L3",
+        unit_key=("m", 1, "L3"),
+        stage="prediction",
+        canonical_dir=tmp_path / "units" / "m-1-L3",
+        files={"prediction.bin": b"new"},
+    )
+    canonical = tmp_path / "units" / "m-1-L3"
+    canonical.mkdir()
+    (canonical / "sentinel").write_bytes(b"do-not-clobber")
+    with pytest.raises(Attempt05RecoveryError, match="RECEIPT_MISSING"):
+        store.promote_unit(receipt)
+    assert (canonical / "sentinel").read_bytes() == b"do-not-clobber"
+    assert (tmp_path / "units" / "m-1-L3.partial").is_dir()
+
+
+def test_schedule_identity_domains_accept_distinct_raw_and_semantic_hashes(tmp_path: Path) -> None:
+    schedule_path = tmp_path / "schedule.json"
+    schedule_path.write_bytes(b"{\n  \"units\": [1, 2]\n}\n")
+    manifest = recovery.ScheduleIdentityManifest.build(
+        raw_sha256=__import__("hashlib").sha256(schedule_path.read_bytes()).hexdigest(),
+        semantic_payload={"units": [1, 2]},
+        ordered_unit_ids=[("m", 1, "L3"), ("m", 2, "L3")],
+    )
+    assert manifest.raw_sha256 != manifest.semantic_sha256
+    expected_semantic = hashlib.sha256(
+        recovery.SCHEDULE_SEMANTIC_HASH_DOMAIN.encode("utf-8")
+        + b"\0"
+        + b'{"units":[1,2]}'
+    ).hexdigest()
+    assert manifest.semantic_sha256 == expected_semantic
+    # Hash domains use compact canonical JSON without the JSONL newline used
+    # by the append-only ledger.
+    assert not recovery._canonical_json_bytes_without_newline({"units": [1, 2]}).endswith(b"\n")
+    assert recovery.ScheduleIdentityManifest.from_mapping(manifest.to_dict()).schedule_identity_sha256 == manifest.schedule_identity_sha256
+
+
+def test_production_atomic_writer_has_no_replace_primitive() -> None:
+    assert "os.replace" not in inspect.getsource(recovery.atomic_write_bytes)
+
+
+def test_same_attempt_session_union_rejects_cross_attempt_and_exactly_closes(tmp_path: Path) -> None:
+    keys = _schedule(3)
+    manifest = build_same_attempt_session_union(
+        attempt_id="attempt-06",
+        schedule_identity_sha256="a" * 64,
+        session_units={"session-a": keys[:2], "session-b": keys[2:]},
+        expected_schedule_keys=keys,
+    )
+    assert isinstance(manifest, SameAttemptSessionUnionManifest)
+    assert manifest.unit_keys == tuple(f"model|{idx}|L3" for idx in range(3))
+    restored = SameAttemptSessionUnionManifest.from_mapping(manifest.to_dict())
+    assert restored.to_dict() == manifest.to_dict()
+    with pytest.raises(Attempt05RecoveryError, match="CROSS_ATTEMPT"):
+        build_same_attempt_session_union(
+            attempt_id="attempt-06",
+            schedule_identity_sha256="a" * 64,
+            session_units={"session": keys},
+            expected_schedule_keys=keys,
+            source_attempt_ids={"session": "attempt-05"},
+        )
 
 
 def test_identity_only_audit_allows_verified_partial_but_blocks_hash_mismatch(tmp_path: Path) -> None:
@@ -257,8 +357,29 @@ def test_identity_audit_strictly_checks_binding_evidence_without_metrics(tmp_pat
         require_binding_evidence=True,
     )
     assert blocked.verdict == "V4_ATTEMPT05_PARTIAL_CORPUS_NOT_RESUMABLE"
-    assert blocked.checks["binding_evidence_missing_units"][0]["unit_key"] == "model|0|L3"
-    assert "adapter" in blocked.checks["binding_evidence_missing_units"][0]["fields"]
+    assert blocked.checks["reconciliation_failures"]["path_or_sha_missing"] == 1
+    assert blocked.checks["binding_evidence_missing_units"] == []
+
+
+def test_sha256_file_rejects_path_metadata_mutation(monkeypatch, tmp_path: Path) -> None:
+    path = tmp_path / "canonical.bin"
+    path.write_bytes(b"stable")
+    real_lstat = recovery.os.lstat
+    calls = 0
+
+    def mutating_lstat(value):
+        nonlocal calls
+        result = real_lstat(value)
+        calls += 1
+        if calls == 2:
+            fields = list(result)
+            fields[6] = int(fields[6]) + 1  # st_size differs after the read
+            return type(result)(fields)
+        return result
+
+    monkeypatch.setattr(recovery.os, "lstat", mutating_lstat)
+    with pytest.raises(OSError):
+        sha256_file(path)
 
 
 def test_identity_audit_detects_duplicate_and_partial(tmp_path: Path) -> None:
@@ -324,8 +445,75 @@ def test_missing_schedule_union_and_attempt06_gate(tmp_path: Path) -> None:
         expected_total_count=3,
         expected_missing_count=2,
     )
-    assert closed["status"] == "V4_ATTEMPT06_AUTHORIZATION_READY"
+    # Historical eligibility/missing-unit closure can never authorize a fresh
+    # Attempt-06 materialization.
+    assert closed["status"] == "V4_ATTEMPT06_BLOCKED_RECOVERY_GATE"
+    assert closed["checks"]["fresh_source_confirmed"] is False
     assert closed["launch_performed"] is False
+
+
+def test_attempt06_fresh_source_gate_rejects_historical_partial_and_requires_pilot(tmp_path: Path) -> None:
+    blocked = attempt06_gate(
+        fresh_source=True,
+        attempt05_source_rejected=True,
+        recovery_runtime_qualified=True,
+        power_gate_passed=True,
+        pilot_status="V4_PILOT_SCIENTIFIC_NO_GO",
+        budget_gate_passed=True,
+        fresh_schedule_closed=True,
+        explicit_authorization=True,
+    )
+    assert blocked["status"] == "V4_ATTEMPT06_BLOCKED_RECOVERY_GATE"
+    assert blocked["checks"]["pilot_gate_passed"] is False
+    ready = attempt06_gate(
+        fresh_source_confirmed=True,
+        attempt05_source_rejected=True,
+        recovery_runtime_qualified=True,
+        power_gate_passed=True,
+        pilot_status="V4_PILOT_GO_TO_FULL_MVE",
+        budget_gate_passed=True,
+        fresh_schedule_closed=True,
+        explicit_authorization=True,
+    )
+    assert ready["status"] == "V4_ATTEMPT06_AUTHORIZATION_READY"
+    assert ready["checks"].get("historical_partial_ignored") is True
+    assert ready["launch_performed"] is False
+
+
+def test_recovery_smoke_manifest_is_deterministic_and_fail_closed(tmp_path: Path) -> None:
+    schedule_identity = "b" * 64
+    manifest = build_recovery_smoke_manifest(
+        schedule_identity_sha256=schedule_identity,
+        support_scene_ids=(1, 9, 10, 11, 12, 13, 23, 24, 29, 32),
+    )
+    assert isinstance(manifest, RecoverySmokeManifest)
+    restored = RecoverySmokeManifest.from_mapping(manifest.to_dict())
+    assert restored.to_dict() == manifest.to_dict()
+    incomplete = evaluate_recovery_smoke(
+        restored,
+        observations=[{"unit_key": manifest.unit_keys[0]}],
+    )
+    assert incomplete["status"] == "V4_RECOVERY_RUNTIME_NOT_QUALIFIED"
+    assert manifest.unit_keys[0] in incomplete["closure_violations"] or manifest.unit_keys[0] in incomplete["inference_count_mismatches"]
+
+    rows = []
+    for key, expected in manifest.expected_inference_starts.items():
+        rows.append(
+            {
+                "unit_key": key,
+                "inference_start_count": expected,
+                "completion_count": 1,
+                "overwrite_count": 0,
+                "gpu_uuid": manifest.gpu_uuid,
+                "physical_gpu_index": manifest.physical_gpu_index,
+                "canonical_present": True,
+                "ledger_committed": True,
+                "scientific_marker": "NO_SCIENTIFIC_RESULT",
+            }
+        )
+    qualified = evaluate_recovery_smoke(restored, observations=rows)
+    assert qualified["status"] == "V4_RECOVERY_RUNTIME_QUALIFIED"
+    assert qualified["scientific_result"] == "NO_SCIENTIFIC_RESULT"
 
 
 def test_forensic_bundle_and_supervisor_are_separate_from_source(tmp_path: Path) -> None:

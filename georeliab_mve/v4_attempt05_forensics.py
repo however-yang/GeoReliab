@@ -14,28 +14,47 @@ from pathlib import Path
 from typing import Any
 
 from .v4_attempt05_recovery import (
-    _canonical_json_bytes,
+    ScheduleIdentityManifest,
     identity_only_audit,
-    sha256_bytes,
     sha256_file,
     write_forensic_bundle,
 )
 
 
-def replay_schedule_hashes(path: Path) -> dict[str, str | None]:
+def replay_schedule_hashes(path: Path) -> dict[str, object]:
+    """Replay raw, semantic and identity hashes in their separate domains."""
+
     raw = path.read_bytes()
     payload = json.loads(raw.decode("utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("schedule JSON must contain an object")
     embedded = payload.get("schedule_sha256")
     unsigned = dict(payload)
-    unsigned.pop("schedule_sha256", None)
-    semantic = sha256_bytes(_canonical_json_bytes(unsigned).rstrip(b"\n"))
+    for name in (
+        "schedule_sha256",
+        "schedule_raw_sha256",
+        "schedule_semantic_sha256",
+        "schedule_identity_sha256",
+    ):
+        unsigned.pop(name, None)
+    keys = _schedule_keys(path)
+    manifest = ScheduleIdentityManifest.build(
+        raw_sha256=sha256_file(path),
+        semantic_payload=unsigned,
+        ordered_unit_ids=keys,
+    )
     return {
-        "schedule_file_sha256": sha256_file(path),
-        "schedule_identity_sha256": semantic,
+        "schedule_raw_sha256": manifest.raw_sha256,
+        "schedule_semantic_sha256": manifest.semantic_sha256,
+        "schedule_identity_sha256": manifest.schedule_identity_sha256,
+        "ordered_unit_ids_sha256": manifest.ordered_unit_ids_sha256,
+        "unit_count": manifest.unit_count,
         "embedded_schedule_sha256": embedded if isinstance(embedded, str) else None,
+        "schedule_identity_manifest": manifest.to_dict(),
+        # Legacy name retained for read-only reports; it is explicitly raw.
+        "schedule_file_sha256": manifest.raw_sha256,
     }
+
 
 
 def _schedule_keys(path: Path) -> list[object]:
@@ -78,6 +97,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--schedule-sha256", required=True)
     parser.add_argument("--expected-schedule-sha256")
     parser.add_argument("--input-closure-schedule-sha256")
+    parser.add_argument("--expected-schedule-identity-sha256")
+    parser.add_argument("--expected-schedule-semantic-sha256")
     parser.add_argument("--expected-verified-count", type=int, default=199)
     parser.add_argument(
         "--require-binding-evidence",
@@ -94,8 +115,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     keys = _schedule_keys(args.schedule)
     hash_replay = replay_schedule_hashes(args.schedule)
-    if args.schedule_sha256 != hash_replay["schedule_file_sha256"]:
-        raise ValueError("--schedule-sha256 must match the schedule file SHA-256")
+    if args.schedule_sha256 != hash_replay["schedule_raw_sha256"]:
+        raise ValueError("--schedule-sha256 must match the schedule raw file SHA-256")
     eligibility = identity_only_audit(
         attempt_id=args.attempt_id,
         schedule_keys=keys,
@@ -104,6 +125,9 @@ def main(argv: list[str] | None = None) -> int:
         schedule_sha256=args.schedule_sha256,
         expected_schedule_sha256=args.expected_schedule_sha256,
         input_closure_schedule_sha256=args.input_closure_schedule_sha256,
+        schedule_identity_manifest=hash_replay["schedule_identity_manifest"],
+        expected_schedule_identity_sha256=args.expected_schedule_identity_sha256,
+        expected_schedule_semantic_sha256=args.expected_schedule_semantic_sha256,
         final_evidence_root=args.final_evidence_root,
         expected_verified_count=args.expected_verified_count,
         require_binding_evidence=args.require_binding_evidence,
@@ -116,6 +140,7 @@ def main(argv: list[str] | None = None) -> int:
         "binding_evidence_required": args.require_binding_evidence,
         "source_paths": {key: str(path) for key, path in _sources(args.source).items()},
         "schedule_hash_replay": hash_replay,
+        "schedule_identity_manifest": hash_replay["schedule_identity_manifest"],
     }
     if args.postmortem_json is not None:
         loaded = json.loads(args.postmortem_json.read_text(encoding="utf-8"))
