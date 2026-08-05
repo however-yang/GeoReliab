@@ -610,3 +610,66 @@ def test_calibration_l3_fail_closed_on_partial_exception_and_nonfinite_warning(t
     assert not (nonfinite_out / "native_warning_evidence.json").exists()
     assert not (nonfinite_out / "task_audit_record.json").exists()
 
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "reason_code"),
+    [
+        ("audit", "V4_ATTEMPT05_GT_ARRAY_AUDIT_FAILED"),
+        ("point", "V4_ATTEMPT05_POINT_METRIC_FAILED"),
+        ("pose", "V4_ATTEMPT05_POSE_METRIC_FAILED"),
+        ("record", "V4_ATTEMPT05_TASK_RECORD_BUILD_FAILED"),
+    ],
+)
+def test_prediction_record_failures_preserve_split_failure_envelope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+    reason_code: str,
+) -> None:
+    unit = _unit()
+    prediction = _write_prediction(unit, tmp_path / "prediction")
+    original_audit = runtime.audit_prediction_arrays
+    original_point = runtime.compute_point_task_metrics
+    original_pose = runtime.compute_relative_pose_metrics
+    original_record = runtime.build_task_audit_record
+
+    def fail(*_args, **_kwargs):
+        raise ValueError(f"injected-{failure_stage}")
+
+    if failure_stage == "audit":
+        monkeypatch.setattr(runtime, "audit_prediction_arrays", fail)
+    elif failure_stage == "point":
+        monkeypatch.setattr(runtime, "compute_point_task_metrics", fail)
+    elif failure_stage == "pose":
+        monkeypatch.setattr(runtime, "compute_relative_pose_metrics", fail)
+    else:
+        monkeypatch.setattr(runtime, "build_task_audit_record", fail)
+
+    with pytest.raises(runtime.Attempt05RuntimeError) as captured:
+        runtime.execute_attempt05_unit(
+            unit=unit,
+            manifest=_manifest(unit),
+            sample_key=SampleKey.parse(prediction.sample_key),
+            rendered_views=_views(tmp_path),
+            adapter=FakeAdapter(prediction),
+            calibration=_calibration(unit.model_id),
+            output_dir=tmp_path / f"out-{failure_stage}",
+            gt_points=np.stack([np.arange(8, dtype=np.float64), np.zeros(8), np.zeros(8)], axis=1),
+            gt_camera_c2w=_camera_stack(),
+            observability_mask=np.ones(8, dtype=bool),
+            gt_dtu_camera_c2w=_camera_stack(),
+        )
+    error = captured.value
+    assert str(error) == reason_code
+    assert error.failure_envelope is not None
+    assert error.failure_envelope.reason_code == reason_code
+    assert error.failure_envelope.stage in {
+        "gt_array_audit",
+        "point_metrics",
+        "pose_metrics",
+        "task_record_build",
+    }
+    assert f"injected-{failure_stage}" in error.failure_envelope.traceback_text
+    assert original_audit is not None and original_point is not None
+    assert original_pose is not None and original_record is not None

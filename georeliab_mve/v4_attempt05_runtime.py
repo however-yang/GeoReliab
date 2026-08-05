@@ -34,6 +34,7 @@ from .contracts import (
     write_json_artifact,
 )
 from .v4_counterfactuals import FOG_STATES, SCIENTIFIC_STATES, ScientificExecutionUnit
+from .v4_attempt05_recovery import FailureEnvelope, atomic_write_bytes, failure_envelope_for
 from .v4_execution import V4ExecutionError
 from .v4_metrics import (
     NativeWarningCalibration,
@@ -51,7 +52,42 @@ from .v4_records import (
 
 
 class Attempt05RuntimeError(V4ExecutionError):
-    """Raised when Attempt-05 runtime execution must fail closed."""
+    """Raised when Attempt-05 runtime execution must fail closed.
+
+    The legacy string reason remains the exception message for compatibility,
+    while failure_envelope retains stage, original exception and traceback.
+    """
+
+    def __init__(
+        self,
+        reason_code: str,
+        *,
+        failure_envelope: FailureEnvelope | None = None,
+    ) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.failure_envelope = failure_envelope
+
+    @classmethod
+    def from_exception(
+        cls,
+        exc: BaseException,
+        *,
+        stage: str,
+        unit: ScientificExecutionUnit | None = None,
+        reason_code: str,
+    ) -> "Attempt05RuntimeError":
+        unit_key = None
+        if unit is not None:
+            unit_key = (unit.model_id, unit.scene_id, unit.state_id)
+        envelope = failure_envelope_for(
+            exc,
+            attempt_id="attempt-05",
+            stage=stage,
+            unit_key=unit_key,
+            reason_code=reason_code,
+        )
+        return cls(envelope.reason_code, failure_envelope=envelope)
 
 
 CALIBRATION_WARNING_EVIDENCE_SCHEMA = "georeliab-v4-attempt05-calibration-warning-evidence-1.0"
@@ -111,8 +147,7 @@ def _json_payload_sha256(payload: Mapping[str, Any]) -> str:
 
 
 def _write_json_payload(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(_canonical_json_bytes(payload))
+    atomic_write_bytes(path, _canonical_json_bytes(payload))
 
 
 def _file_uri_path(uri: str, label: str) -> Path:
@@ -534,12 +569,45 @@ def _prediction_record(
             observability_res=observability_res,
             voxel_size_mm=0.2,
         )
+    except Exception as exc:
+        if isinstance(exc, Attempt05RuntimeError):
+            raise
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage="gt_array_audit",
+            unit=unit,
+            reason_code="V4_ATTEMPT05_GT_ARRAY_AUDIT_FAILED",
+        ) from exc
+
+    try:
         point_metrics = compute_point_task_metrics(audit.voxel_points, gt_points, audit.risk)
+    except Exception as exc:
+        if isinstance(exc, Attempt05RuntimeError):
+            raise
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage="point_metrics",
+            unit=unit,
+            reason_code="V4_ATTEMPT05_POINT_METRIC_FAILED",
+        ) from exc
+
+    try:
         pose_metrics = compute_relative_pose_metrics(
             geometry["camera_c2w"],
             gt_dtu_camera_c2w,
             ordered_view_ids=ordered_view_ids,
         )
+    except Exception as exc:
+        if isinstance(exc, Attempt05RuntimeError):
+            raise
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage="pose_metrics",
+            unit=unit,
+            reason_code="V4_ATTEMPT05_POSE_METRIC_FAILED",
+        ) from exc
+
+    try:
         record = build_task_audit_record(
             execution_unit=unit,
             calibration=calibration,
@@ -553,7 +621,12 @@ def _prediction_record(
     except Exception as exc:
         if isinstance(exc, Attempt05RuntimeError):
             raise
-        raise Attempt05RuntimeError("V4_ATTEMPT05_AUDIT_OR_RECORD_FAILED") from exc
+        raise Attempt05RuntimeError.from_exception(
+            exc,
+            stage="task_record_build",
+            unit=unit,
+            reason_code="V4_ATTEMPT05_TASK_RECORD_BUILD_FAILED",
+        ) from exc
 
     dense_payload = {
         "voxel_points": audit.voxel_points,

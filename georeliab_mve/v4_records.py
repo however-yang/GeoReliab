@@ -839,6 +839,18 @@ def parse_task_audit_record(
     )
 
 
+def _fsync_parent_directory(path: Path) -> None:
+    flags = getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | flags)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def write_task_audit_record(path: Path, record: TaskAuditRecord) -> str:
     """Atomically publish canonical JSON without overwriting a conflict."""
 
@@ -873,6 +885,7 @@ def write_task_audit_record(path: Path, record: TaskAuditRecord) -> str:
             raise Task3ContractError(
                 f"cannot atomically publish TaskAuditRecord: {path}"
             ) from exc
+        _fsync_parent_directory(path.parent)
         return expected_sha256
     except Task3ContractError:
         raise
