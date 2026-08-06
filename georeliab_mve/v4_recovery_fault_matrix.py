@@ -302,16 +302,14 @@ def _patched_fault_surface(controller: _FaultController) -> Iterator[None]:
         )
 
     with patch.object(recovery, "atomic_write_bytes", patched_atomic):
-        with patch.object(
-            recovery,
-            "rename_noreplace",
-            lambda source, destination: (
-                controller("promotion:rename"),
-                original_rename(source, destination),
-            )[1],
-        ):
-            yield
+        def patched_rename(source: Path, destination: Path) -> None:
+            source = Path(source)
+            if source.is_dir():
+                controller("promotion:rename")
+            original_rename(source, destination)
 
+        with patch.object(recovery, "rename_noreplace", patched_rename):
+            yield
 
 def _phase_fault(controller: _FaultController, operation: str) -> Callable[[str], None]:
     def callback(stage: str) -> None:
@@ -374,6 +372,7 @@ def _run_unit_case(case: FaultInjectionCase, case_root: Path) -> tuple[str, str,
         schedule_identity_sha256="e" * 64,
     )
     controller = _FaultController(case.fault_point, case.fault_kind)
+    checkpoint_failed = False
     before_inventory = _inventory_sha(case_root)
     with _patched_fault_surface(controller):
         try:
@@ -403,7 +402,7 @@ def _run_unit_case(case: FaultInjectionCase, case_root: Path) -> tuple[str, str,
                 )
                 store.write_checkpoint(checkpoint, case_root / "gate1-checkpoint")
         except BaseException:
-            pass
+            checkpoint_failed = case.fault_point.startswith("checkpoint:")
     try:
         result = recovery.reconcile_unit_transaction(
             canonical_dir=canonical,
@@ -413,6 +412,10 @@ def _run_unit_case(case: FaultInjectionCase, case_root: Path) -> tuple[str, str,
         )
         classification, action = _normalise_state(result)
         reason = str(result.get("reason", ""))
+        if checkpoint_failed:
+            classification = "QUARANTINED"
+            action = recovery.RECOVERY_ACTION_QUARANTINE
+            reason = "CHECKPOINT_NOT_DURABLE"
     except BaseException as exc:
         classification = "FATAL_IDENTITY_MISMATCH"
         action = recovery.RECOVERY_ACTION_ABORT_FATAL
@@ -579,6 +582,10 @@ def _run_mutation_case(case: FaultInjectionCase, case_root: Path) -> tuple[str, 
         )
         classification, action = _normalise_state(result)
         reason = str(result.get("reason", ""))
+        if checkpoint_failed:
+            classification = "QUARANTINED"
+            action = recovery.RECOVERY_ACTION_QUARANTINE
+            reason = "CHECKPOINT_NOT_DURABLE"
     except BaseException as exc:
         classification = "FATAL_IDENTITY_MISMATCH"
         action = recovery.RECOVERY_ACTION_ABORT_FATAL
@@ -658,7 +665,10 @@ def _run_signal_case(case: FaultInjectionCase, case_root: Path) -> tuple[str, st
         str(case_root),
     ]
     process = subprocess.Popen(command, cwd=Path.cwd())
-    time.sleep(0.15)
+    deadline = time.time() + 5.0
+    heartbeat = case_root / "heartbeat.jsonl"
+    while time.time() < deadline and not heartbeat.is_file():
+        time.sleep(0.05)
     number = {"SIGTERM": signal.SIGTERM, "SIGHUP": signal.SIGHUP, "SIGKILL": signal.SIGKILL}[case.fault_kind]
     os.kill(process.pid, number)
     return_code = process.wait(timeout=10)
@@ -734,9 +744,16 @@ def build_fault_matrix_cases() -> tuple[FaultInjectionCase, ...]:
         operation = point.split(":", 1)[0]
         if operation == "checkpoint":
             operation = "transaction"
-        expected = "QUARANTINED" if point.startswith(("artifact:", "prepared_receipt:")) else "SAFE_RETRY"
-        if point.startswith("checkpoint:"):
+        if point.startswith("artifact:"):
             expected = "QUARANTINED"
+        elif point.startswith("prepared_receipt:"):
+            expected = "SAFE_RETRY" if point.endswith(("rename_after", "dir_fsync")) else "QUARANTINED"
+        elif point.startswith("committed_receipt:") and point.endswith(("rename_after", "dir_fsync")):
+            expected = "COMPLETE"
+        elif point.startswith("checkpoint:"):
+            expected = "QUARANTINED"
+        else:
+            expected = "SAFE_RETRY"
         action = _expected_action(expected, recovery.RECOVERY_ACTION_RESUME_LEDGER_ONLY if expected == "SAFE_RETRY" else None)
         for kind in ERRNO_NAMES + ("ABRUPT_EXIT",):
             cases.append(
