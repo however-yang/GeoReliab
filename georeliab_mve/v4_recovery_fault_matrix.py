@@ -929,6 +929,32 @@ def run_cpu_fault_matrix(
     )
     manifest_payload = manifest.to_dict()
     _assert_no_scientific_payload(manifest_payload)
+    semantic_payload = {
+        "schema_version": SCHEMA_VERSION,
+        "parent_commit": lineage["parent_commit"],
+        "parent_tree": lineage["parent_tree"],
+        "current_commit": lineage["current_commit"],
+        "current_tree": lineage["current_tree"],
+        "cases": [
+            {
+                "case_id": case.case_id,
+                "expected_classification": case.expected_classification,
+                "expected_action": case.expected_action,
+                "observed_classification": observation.observed_classification,
+                "observed_action": observation.observed_action,
+                "reason": observation.reason,
+                "duplicate_count": observation.duplicate_count,
+                "overwrite_count": observation.overwrite_count,
+            }
+            for case, observation in zip(cases, observations)
+        ],
+        "all_failure_injections_classified": all_classified,
+        "unknown_count": unknown_count,
+        "broad_legacy_reason_count": broad_count,
+        "scientific_result": NO_SCIENTIFIC_RESULT,
+    }
+    _assert_no_scientific_payload(semantic_payload)
+    semantic_sha = _domain_sha("georeliab:v4:gate1-semantic-result:v1", semantic_payload)
     _write_json(output_root / "lineage-manifest.json", {**lineage, "allowlist": sorted(GATE1_ALLOWLIST), "scientific_assets_zero_drift": True, "scientific_result": NO_SCIENTIFIC_RESULT})
     _write_json(output_root / "source-manifest.json", {**lineage, "changed_paths": list(lineage["changed_paths"]), "scientific_assets_zero_drift": True, "scientific_result": NO_SCIENTIFIC_RESULT})
     _write_json(output_root / "fault-matrix-spec.json", {"cases": [case.to_dict() for case in cases], "schema_version": SCHEMA_VERSION})
@@ -937,6 +963,7 @@ def run_cpu_fault_matrix(
         b"".join(_canonical_bytes(item.to_dict()) + b"\n" for item in observations),
     )
     _write_json(output_root / "environment.json", _environment(repo, lineage))
+    _write_json(output_root / "semantic-result.json", {"semantic_result_sha256": semantic_sha, "semantic_payload": semantic_payload, "scientific_result": NO_SCIENTIFIC_RESULT})
     qualification = {
         "schema_version": SCHEMA_VERSION,
         "status": PASS_MARKER if all_classified else f"{FAIL_MARKER}=matrix",
@@ -951,6 +978,7 @@ def run_cpu_fault_matrix(
         "pilot_started": False,
         "attempt06_started": False,
         "manifest_sha256": manifest_payload["manifest_sha256"],
+        "semantic_result_sha256": semantic_sha,
     }
     _assert_no_scientific_payload(qualification)
     _write_json(output_root / "qualification.json", qualification)
