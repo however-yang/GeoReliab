@@ -866,6 +866,7 @@ def run_cpu_fault_matrix(
         observation = FaultInjectionObservation(
             case_id=case.case_id,
             expected_classification=case.expected_classification,
+            expected_action=case.expected_action,
             observed_classification=classification,
             observed_action=action,
             reason=reason,
