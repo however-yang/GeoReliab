@@ -784,26 +784,37 @@ def _verify_lineage(repo: Path, expected_parent_commit: str) -> dict[str, object
         raise FaultMatrixError("V4_RECOVERY_GATE1_DIRTY_WORKTREE")
     current = _git(repo, "rev-parse", "HEAD")
     current_tree = _git(repo, "rev-parse", "HEAD^{tree}")
-    parent = _git(repo, "rev-parse", "HEAD^")
-    parent_tree = _git(repo, "rev-parse", f"{parent}^{{tree}}")
-    if parent != expected_parent_commit:
+    expected_tree = _git(repo, "rev-parse", f"{expected_parent_commit}^{{tree}}")
+    ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", expected_parent_commit, current],
+        cwd=repo,
+        check=False,
+    )
+    if ancestor.returncode != 0:
         raise FaultMatrixError(
-            f"V4_RECOVERY_GATE1_PARENT_MISMATCH:{parent}!={expected_parent_commit}"
+            f"V4_RECOVERY_GATE1_PARENT_MISMATCH:{expected_parent_commit}!={current}"
         )
-    if parent_tree != EXPECTED_PARENT_TREE:
+    merge_count = _git(repo, "rev-list", "--count", "--merges", f"{expected_parent_commit}..{current}")
+    if merge_count != "0":
+        raise FaultMatrixError("V4_RECOVERY_GATE1_MERGE_FORBIDDEN")
+    if expected_tree != EXPECTED_PARENT_TREE:
         raise FaultMatrixError("V4_RECOVERY_GATE1_PARENT_TREE_MISMATCH")
-    changed = [item for item in _git(repo, "diff", "--name-only", f"{parent}..HEAD").splitlines() if item]
+    changed = [
+        item
+        for item in _git(repo, "diff", "--name-only", f"{expected_parent_commit}..{current}").splitlines()
+        if item
+    ]
     disallowed = sorted(set(changed) - GATE1_ALLOWLIST)
     if disallowed:
         raise FaultMatrixError(f"V4_RECOVERY_SCIENTIFIC_ASSET_DRIFT:{','.join(disallowed)}")
     return {
-        "parent_commit": parent,
-        "parent_tree": parent_tree,
+        "parent_commit": expected_parent_commit,
+        "parent_tree": expected_tree,
+        "immediate_parent_commit": _git(repo, "rev-parse", "HEAD^"),
         "current_commit": current,
         "current_tree": current_tree,
         "changed_paths": changed,
     }
-
 
 def _write_no_clobber(path: Path, payload: bytes) -> None:
     if path.exists():
