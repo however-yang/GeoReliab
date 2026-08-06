@@ -12,6 +12,7 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import errno
+from enum import Enum
 import hashlib
 import json
 import os
@@ -48,6 +49,56 @@ GATE1_ALLOWLIST = {
 }
 EXPECTED_PARENT_TREE = "ba864e0ed53b82bdf10aec06ddceda950bf6e821"
 ERRNO_NAMES = ("EACCES", "ENOSPC", "EIO")
+
+
+class FaultPoint(str, Enum):
+    ARTIFACT_TEMP_WRITE = "artifact:temp_write"
+    ARTIFACT_FILE_FSYNC = "artifact:file_fsync"
+    ARTIFACT_RENAME_BEFORE = "artifact:rename_before"
+    ARTIFACT_RENAME_AFTER = "artifact:rename_after"
+    ARTIFACT_DIR_FSYNC = "artifact:dir_fsync"
+    PREPARED_RECEIPT_TEMP_WRITE = "prepared_receipt:temp_write"
+    PREPARED_RECEIPT_FILE_FSYNC = "prepared_receipt:file_fsync"
+    PREPARED_RECEIPT_RENAME_BEFORE = "prepared_receipt:rename_before"
+    PREPARED_RECEIPT_RENAME_AFTER = "prepared_receipt:rename_after"
+    PREPARED_RECEIPT_DIR_FSYNC = "prepared_receipt:dir_fsync"
+    LEDGER_PENDING_TEMP_WRITE = "ledger_pending:temp_write"
+    LEDGER_PENDING_FILE_FSYNC = "ledger_pending:file_fsync"
+    LEDGER_PENDING_RENAME_BEFORE = "ledger_pending:rename_before"
+    LEDGER_PENDING_RENAME_AFTER = "ledger_pending:rename_after"
+    LEDGER_PENDING_DIR_FSYNC = "ledger_pending:dir_fsync"
+    CANONICAL_RECEIPT_TEMP_WRITE = "canonical_receipt:temp_write"
+    CANONICAL_RECEIPT_FILE_FSYNC = "canonical_receipt:file_fsync"
+    CANONICAL_RECEIPT_RENAME_BEFORE = "canonical_receipt:rename_before"
+    CANONICAL_RECEIPT_RENAME_AFTER = "canonical_receipt:rename_after"
+    CANONICAL_RECEIPT_DIR_FSYNC = "canonical_receipt:dir_fsync"
+    COMMITTED_RECEIPT_TEMP_WRITE = "committed_receipt:temp_write"
+    COMMITTED_RECEIPT_FILE_FSYNC = "committed_receipt:file_fsync"
+    COMMITTED_RECEIPT_RENAME_BEFORE = "committed_receipt:rename_before"
+    COMMITTED_RECEIPT_RENAME_AFTER = "committed_receipt:rename_after"
+    COMMITTED_RECEIPT_DIR_FSYNC = "committed_receipt:dir_fsync"
+    PROMOTION_RENAME_BEFORE = "promotion:rename_before"
+    PROMOTION_RENAME = "promotion:rename"
+    PROMOTION_RENAME_AFTER = "promotion:rename_after"
+    PROMOTION_DIR_FSYNC = "promotion:dir_fsync"
+    PROJECTION_LEDGER_APPEND = "projection:ledger_append"
+    COMPLETION_LEDGER_APPEND = "completion:ledger_append"
+    PENDING_CLEANUP = "pending_cleanup:cleanup"
+    CHECKPOINT_FILE_FSYNC = "checkpoint:file_fsync"
+    PROMOTION_DUPLICATE = "promotion:duplicate"
+    IDENTITY_SYMLINK = "identity:symlink"
+    IDENTITY_PATH = "identity:path"
+    IDENTITY_CONTENT = "identity:content"
+    IDENTITY_IDEMPOTENCY = "identity:idempotency"
+    LIVENESS_LIVE = "liveness:live"
+    LIVENESS_DEAD = "liveness:dead"
+    LEDGER_TORN_TAIL = "ledger:torn_tail"
+    TERMINAL_LEDGER = "terminal:ledger"
+    TERMINAL_SUPERVISOR = "terminal:supervisor"
+    TERMINAL_PAIR = "terminal:pair"
+    SIGNAL_SIGTERM = "signal:SIGTERM"
+    SIGNAL_SIGHUP = "signal:SIGHUP"
+    SIGNAL_SIGKILL = "signal:SIGKILL"
 
 
 class FaultMatrixError(recovery.Attempt05RecoveryError):
@@ -108,7 +159,7 @@ def _expected_action(classification: str, preferred: str | None = None) -> str:
 class FaultInjectionCase:
     case_id: str
     operation: str
-    fault_point: str
+    fault_point: FaultPoint
     fault_kind: str
     expected_classification: str
     expected_action: str
@@ -116,6 +167,11 @@ class FaultInjectionCase:
     schema_version: str = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
+        try:
+            point = self.fault_point if isinstance(self.fault_point, FaultPoint) else FaultPoint(self.fault_point)
+        except ValueError as exc:
+            raise FaultMatrixError("V4_RECOVERY_FAULT_POINT_INVALID") from exc
+        object.__setattr__(self, "fault_point", point)
         if not self.case_id or not self.operation or not self.fault_point:
             raise FaultMatrixError("V4_RECOVERY_FAULT_CASE_ID_INVALID")
         if self.expected_classification not in CLASSIFICATIONS:

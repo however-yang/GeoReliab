@@ -10,6 +10,7 @@ from georeliab_mve import v4_recovery_fault_matrix as matrix
 
 def test_fault_catalog_covers_required_surfaces_and_errno_kinds() -> None:
     cases = matrix.build_fault_matrix_cases()
+    assert all(isinstance(case.fault_point, matrix.FaultPoint) for case in cases)
     points = {case.fault_point for case in cases}
     assert {
         "artifact:temp_write",
