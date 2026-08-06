@@ -1,0 +1,85 @@
+# GeoReliab A100 real-MVE deployment overlay.
+#
+# This file is operational provenance only. Scientific thresholds, statistical
+# gates, scene splits, bootstrap counts, and track-selection logic live only in
+# configs/dual_mve_protocol.toml. The overlay loader rejects threshold-like
+# keys if they are added here.
+
+[runtime]
+root = '/srv/private/smli/GeoReliab'
+data = '/srv/private/smli/GeoReliab/data'
+cache = '/srv/private/smli/GeoReliab/cache'
+logs = '/srv/private/smli/GeoReliab/logs'
+artifacts = '/srv/private/smli/GeoReliab/artifacts'
+git_bare = '/srv/private/smli/GeoReliab/git/GeoReliab.git'
+worktrees = '/srv/private/smli/GeoReliab/worktrees'
+stage = '/srv/private/smli/GeoReliab/stage'
+prepared = '/srv/private/smli/GeoReliab/prepared'
+rendered = '/srv/private/smli/GeoReliab/rendered'
+manifests = '/srv/private/smli/GeoReliab/manifests'
+evidence = '/srv/private/smli/GeoReliab/evidence'
+
+vggt_source = '/home/smli/workspace/vggt'
+mast3r_source = '/home/smli/workspace/external/mast3r'
+dust3r_source = '/home/smli/workspace/external/mast3r/dust3r'
+croco_source = '/home/smli/workspace/external/mast3r/dust3r/croco'
+vggt_env = '/home/smli/miniforge3/envs/vggt_env'
+mast3r_env = '/home/smli/miniforge3/envs/surg_mast3r'
+vggt_python = '3.10.20'
+vggt_torch = '2.3.1+cu121'
+mast3r_python = '3.10.20'
+mast3r_torch = '2.5.1+cu121'
+typing_extensions_site = '/home/smli/miniforge3/pkgs/typing_extensions-4.15.0-pyhcf101f3_0/site-packages'
+
+[resources]
+dtu_sampleset_url = 'https://roboimagedata2.compute.dtu.dk/data/MVS/SampleSet.zip'
+dtu_points_url = 'https://roboimagedata2.compute.dtu.dk/data/MVS/Points.zip'
+dtu_rectified_url = 'https://roboimagedata2.compute.dtu.dk/data/MVS/Rectified.zip'
+dtu_sampleset_bytes = 6905656531
+dtu_sampleset_sha256 = 'f719a5259db9257c4716ce014964444c1bb82fbb893e0d100b5fa01b82c029c7'
+dtu_points_bytes = 6966262016
+dtu_points_sha256 = '85862c8844978e8958040982b0071442d2a47fe67391aa1aca9a743153c9edc1'
+dtu_rectified_bytes = 129593443783
+dtu_rectified_etag = '1e2c5f05c7-5652dcf644cb3'
+
+vggt_checkpoint = '/home/smli/models/vggt/model.pt'
+vggt_checkpoint_sha256 = 'd15bf50a8615c8225ed48b51ea5cac673d82442ec0309036df555a053253afe0'
+vggt_source_commit = 'a288dd0f14786c93483e45524328726ab7b1b4ce'
+
+mast3r_checkpoint = '/home/smli/models/mast3r/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric/model.safetensors'
+mast3r_checkpoint_sha256 = '0a615eb05fa9db654050aa655945ee5696e7c6c1b7f93f1ee8c37249010f6feb'
+mast3r_config = '/home/smli/models/mast3r/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric/config.json'
+mast3r_config_sha256 = '718eb93dc4f9e4332b60cc0041af962d712cbd346d7770ce35c5b22cff68eae4'
+mast3r_source_commit = 'f5209afc300cec36239a7ac992263f36847bbba0'
+dust3r_source_commit = '3cc8c88c413bb9e34c41db0e0eef99c2ee010b12'
+croco_source_commit = 'd7de0705845239092414480bd829228723bf20de'
+typing_extensions_version = '4.15.0'
+typing_extensions_sha256 = '433d11d170d3a24d2eb065ebc1bfe848cea7e3d7ce68567ab52bea2d4c2f7ed8'
+
+tartanair_image_url = 'https://huggingface.co/datasets/theairlabcmu/tartanair2/resolve/0d2d145e973832742a2aaa04b7d2ebffc8d82817/GreatMarsh/Data_easy/image_lcam_front.zip'
+tartanair_image_bytes = 35240547705
+tartanair_image_etag = '6f8cc2fb7da51f89202db8b6e742f50c929181b27cc8e7063f30d255ec773dd6'
+tartanair_depth_url = 'https://huggingface.co/datasets/theairlabcmu/tartanair2/resolve/0d2d145e973832742a2aaa04b7d2ebffc8d82817/GreatMarsh/Data_easy/depth_lcam_front.zip'
+tartanair_depth_bytes = 21045555462
+tartanair_depth_etag = '7f9e53935c7f96a868d647a15ddf2381953022a302cecec8382ef58f23acd834'
+tartanair_hf_commit = '0d2d145e973832742a2aaa04b7d2ebffc8d82817'
+tartanair_environment = 'GreatMarsh'
+tartanair_difficulty = 'easy'
+tartanair_trajectory = 'P000'
+tartanair_modalities = ['image', 'depth']
+tartanair_camera = 'lcam_front'
+
+[execution]
+devices = ['cuda:0', 'cuda:1']
+default_device = 'cuda:0'
+test_shards = 2
+screen_prefix = 'georeliab'
+download_resume = true
+archive_verify = 'zip-crc-and-central-directory'
+gpu_hour_limit = 50
+preflight_gpu_hour_reservation = 2.0
+storage_tb_limit = 1
+max_storage_bytes = 1000000000000
+home_read_only = true
+write_root_guard = '/srv/private/smli/GeoReliab'
+force_tmp_under_runtime = true

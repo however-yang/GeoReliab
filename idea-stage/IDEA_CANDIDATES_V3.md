@@ -1,3 +1,11 @@
+---
+status: superseded_historical
+authority: GEORELIAB_TASKBOOK.md
+execution_entry: false
+superseded_by: GEORELIAB_TASKBOOK.md#v2.2
+---
+
+> Historical document retained for provenance. It is not an execution entry; the v2.2 mainline and all current phase gates are defined by GEORELIAB_TASKBOOK.md.
 # Idea Candidates v3 — 完全放开的视觉方向（5-lens fan-out，Tier 2 并行）
 
 **日期**: 2026-07-26 | **生成**: 5 个 lens 子代理并行（method-transfer / untested-assumption / diagnostic / contradiction / scaling-regime），共 15 个原子候选

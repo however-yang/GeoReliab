@@ -1,60 +1,105 @@
-# Pilot Plan — 最小验证包（Phase 3）
-
-**日期**: 2026-07-26 | **原则**: offline-first，无真机，全部使用公开数据集与冻结模型
-**本仓库无现成执行环境** → 按 pipeline 规则产出具体 pilot 计划而非强行执行。
-
+---
+status: supporting
+authority: GEORELIAB_TASKBOOK.md
+execution_entry: false
+superseded_by: null
 ---
 
-## IDEA-A: Do 3D Geometry Foundation Models Know When They Fail?
+# GeoReliab v2.2 Development Pilot Plan
 
-- **Embodiment**: 虚拟（内窥镜相机 / 水下相机 / 通用多视图相机）；无真机
-- **Benchmark / simulator**:
-  - 干净域: DTU, ETH3D, ScanNet（GT depth/pose 齐全）
-  - 腐蚀域: Robust-MonoDepth 式 15-corruption 套件叠加于上述数据
-  - 散射域: SCARED / Hamlyn / C3VD（内窥镜，GT 来自结构光/CT）、FLSea / SQUID（水下，metric GT）
-  - 动态域: 任选 Bonn Dynamic / TUM dynamic 子集
-- **Baselines**:
-  - GFM 自带 confidence（VGGT / DUSt3R / MASt3R / MoGe，各自的 heuristic head）
-  - Trust3R（若代码可得；不可得则以 GNLL fine-tune 复现代理）
-  - 2D UQ 移植: MC-Dropout、GNLL fine-tune（来自 2501.08188 的最优法）
-  - 朴素信号: 光度重投影误差、Laplacian blur score
-- **Pilot type**: offline（冻结模型推理 + 指标计算）
-- **Compute estimate**: pilot 阶段 ≤ 8 GPU·h（单卡 24GB 足够，VGGT 推理为主）；全文实验约 200-300 GPU·h
-- **Human/operator time**: 数据准备 2-3 天（SCARED 申请协议注意）
-- **Success metrics**: AUSE↓, failure-detection AUROC↑, ECE-depth, risk@coverage
-- **Failure metrics**: 逐退化族的 confidence-error 相关系数、灾难性过信率（高confidence×大误差像素占比）、失败案例目录
-- **Safety concerns**: 无（离线）
-- **正信号判据**: 任一 GFM 在散射域 confidence-error Spearman ρ 相比干净域下降 >50%，且 training-free 信号将 AUROC 拉回 ≥0.15
-- **可发表的负结果**: 若 confidence 出人意料地稳健 → "Surprisingly Calibrated" 分析论文路线（改写 framing，benchmark 贡献不变）
-- **Pilot（第1周即可跑，v2 修订: 去水下）**:
-  1. VGGT 冻结推理: DTU 干净 200帧 + DTU 施加合成雾/低照度（2 个 severity）+ nuScenes-night 200帧
-  2. 画 confidence-error 散点 + sparsification 曲线
-  3. 判据: 退化档位上 AUSE 相对干净 DTU 的恶化幅度、confidence-error 相关系数随 severity 的衰减曲线
-  4. 预算: 1 GPU × 半天（合成退化用现成物理模型脚本，无需训练）
-  5. （可选）SCARED 200帧作为 hard-deployment 附加点——不阻塞主线
+## Gate status
 
-## IDEA-B: Selective 3D Reconstruction with Risk-Coverage Guarantees
+This is a development-only specification. It cannot authorize a run. The [authoritative Taskbook](../GEORELIAB_TASKBOOK.md#v2.2) is the only execution entry. The current status remains:
 
-- **Embodiment**: 同上
-- **Benchmark**: 同 IDEA-A 域集（复用数据管线——两个 idea 共享 70% 基础设施）
-- **Baselines**: GFM 自带 confidence 阈值化、Trust3R 不确定性阈值化、softmax-entropy 式朴素评分、非选择性 full-coverage 基线
-- **Pilot type**: offline
-- **Compute estimate**: pilot ≤ 6 GPU·h；全文约 150-250 GPU·h
-- **Success metrics**: risk@coverage 曲线 AUC、目标风险 α∈{5%,10%} 下实际风险违反率 ≤ α+1%
-- **Failure metrics**: 强 shift 下 guarantee 违反率、coverage 崩塌点、块级交换性检验
-- **正信号判据**: split-conformal 在同域上保证成立（违反率≤α）且 coverage ≥60%；跨域违反可控或可用 shift-aware 变体修复
-- **可发表的负结果**: 空间相关性/shift 导致朴素 conformal 失效的系统性刻画 → 本身即贡献（指出社区需要 geometry-specific conformal）
-- **Pilot（第1-2周）**:
-  1. 复用 IDEA-A pilot 的推理输出
-  2. 3 种 post-hoc 评分 × DTU split-conformal 校准 → risk-coverage 曲线
-  3. 判据: 至少一种评分显著优于自带 confidence（AUC 差 >5%）
-  4. 预算: 1 GPU × 半天（大部分是 CPU 统计计算）
+- ATTEMPT05_TERMINAL_INFRASTRUCTURE_FAILURE
+- PARTIAL_CORPUS_NOT_RESUMABLE
+- RECOVERY_EXECUTOR_NOT_QUALIFIED
+- NO_SCIENTIFIC_RESULT
 
-## IDEA-C（备胎，不设 pilot）
-标记为 `hold`；若 A/B novelty-check 双双失败再启动。
+The Pilot is blocked until Gate 1 CPU fault-matrix qualification and Gate 2 12-unit GPU recovery qualification both pass. A new explicit GPU and budget authorization is required. Attempt-05 outputs, including its 199 partial units, are not inputs.
 
-## 执行顺序建议
-1. **Week 1**: IDEA-A pilot（同时为 B 产出推理缓存）
-2. **Week 2**: IDEA-B pilot（复用缓存）
-3. 两个 pilot 共享基础设施 → 实际上是一次数据准备、两次分析，边际成本低
-4. **决策点**: pilot 后若 A 的"坍塌"信号强 → A 为主文，B 的 selective 机制并入 A 的 method 章节做次贡献；若 A 信号弱（模型稳健）→ B 升为主文
+## Purpose
+
+The Pilot tests whether a fresh, frozen native confidence signal exhibits:
+
+1. ranking of pose failure above chance;
+2. a positive failure-warning gap;
+3. directionally consistent behavior across the two frozen models;
+4. robustness that is not driven by one scene.
+
+It is not a formal confirmation, a model-training exercise, or a license to alter the protocol.
+
+## Frozen Pilot inventory
+
+- Three preregistered scenes selected from the frozen schedule using the bound selector and schedule identity.
+- Ten ordered states per scene.
+- Two frozen models with their approved adapters.
+- 3 scenes × 10 states × 2 models = 60 unique units.
+- Full-state paired/severity coverage is retained; no convenience subset is permitted.
+- A new Attempt/Pilot run and artifact root are mandatory.
+- Each unit binds schedule identity, scene/state identity, model, adapter, split, GPU identity, and canonical output hash.
+- Development scenes and outputs remain disjoint from any future confirmation inventory.
+
+No Attempt-05 prediction, receipt, ledger segment, output hash, or intermediate metric may be used to fill or select Pilot units.
+
+## Metrics and preregistered gates
+
+### Ranking
+
+Use native_warning_score to rank pose_failure.
+
+- Compute AUROC over every model and selected-scene state set.
+- Report the equal-weight macro AUROC across the two models.
+- GO ranking requires macro AUROC at least 0.60 and each model strictly above 0.50.
+- A missing positive/negative class makes the metric undefined and prevents a GO decision.
+
+### Warning gap
+
+Boundary Lag is alarm time minus failure-onset time; a positive value means a late warning.
+
+- Report pooled median Boundary Lag.
+- GO warning requires pooled median Boundary Lag greater than 0 and late-warning proportion at least 60 percent.
+- Both models must have positive median lag.
+- A missing failure group or undefined lag is not silently removed from the denominator.
+
+### Agreement and robustness
+
+- The two models must move in the same direction for every core metric; strict opposite signs are a model conflict. A zero effect is not a conflict, but it cannot satisfy a positive GO gate.
+- Leave-one-scene-out subsets must keep macro AUROC above 0.50 and median Boundary Lag above 0.
+- For three scenes, at least two of three scenes must be directionally consistent for both ranking and lag.
+- Scene dominance is reported; the Pilot cannot GO if one scene explains the entire effect.
+- Failure taxonomy cases must include Type A ranking-good/warning-bad, Type B early warning, and Type C correct rejection when present.
+
+## Decision precedence
+
+1. Any invalid, duplicate, overwrite, identity mismatch, incomplete canonical output, or coverage failure yields V4_PILOT_BLOCKED_EXECUTION.
+2. Undefined ranking or warning metrics yield V4_PILOT_INCONCLUSIVE; no denominator deletion.
+3. If macro AUROC is below 0.55, pooled median Boundary Lag is not positive, or the models conflict, publish V4_PILOT_SCIENTIFIC_NO_GO.
+4. If all GO conditions and robustness conditions are met, publish V4_PILOT_GO_TO_FULL_MVE.
+5. Otherwise publish V4_PILOT_INCONCLUSIVE.
+
+All Pilot outcomes are DEVELOPMENT_EVIDENCE_ONLY and NO_FORMAL_SCIENTIFIC_RESULT. The Pilot finalizer must not write MVE_FINALIZED or a formal scientific marker.
+
+## Extension rule
+
+A two-scene extension is permitted only when:
+
+- the three-scene result is INCONCLUSIVE rather than blocked or NO-GO;
+- the 15-scene power gate has passed;
+- a new explicit GPU, storage, and execution authorization exists;
+- the extension manifest is frozen before any extension output is inspected.
+
+The extension is five-scene development evidence in total (the original three plus two new scenes). It is the only allowed development expansion. A NO-GO permanently forbids the 400-unit full run for this route.
+
+## Non-negotiable boundaries
+
+- Do not train or fine-tune a confidence head.
+- Do not modify VGGT, models, adapters, schedule, split, corruption, or thresholds.
+- Do not use Attempt-05 partial outputs or formal confirmation outcomes for Pilot tuning.
+- Do not inspect formal-set metrics before the finalizer.
+- Do not auto-start the extension, formal confirmation, P3, Warning-aware method development, or any future stage.
+- Do not emit scientific claims from Pilot evidence.
+
+## Required machine-readable evidence
+
+Before execution, freeze the PilotPartitionManifest with scene IDs, unit IDs, selector version, schedule identity, model/adapter identity, scope hash, and disjointness proof. During execution, record completion receipts, canonical hashes, invalid/duplicate counters, GPU ownership, active hours, card hours, wall time, storage, and resume sessions. After execution, publish only the development decision and its evidence manifest.

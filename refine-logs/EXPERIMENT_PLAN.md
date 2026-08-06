@@ -1,162 +1,127 @@
-# Experiment Plan — GeoReliab
-
-> **当前执行覆盖（2026-07-26）**：本文件原 B1–B5 作为 GeoReliab 第一备选的完整路线保留。七天决策阶段改为 Geometry causal audit + GeoReliab 双 MVE；Geometry 通过时优先。机器可执行协议见 `../configs/dual_mve_protocol.toml`。
-
-**Problem**: 前馈多视图几何基础模型（VGGT/MASt3R/CUT3R）的 confidence 被整个下游生态（点云过滤、融合、SLAM/NVS 初始化）默认信任，但该信任在分布偏移下从未被检验。
-**Method Thesis**: 用 3D-一致的受控物理退化系统性揭示 GFM confidence 的失效规律及其下游代价，并证明简单的 training-free 信号即可在冻结模型上恢复失效检测。
-**Date**: 2026-07-26
-**Target**: CVPR 2027（11月中旬截稿）；arXiv 占坑 9月15日前
-**约束**: 4-8 GPU；与 SR 论文并行 → 全线以冻结推理为主；唯一训练环节是 GNLL baseline head（轻量）
-
+---
+status: supporting
+authority: GEORELIAB_TASKBOOK.md
+execution_entry: false
+superseded_by: null
 ---
 
-## Claim Map
+# GeoReliab v2.2 Experiment Plan
 
-| Claim | Why It Matters | Minimum Convincing Evidence | Linked Blocks |
-|-------|----------------|-----------------------------|---------------|
-| **C1（主）**: 多视图 GFM 的 native confidence 在退化下与误差脱钩，且这种脱钩对 confidence 依赖型下游管线造成可量化损害 | 下游生态每天在用 confidence 做过滤/融合；如果信任地基有裂缝，整个生态受影响——这不是"OOD 过信常识"，而是"ubiquitous practice 的代价量化" | ① 3 模型 × 3 数据集 × 5 退化 × 3 severity 的校准指标网格 + severity-ramp 曲线（GT 完美的合成主轴）；② 真实 shift 域复现同一规律；③ 下游任务在等稀疏度对照下的损失量化 | B1, B2, B3 |
-| **C2（辅）**: 无需任何训练，单遍特征评分（cheap）与视图重采样分歧（full）即可在冻结 GFM 上恢复失效检测，且在质量-效率 Pareto 上支配移植的 2D-UQ 方法 | 修复必须即插即用才对生态有意义（Trust3R 需重训练，无法覆盖任意 checkpoint） | 在 B1/B2 全部条件下 failure-AUROC / AUSE / risk@coverage 显著优于 native conf 与 ≥5 个 baseline；cheap 档单遍推理开销 <10%；效率 Pareto 图 | B4 |
+## Role and current state
 
-**Anti-claims 必须排除**（每条对应一个设计防御）:
-- A1 "miscalibration 是 GT 噪声的伪像" → 主轴用 GT 完美的合成数据 + **3D-一致物理退化**（雾用 GT 深度按 Koschmieder 模型渲染，跨视图几何一致——顺带与 ImageNet-C 式 2D 腐蚀套件形成方法论差异点）
-- A2 "OOD 过信是常识，不惊人" → 贡献重心放在 severity-结构化规律 + 下游损害美元账，不是"存在过信"本身
-- A3 "方法就是 TTA ensembling，不新" → cheap 档单遍无集成；full 档与等算力 baseline 对比；贡献重心声明为 finding+benchmark，方法定位 "simple strong fix"
-- A4 "confidence 过滤在实践里没问题" → 等稀疏度对照（random / gradient-ranking）直接检验
+This file is the claim-driven experiment specification for the single authoritative [mainline](../GEORELIAB_TASKBOOK.md#v2.2). It is not an execution entry and it cannot authorize compute. The current state is:
 
----
+- ATTEMPT05_TERMINAL_INFRASTRUCTURE_FAILURE
+- PARTIAL_CORPUS_NOT_RESUMABLE
+- RECOVERY_EXECUTOR_NOT_QUALIFIED
+- NO_SCIENTIFIC_RESULT
 
-## Paper Storyline
+Attempt-05 outputs, including the historical 199/400 materialization record, are excluded from all Pilot, confirmation, statistical, and claim decisions.
 
-- **Main paper must prove**: B1（受控主轴网格+severity曲线）→ B2（真实域外部有效性）→ B3（下游损害）→ B4（training-free 修复+Pareto）
-- **Appendix can support**: B5 失效模式分类学与案例分册、单目模型（MoGe/DAv2）对照、backbone 规模效应、conformal selective-reconstruction 协议全推导、SCARED hard-deployment 域
-- **Experiments intentionally cut**: 真机实验（无需）；VLA/具身下游（饱和赛道）；Trust3R 完整复现（代码不可得则只引用+GNLL 代理）；水下域（用户排除）
+## Main claim map
 
----
+| Claim | Evidence required | Decision boundary |
+|---|---|---|
+| C1: native confidence can rank degradation and task failure | CRR/SFR on paired counterfactuals, ranking metrics, and model-direction agreement | Ranking must be separated from warning; no method claim follows from ranking alone |
+| C2: ranking ability can differ from failure-warning ability | Boundary Lag, late-warning proportion, paired failure cases, and LOSO stability | A positive warning gap must be demonstrated before method development |
+| C3: scene reliability can transfer from point confidence to task failure | Pose/fusion failure linkage on the frozen task axis | The task-level result must be evaluated independently of point-level calibration |
+| C4: failure awareness can support admission or defer decisions | Scoped warning evidence after C1/C2 are confirmed | No admission-control method is designed before the warning gap is established |
 
-## Experiment Blocks
+Anti-claims: this project does not train a confidence head, modify VGGT, learn uncertainty, replace the native signal with a new estimator, or optimize thresholds after seeing formal outcomes.
 
-### Block B1: GeoReliab-C — 3D-一致受控退化校准网格（主锚点）
-- **Claim tested**: C1 前半（confidence-error 脱钩随 severity 增长）
-- **Why**: 论文的主表+主图；GT 完美 → 击破 A1；severity 分级 → 击破 A2 的"不惊人"
-- **Dataset / split / task**: DTU（object-centric 多视图，官方 eval split）、Hypersim（室内合成，完美深度，每场景采样 8-16 视图）、TartanAir（序列，完美深度+位姿；部分环境自带雾/夜变体作交叉验证）。每数据集 ~100-150 场景/序列段
-- **退化渲染（3D-一致，物理参数化，severity∈{1,2,3}）**:
-  1. 雾/散射: Koschmieder 模型 `I' = I·e^(−βd) + A(1−e^(−βd))`，d=GT深度 → 跨视图几何一致
-  2. 低照度+传感噪声: 增益压暗 + Poisson-Gaussian 噪声
-  3. 运动模糊: 沿相机运动方向的 PSF（TartanAir 有真实运动向量）
-  4. 散焦模糊: 深度依赖的 thin-lens PSF（同样用 GT 深度）
-  5. JPEG/压缩伪影（非物理对照组，连接 ImageNet-C 传统）
-- **Compared systems**: VGGT、MASt3R、CUT3R（全冻结）各自的 native confidence
-- **Metrics**（decisive 在前）: Spearman ρ(conf, |err|) per condition、AUSE、failure-detection AUROC/AUPR（阈值 τ=abs-rel>0.1 等多档）、ECE-depth、risk@coverage；主图 = ρ 与 AUROC 的 severity-ramp 曲线族
-- **Setup**: 每条件缓存 confidence 图+深度图+误差图（后续 Block 复用，只推理一次）；单 seed（推理确定性）
-- **Success criterion**: ≥2 个模型在 ≥3 类退化上 severity-3 的 ρ 相对 clean 下降 >50%，或 AUROC 跌破 0.65
-- **Failure interpretation**: 若 confidence 稳健 → 切换 "Surprisingly Calibrated" framing，B1 网格原样保留为正面 benchmark 贡献（论文仍成立，C2 改为"何时仍需外部信号"）
-- **Table/figure target**: Table 1（主网格）、Figure 2（severity-ramp 曲线族）、Figure 1（teaser: 高confidence×大误差可视化）
-- **Priority**: **MUST-RUN**
+## Run order
 
-### Block B2: 真实 shift 域外部有效性
-- **Claim tested**: C1（合成规律在真实域复现）
-- **Why**: 只有合成会被批"renders are not reality"；只有真实会被批 A1 GT噪声——两者互为盾牌
-- **Dataset**: nuScenes night/rain 子集（前视相机序列，LiDAR 投影 GT，标注 GT 稀疏性）、TUM/Bonn dynamic（Kinect GT，动态非刚性）、ETH3D 低纹理室内子集。可选附录: SCARED（内窥镜）
-- **Compared systems / Metrics**: 同 B1（GT 稀疏时只算有效像素；报告 GT 密度以示诚实）
-- **Success criterion**: B1 中每类退化的定性规律（哪类退化最毁 confidence、失效空间结构）在对应真实域方向一致
-- **Failure interpretation**: 合成-真实规律不一致本身是发现（合成 corruption benchmark 的外部效度问题）→ 并入 B5 讨论
-- **Table/figure target**: Table 2、Figure 4
-- **Priority**: **MUST-RUN**（SCARED 部分 NICE-TO-HAVE）
+The order is a hard gate sequence, not a suggestion.
 
-### Block B3: 下游损害 + 等稀疏度效用检验
-- **Claim tested**: C1 后半（脱钩造成实际损害）+ 排除 A4
-- **Why**: 把"校准指标坍塌"翻译成"重建质量损失"——审稿人无法用"常识"驳回的部分
-- **Task 1 — confidence 过滤重建**: 按 confidence 保留 top-{90,70,50,30}% 点 → 点云 accuracy/completeness/F-score（DTU 官方协议）+ TSDF 融合 Chamfer；**等稀疏度对照**: random drop、图像梯度排序、光度一致性排序
-- **Task 2 — confidence 加权多视图融合**: confidence 加权 vs 等权 vs oracle(误差)加权的深度融合精度
-- **Setup**: 复用 B1 缓存；条件取 {clean, 每类退化 severity-2} 代表性子集
-- **Success criterion**: 退化条件下 confidence 过滤相对 random 对照的增益消失或反转（<1% 或负增益），oracle 加权与 confidence 加权的 gap 显著放大
-- **Failure interpretation**: 若过滤仍有效 → C1 收窄为"校准层面失效但排序仍可用"（rank vs calibration 分离，本身是有价值的精细发现）
-- **Table/figure target**: Table 3、Figure 5（kept-fraction 曲线）
-- **Priority**: **MUST-RUN**
+### Block 0 — Infrastructure qualification
 
-### Block B4: Training-free 双档修复 + 效率 Pareto + selective 协议
-- **Claim tested**: C2 + 排除 A3
-- **Why**: 论文的方法贡献；必须证明"简单但没人做过且立即可用"
-- **方法规格**:
-  - **cheap（单遍）**: ① encoder token 对干净参考库（ScanNet/CO3D 采样 ~50k tokens）的 kNN 特征距离，投影回像素; ② 跨视图注意力熵。两信号 per-image z-score 融合
-  - **full（K遍）**: K=8 视图子集/顺序重采样 → 对齐后逐像素深度方差 + 位姿分歧（epistemic 代理）；可选叠加光度扰动
-  - **selective 协议**: split-conformal（**image-level 校准保交换性**，措辞 evaluation protocol 非 guarantees）→ risk@coverage 报告规范
-- **Compared systems（3 个 baseline 家族，压缩至强者）**:
-  1. 启发式家族: native confidence、光度重投影误差、2 个经典 stereo confidence 度量移植（PKRN、左右一致性的跨视图类比；覆盖 W3 文献义务）
-  2. 移植 UQ 家族: GNLL head fine-tune（冻结 backbone，唯一训练环节，~40 GPU·h）、MC-Dropout（推理期注入 dropout）
-  3. Trust3R（代码可得则加；不可得则文字对比 + GNLL 作训练式代理）
-- **Metrics**: failure-AUROC/AUPR、AUSE、risk@coverage AUC + **效率轴**（相对单遍推理的额外延迟/FLOPs）→ Pareto 图；等算力对照（full K=8 vs GNLL×8 ensemble）
-- **Success criterion**: cheap 在多数条件超越全部启发式家族且开销<10%；full 在全部条件 AUROC ≥ native + 0.15；二者构成 Pareto 前沿
-- **Failure interpretation**: cheap 失败 full 成功 → 方法章节只保 full+效率讨论；双双失败 → 论文回落为 finding+benchmark（B1-B3 自足）
-- **Table/figure target**: Table 4（方法对比）、Figure 6（Pareto）、Figure 7（risk-coverage）
-- **Priority**: **MUST-RUN**（selective 协议部分若时间紧移附录）
+Purpose: establish durable, auditable execution before collecting development or formal evidence.
 
-### Block B5: 失效分类学与定性诊断（简洁性/深度检查）
-- **Claim tested**: 支撑 C1 的机制解释力；顺带覆盖"simplicity check"（证明不需要更重的方案）
-- **Why**: CVPR 分析文的"记忆点"；给社区可操作的检查清单
-- **内容**: ① 逐退化类型的 confidence 失效模式分类（镜面过信/低纹理漏报/雾中远景塌陷等）+ 每类 top-losing 案例分册; ② confidence 的 rank-vs-calibration 分离分析; ③ 简洁性对照: cheap 方法 vs "重型替代"（在 GFM 上加训练式 evidential head 的成本-收益，引用 Trust3R 定位差异）
-- **Priority**: NICE-TO-HAVE（主图 1-2 张进正文，其余附录）
+1. Qualify the locked toolchain and Ruff environment.
+2. Run the Gate 1 CPU fault matrix. Every injected failure must classify deterministically as COMPLETE, SAFE_RETRY, QUARANTINED, or FATAL_IDENTITY_MISMATCH; UNKNOWN and the old broad audit reason are forbidden in new evidence.
+3. Obtain separate authorization for the Gate 2 12-unit non-scientific GPU recovery smoke.
+4. Stop fail-closed on any qualification, identity, budget, or evidence-integrity failure.
 
-**Frontier necessity check**: 本文有意不引入 LLM/Diffusion 组件（分析+轻方法定位），按规则显式声明而非强造 frontier block。
+Block 0 creates engineering evidence only. It never creates a paper result, scientific marker, or formal claim.
 
----
+### Block 1 — Fresh development Pilot
 
-## Run Order and Milestones
+Prerequisites: Gate 1 and Gate 2 pass, a clean canonical worktree is identified, and a new explicit execution authorization is recorded.
 
-| Milestone | Goal | Runs | Decision Gate | Cost | Risk |
-|-----------|------|------|---------------|------|------|
-| **M0 Sanity**（W1: ~8/4） | 数据管线+退化渲染+指标实现正确性 | R001-R004 | **MVE 门**: DTU 20场景×雾/低照度 severity-ramp——ρ 是否随 severity 下降？① 显著下降→主 framing GO ② 稳健→切换 "Surprisingly Calibrated" framing（流程不变） | ~10 GPU·h | 渲染管线 bug 污染结论 → 用 TartanAir 自带雾变体交叉验证渲染真实性 |
-| **M1 主网格**（W2-3: ~8/18） | B1 全网格 + 推理缓存 | R010-R018 | 主表成型；确认 ≥2 模型 ≥3 退化的失效规律 | ~150 GPU·h | CUT3R 序列接口与 VGGT 批式不一致 → 统一为窗口式输入适配层 |
-| **M2 真实域+下游**（W4: ~8/25） | B2 + B3（复用缓存） | R020-R027 | 合成↔真实规律一致性检查；下游损害是否量化成立 | ~60 GPU·h | nuScenes LiDAR GT 稀疏 → 报告 GT 密度+只算有效像素 |
-| **M3 方法**（W5-6: ~9/8） | B4 cheap+full+baselines | R030-R039 | cheap/full 是否过成功判据 → 定方法章节规模 | ~120 GPU·h（含 GNLL 训练 40） | MC-Dropout 在无 dropout 架构上不适用 → 文中说明并以扰动集成替代 |
-| **M4 arXiv 冻结**（9/15） | v1 写作+挂 arXiv 占坑 | — | B1-B4 核心表图齐 → 提交 arXiv | — | SR Stage B 争时间 → M4 只要求核心表，polish 后移 |
-| **M5 Polish**（9-10月） | B5 + 附录 + SCARED + 补实验 | R040+ | CVPR 投稿版定稿（11月中旬） | ~60 GPU·h | 竞品占坑 → arXiv 已对冲 |
+- Use a fresh run and artifact root; do not read or reference Attempt-05 predictions.
+- Use two frozen models, the frozen adapters and protocol, three preregistered scenes, all ten states, and 60 units total.
+- Evaluate native warning score against pose failure. Report development-only ranking, warning-gap, model-agreement, LOSO, and failure-taxonomy evidence.
+- Mark every output DEVELOPMENT_EVIDENCE_ONLY and NO_FORMAL_SCIENTIFIC_RESULT.
+- Do not write MVE_FINALIZED or any formal scientific marker.
 
-**First three runs**: R001 数据下载与格式统一（DTU/Hypersim/TartanAir）→ R002 退化渲染管线+TartanAir 雾变体交叉验证 → R003 MVE（20 场景 severity-ramp）
+The Pilot decision is GO, INCONCLUSIVE, NO-GO, or EXECUTION_BLOCKED. A NO-GO ends the full-run route. An INCONCLUSIVE result may request a two-scene extension only after a new authorization.
 
-## Compute and Data Budget
-- **Total estimated GPU-hours**: ~400（几乎全推理；峰值需求 = M1 期间 4 卡并行 × 2-3 天）
-- **Data preparation needs**: DTU/Hypersim/TartanAir/TUM/ETH3D 直接下载；nuScenes 需注册；SCARED 需协议（可选，尽早申请不阻塞）
-- **Human evaluation needs**: 无
-- **Biggest bottleneck**: 退化渲染管线的物理正确性验证（M0 唯一严肃工程投入）＋与 SR 论文的时间切分
+### Block 2 — Confirmation preparation
 
-## Risks and Mitigations
-- **R1 主发现落空（confidence 稳健）**: M0 即知；framing 切换预案已内置，全部实验产出复用
-- **R2 竞品抢发（Trust3R 扩展/VGGT-UQ 续作）**: 9/15 arXiv 硬门；M1 结束即具备占坑材料
-- **R3 渲染被批不真实**: TartanAir 原生雾变体 + nuScenes 真实雨夜双重交叉验证
-- **R4 SR 论文挤占时间**: 全线冻结推理设计使实验可无人值守批跑；写作是真正的串行瓶颈——W5 起每周固定 2 天写作
-- **R5 CUT3R/MASt3R 工程适配超预期**: 先保 VGGT+MASt3R 双模型成文底线，CUT3R 为第三模型增强
+Only a Pilot GO or an explicitly permitted inconclusive extension can open this block.
 
-## Final Checklist
-- [ ] Main paper tables are covered（T1 主网格/T2 真实域/T3 下游/T4 方法）
-- [ ] Novelty is isolated（B1 的 3D-一致退化 vs 2D 腐蚀套件；B4 的 training-free vs Trust3R 训练式）
-- [ ] Simplicity is defended（B5.③ cheap vs 重型替代）
-- [ ] Frontier contribution is justified or explicitly not claimed（显式不 claim）
-- [ ] Nice-to-have runs are separated（SCARED/B5/selective 协议均已标注）
+- Run the preregistered synthetic power design without using Attempt-05 or Pilot outcomes as tuning data.
+- Freeze the confirmation scope manifest, selector version, raw/semantic/domain-separated schedule identities, seed design, and union/disjointness proof.
+- Prepare the 17-scene and 15-scene alternatives and their expected unit counts.
+- Do not start full confirmation until the power and scope gates are closed and a new budget contract is present.
 
----
+### Block 3 — Formal confirmation
 
-## Dual-MVE Execution Override（当前权威）
+- Run only the preregistered confirmation scope.
+- Generate StaticRank, CRR, RWG, SFR, and Boundary Lag evidence through the locked evaluator.
+- Keep development scenes outside the confirmatory inventory.
+- Allow recovery sessions only within the same Attempt-06 identity through SameAttemptSessionUnionManifest; cross-Attempt unions and Attempt-05 references are rejected.
+- The finalizer must verify identity, hashes, transaction closure, coverage, and scope before any formal scientific result is published.
 
-### Day 0–7
+### Block 4 — Failure Case Taxonomy
 
-- Day 0–3：确认 Spatial-MLLM、SpatialStack、GUIDE 三候选中任意至少两个 checkpoint 可复现且可挂接 fusion；同时确认 VGGT、MASt3R、VSI-Bench、CVT-Bench、DTU 与 TartanAir 数据许可和本地 hash。
-- Day 3–7：Geometry 执行 matched scene swap、spatial permutation、mean replacement、activation patching；GeoReliab 执行 fog、low-light-noise、defocus ×3 severity 与 coverage-matched random downstream control。
-- 所有真实运行必须通过 `python -m georeliab_mve readiness`；当前缺外部资源时状态为 `BLOCKED`。
+Every development and confirmation report should classify representative cases:
 
-### 统计与 gate
+- Type A: ranking is correct but warning fails — high confidence with severe task failure.
+- Type B: warning is early or conservative — confidence falls before task failure.
+- Type C: correct rejection — confidence falls and failure occurs.
 
-- scene/sequence 是唯一独立统计单位；paired scene bootstrap 10,000 次，95% CI；主要多重比较 Holm 校正。
-- Geometry faithful-use 门：两个模型分别在至少两个 strata 上 `Δgeom ≥ 0.05`、CI 下界 `>0`、patch recovery `≥0.30`。
-- Geometry non-dependence 门：±0.02 TOST 通过，且 post-fusion representation 确实改变、semantic control 不变。
-- GeoReliab confidence 门只接受 CI 支持的相对 `ρ` 下降或 AUROC 失效；另需两个不同 model-condition 的下游负损害 CI 与 zero-update AUROC gain。
-- invalid output 一律记为 failure；fixture 一律 `NON_SCIENTIFIC_FIXTURE`。
+Taxonomy is diagnostic evidence and cannot replace preregistered quantitative gates.
 
-### 后续路线
+### Block 5 — Method development
 
-- 8/03 冻结唯一主线；8/04–8/23 扩展两个模型、两个 benchmark、三个 fusion 层或执行 GeoReliab B1+B3。
-- 8/24–9/06 完成真实域/反事实、negative controls、failure taxonomy 和独立重跑。
-- 9/07–9/15 完成主表、主图、论文骨架及内部冻结；CVPR 2027 官方截止日仍为 TBA。
-- 双 MVE 上限 50 GPU·h；Geometry 全线 160 GPU·h/≤1 TB；GeoReliab 全线约 400 GPU·h/1–5 TB。
+Only after a positive, reproducible warning gap is confirmed may a warning-aware repair, admission policy, or defer mechanism be designed. The method cannot be proposed first and justified by a later search for an effect.
 
-完整 contract、CLI 和外部阻塞说明见 `../docs/DUAL_MVE_PROTOCOL.md`。
+## Development Pilot evidence contract
+
+The Pilot must answer only:
+
+1. Does native reliability rank pose failure above chance?
+2. Is there a positive Boundary Lag / late-warning pattern?
+3. Do both frozen models agree in direction?
+4. Does the pattern survive leave-one-scene-out analysis and the taxonomy review?
+
+Minimum Pilot thresholds are specified in idea-stage/PILOT_PLAN.md. Metrics are viewed only for development evidence; no formal confirmation decision may use an unregistered threshold adjustment.
+
+## Confirmation evidence contract
+
+Formal evidence must retain the paired counterfactual DTU axis and the TartanAir severity axis:
+
+- CRR and SFR belong to the paired counterfactual axis.
+- Boundary Lag belongs to the ordered severity axis.
+- The complete 20-scene/400-unit schedule remains a frozen candidate inventory, not the current Pilot.
+- The final confirmatory scope is the approved 17-scene or 15-scene manifest, not an opportunistic subset.
+
+## Resource and risk controls
+
+- No automatic progression from qualification to Pilot or from Pilot to confirmation.
+- GPU and storage budgets are cumulative across historical Attempt-05 accounting, recovery smoke, Pilot/extension, and confirmation.
+- Missing telemetry fails closed; wall time, GPU-active time, card hours, and storage are recorded separately.
+- No new dependency, code path, protocol TOML, data split, corruption rule, threshold, adapter, or model is introduced by this document.
+- If a Gate fails, preserve NO_SCIENTIFIC_RESULT and produce a machine-readable blocker; do not infer a scientific no-go from infrastructure failure.
+
+## Execution checklist
+
+- [ ] Taskbook is the only execution entry.
+- [ ] Gate 1 CPU matrix is complete and fully classified.
+- [ ] Gate 2 GPU smoke has explicit authorization and passes exactly-once checks.
+- [ ] Pilot manifest and 60-unit inventory are frozen before execution.
+- [ ] Pilot outputs are isolated as development evidence.
+- [ ] Power and confirmation scope manifests are frozen before formal execution.
+- [ ] Finalizer verifies the complete scoped inventory before publication.
+- [ ] NO_SCIENTIFIC_RESULT remains true until formal finalization.

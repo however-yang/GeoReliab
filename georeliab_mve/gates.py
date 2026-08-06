@@ -7,7 +7,7 @@ from enum import Enum
 import math
 from typing import Any, Iterable
 
-from .contracts import ScientificValidity
+from .contracts import RunMode, ScientificValidity
 
 
 GEOMETRY_DELTA_THRESHOLD = 0.05
@@ -36,13 +36,19 @@ class GateStatus(str, Enum):
     FAIL = "FAIL"
     BLOCKED = "BLOCKED"
 
+    @property
+    def is_terminal(self) -> bool:
+        return self in (GateStatus.PASS, GateStatus.FAIL)
+
 
 class SelectedTrack(str, Enum):
     GEOMETRY = "GEOMETRY_CAUSAL_AUDIT"
     GEORELIAB = "GEORELIAB"
     STOP = "STOP_AND_RETURN_RESOURCES"
-    BLOCKED = "BLOCKED_MISSING_EVIDENCE"
+    BLOCKED = "BLOCKED_PENDING_EVIDENCE"
+    BLOCKED_PENDING_GEOMETRY = 'BLOCKED_PENDING_GEOMETRY'
     NON_SCIENTIFIC = "BLOCKED_NON_SCIENTIFIC_FIXTURE"
+    NON_SCIENTIFIC_SMOKE = 'BLOCKED_NON_SCIENTIFIC_SMOKE'
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +137,8 @@ class GeometryGateInput:
     matched_intervention_effective: bool
     evidence: tuple[GeometryEvidence, ...]
     fixed_inputs_verified: bool
+    run_mode: RunMode = RunMode.REAL
+    evidence_schema_version: str = '1.1'
 
 
 def _models_with_geometry_coverage(
@@ -172,14 +180,39 @@ def _models_with_control_coverage(
     }
 
 
+def _scientific_evidence_reason(
+    scientific_validity: ScientificValidity,
+    run_mode: RunMode,
+    evidence_schema_version: str,
+) -> str | None:
+    if run_mode is RunMode.SMOKE or (
+        scientific_validity is ScientificValidity.NON_SCIENTIFIC_SMOKE
+    ):
+        return 'NON_SCIENTIFIC_SMOKE'
+    if run_mode is RunMode.FIXTURE or (
+        scientific_validity is ScientificValidity.NON_SCIENTIFIC_FIXTURE
+    ):
+        return 'NON_SCIENTIFIC_FIXTURE'
+    if scientific_validity is not ScientificValidity.SCIENTIFIC:
+        return 'NON_SCIENTIFIC_EVIDENCE'
+    if run_mode is not RunMode.REAL:
+        return 'SCIENTIFIC_REAL_TEST_EVIDENCE_REQUIRED'
+    if evidence_schema_version != '1.1':
+        return 'SCHEMA_V1_1_TEST_EVIDENCE_REQUIRED'
+    return None
+
+
 def evaluate_geometry_gate(value: GeometryGateInput) -> GateDecision:
     """Apply the approved Geometry MVE engineering and scientific gates."""
 
-    if value.scientific_validity is not ScientificValidity.SCIENTIFIC:
+    evidence_reason = _scientific_evidence_reason(
+        value.scientific_validity, value.run_mode, value.evidence_schema_version
+    )
+    if evidence_reason is not None:
         return GateDecision(
             lane="geometry",
             status=GateStatus.BLOCKED,
-            reason_codes=("NON_SCIENTIFIC_FIXTURE",),
+            reason_codes=(evidence_reason,),
             details={},
             scientific_validity=value.scientific_validity,
         )
@@ -311,6 +344,17 @@ class GeoReliabConditionEvidence:
     relative_decline_ci_lower: float | None = None
     failure_auroc_ci_upper: float | None = None
     extreme_ood_only: bool = False
+    scene_ids: tuple[str, ...] = ()
+    scene_count: int = 0
+    invalid_count: int = 0
+    n_resamples: int = 0
+    relative_decline_raw_p: float | None = None
+    relative_decline_adjusted_p: float | None = None
+    relative_decline_holm_rejected: bool = False
+    failure_auroc_raw_p: float | None = None
+    failure_auroc_adjusted_p: float | None = None
+    failure_auroc_holm_rejected: bool = False
+    branch_reason_codes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model:
@@ -342,6 +386,10 @@ class GeoReliabConditionEvidence:
             self.failure_auroc,
             self.relative_decline_ci_lower,
             self.failure_auroc_ci_upper,
+            self.relative_decline_raw_p,
+            self.relative_decline_adjusted_p,
+            self.failure_auroc_raw_p,
+            self.failure_auroc_adjusted_p,
         )
         if any(
             value is not None
@@ -365,14 +413,30 @@ class GeoReliabConditionEvidence:
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")
+        if self.scene_count < 0 or self.invalid_count < 0 or self.n_resamples < 0:
+            raise ValueError('scene_count, invalid_count, and n_resamples must be non-negative')
+        for name in ('relative_decline_holm_rejected', 'failure_auroc_holm_rejected'):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f'{name} must be boolean')
+        if any(not isinstance(item, str) or not item for item in self.scene_ids):
+            raise ValueError('scene_ids must contain non-empty strings')
+        if any(not isinstance(item, str) or not item for item in self.branch_reason_codes):
+            raise ValueError('branch_reason_codes must contain non-empty strings')
+
+    def to_dict(self) -> dict[str, Any]:
+        result = asdict(self)
+        result['severity_rhos'] = list(self.severity_rhos)
+        result['scene_ids'] = list(self.scene_ids)
+        result['branch_reason_codes'] = list(self.branch_reason_codes)
+        return result
 
     @property
     def severity3_rho(self) -> float:
         return self.severity_rhos[-1]
 
     def rho_ramp_monotonic(self) -> bool:
-        magnitudes = (abs(self.clean_rho), *(abs(item) for item in self.severity_rhos))
-        return all(left >= right for left, right in zip(magnitudes, magnitudes[1:]))
+        directional = (self.clean_rho, *self.severity_rhos)
+        return all(left >= right for left, right in zip(directional, directional[1:]))
 
     def verification_passed(self) -> bool:
         return (
@@ -383,21 +447,27 @@ class GeoReliabConditionEvidence:
         )
 
     def confidence_gate_hit(self) -> bool:
-        clean_magnitude = abs(self.clean_rho)
+        clean_rho = self.clean_rho
         relative_decline = (
-            (clean_magnitude - abs(self.severity3_rho)) / clean_magnitude
-            if clean_magnitude >= 0.2
+            (clean_rho - self.severity3_rho) / clean_rho
+            if clean_rho >= 0.2
             else float("-inf")
         )
         relative_supported = (
             relative_decline > GEORELIAB_RHO_DECLINE_THRESHOLD
             and self.relative_decline_ci_lower is not None
             and self.relative_decline_ci_lower > GEORELIAB_RHO_DECLINE_THRESHOLD
+            and self.relative_decline_adjusted_p is not None
+            and self.relative_decline_adjusted_p <= 0.05
+            and self.relative_decline_holm_rejected
         )
         auroc_supported = (
             self.failure_auroc < GEORELIAB_FAILURE_AUROC_THRESHOLD
             and self.failure_auroc_ci_upper is not None
             and self.failure_auroc_ci_upper < GEORELIAB_FAILURE_AUROC_THRESHOLD
+            and self.failure_auroc_adjusted_p is not None
+            and self.failure_auroc_adjusted_p <= 0.05
+            and self.failure_auroc_holm_rejected
         )
         return relative_supported or auroc_supported
 
@@ -458,16 +528,24 @@ class GeoReliabGateInput:
     conditions: tuple[GeoReliabConditionEvidence, ...]
     downstream_harm: tuple[DownstreamHarmEvidence, ...]
     zero_update: tuple[ZeroUpdateEvidence, ...]
+    run_mode: RunMode = RunMode.REAL
+    evidence_schema_version: str = '1.1'
+    split: str = 'test'
+    schedule_counts: dict[str, int] = None
+    downstream_schedule_counts: dict[str, int] = None
 
 
 def evaluate_georeliab_gate(value: GeoReliabGateInput) -> GateDecision:
     """Apply the approved GeoReliab MVE gate without optimistic fallback."""
 
-    if value.scientific_validity is not ScientificValidity.SCIENTIFIC:
+    evidence_reason = _scientific_evidence_reason(
+        value.scientific_validity, value.run_mode, value.evidence_schema_version
+    )
+    if evidence_reason is not None:
         return GateDecision(
             lane="georeliab",
             status=GateStatus.BLOCKED,
-            reason_codes=("NON_SCIENTIFIC_FIXTURE",),
+            reason_codes=(evidence_reason,),
             details={},
             scientific_validity=value.scientific_validity,
         )
@@ -490,6 +568,44 @@ def evaluate_georeliab_gate(value: GeoReliabGateInput) -> GateDecision:
                 ),
                 "ready_models": sorted(ready_models),
                 "required_datasets_ready": value.required_datasets_ready,
+            },
+            scientific_validity=value.scientific_validity,
+        )
+
+    if value.split != 'test':
+        return GateDecision(
+            lane='georeliab',
+            status=GateStatus.FAIL,
+            reason_codes=('P3_SCHEDULE_COUNTS_INVALID',),
+            details={'split': value.split, 'schedule_counts': value.schedule_counts or {}},
+            scientific_validity=value.scientific_validity,
+        )
+    if not _p3_schedule_counts_valid(value.schedule_counts):
+        return GateDecision(
+            lane='georeliab',
+            status=GateStatus.BLOCKED,
+            reason_codes=('P3_SCHEDULE_COUNTS_INVALID',),
+            details={'split': value.split, 'schedule_counts': value.schedule_counts or {}},
+            scientific_validity=value.scientific_validity,
+        )
+
+    condition_reason = _validate_georeliab_condition_grid(value.conditions)
+    if condition_reason is not None:
+        return GateDecision(
+            lane='georeliab',
+            status=GateStatus.FAIL,
+            reason_codes=(condition_reason,),
+            details={'condition_count': len(value.conditions)},
+            scientific_validity=value.scientific_validity,
+        )
+    if value.schedule_counts.get('invalid', 0) > 0 or any(item.invalid_count > 0 for item in value.conditions):
+        return GateDecision(
+            lane='georeliab',
+            status=GateStatus.FAIL,
+            reason_codes=('INVALID_OUTPUT_IN_VERIFIED_CONDITION',),
+            details={
+                'condition_invalid': sum(item.invalid_count for item in value.conditions),
+                'schedule_invalid': value.schedule_counts.get('invalid'),
             },
             scientific_validity=value.scientific_validity,
         )
@@ -534,6 +650,47 @@ def evaluate_georeliab_gate(value: GeoReliabGateInput) -> GateDecision:
         reason_codes.append("TARTANAIR_SANITY_GATE_NOT_MET")
     if not confidence_pass:
         reason_codes.append("CONFIDENCE_FAILURE_GATE_NOT_MET")
+        return GateDecision(
+            lane="georeliab",
+            status=GateStatus.FAIL,
+            reason_codes=tuple(reason_codes),
+            details={
+                "confidence_models": sorted(confidence_models),
+                "verified_condition_count": len(verified_conditions),
+                "tartanair_native_fog_sanity": value.tartanair_native_fog_sanity,
+                "p5_skip_reason": "P4_CONFIDENCE_PHENOMENON_GATE_FAILED",
+            },
+            scientific_validity=value.scientific_validity,
+        )
+    if reason_codes:
+        return GateDecision(
+            lane="georeliab",
+            status=GateStatus.FAIL,
+            reason_codes=tuple(reason_codes),
+            details={
+                "confidence_models": sorted(confidence_models),
+                "verified_condition_count": len(verified_conditions),
+                "tartanair_native_fog_sanity": value.tartanair_native_fog_sanity,
+            },
+            scientific_validity=value.scientific_validity,
+        )
+    if not _p5_downstream_schedule_counts_valid(value.downstream_schedule_counts):
+        return GateDecision(
+            lane='georeliab',
+            status=GateStatus.BLOCKED,
+            reason_codes=('P5_DOWNSTREAM_SCHEDULE_COUNTS_INVALID',),
+            details={'downstream_schedule_counts': value.downstream_schedule_counts or {}},
+            scientific_validity=value.scientific_validity,
+        )
+    execution_reason = _validate_p5_execution_grid(value.downstream_harm, value.zero_update)
+    if execution_reason is not None:
+        return GateDecision(
+            lane='georeliab',
+            status=GateStatus.FAIL,
+            reason_codes=(execution_reason,),
+            details={'downstream_harm_count': len(value.downstream_harm), 'zero_update_count': len(value.zero_update)},
+            scientific_validity=value.scientific_validity,
+        )
     if not harm_pass:
         reason_codes.append("DOWNSTREAM_HARM_GATE_NOT_MET")
     if not zero_update_pass:
@@ -559,6 +716,61 @@ def evaluate_georeliab_gate(value: GeoReliabGateInput) -> GateDecision:
         scientific_validity=value.scientific_validity,
     )
 
+
+def _p3_schedule_counts_valid(counts: dict[str, int] | None) -> bool:
+    if not isinstance(counts, dict):
+        return False
+    if counts.get('scheduled') != 400 or counts.get('completed') != 400 or counts.get('missing') != 0:
+        return False
+    invalid = counts.get('invalid')
+    return isinstance(invalid, int) and 0 <= invalid <= 400
+
+
+def _p5_downstream_schedule_counts_valid(counts: dict[str, int] | None) -> bool:
+    if not isinstance(counts, dict):
+        return False
+    return counts.get('scheduled') == 6 and counts.get('completed') == 6 and counts.get('missing') == 0
+
+
+def _validate_georeliab_condition_grid(
+    conditions: tuple[GeoReliabConditionEvidence, ...]
+) -> str | None:
+    expected_pairs = {
+        (model, corruption)
+        for model in GEORELIAB_MVE_REQUIRED_MODELS
+        for corruption in GEORELIAB_REQUIRED_CORRUPTIONS
+    }
+    observed_pairs = [(item.model, item.corruption) for item in conditions]
+    if len(observed_pairs) != len(expected_pairs) or set(observed_pairs) != expected_pairs:
+        return 'CONDITION_GRID_INVALID'
+    if len(set(observed_pairs)) != len(observed_pairs):
+        return 'CONDITION_GRID_INVALID'
+    scene_sets = {tuple(item.scene_ids) for item in conditions}
+    if len(scene_sets) != 1:
+        return 'CONDITION_SCENE_KEYS_INVALID'
+    for item in conditions:
+        if item.scene_count != 20 or len(item.scene_ids) != 20 or item.n_resamples != 10_000:
+            return 'CONDITION_PROVENANCE_INVALID'
+    return None
+
+
+def _validate_p5_execution_grid(
+    downstream_harm: tuple[DownstreamHarmEvidence, ...],
+    zero_update: tuple[ZeroUpdateEvidence, ...]
+) -> str | None:
+    expected = {
+        (model, f'{corruption}-s2')
+        for model in GEORELIAB_MVE_REQUIRED_MODELS
+        for corruption in GEORELIAB_REQUIRED_CORRUPTIONS
+    }
+    harm_pairs = [(item.model, item.condition) for item in downstream_harm]
+    zero_pairs = [(item.model, item.condition) for item in zero_update]
+    if len(harm_pairs) != 6 or set(harm_pairs) != expected or len(set(harm_pairs)) != 6:
+        return 'DOWNSTREAM_EXECUTION_GRID_INVALID'
+    if len(zero_pairs) != 6 or set(zero_pairs) != expected or len(set(zero_pairs)) != 6:
+        return 'ZERO_UPDATE_EXECUTION_GRID_INVALID'
+    return None
+
 def select_track(
     geometry: GateDecision, georeliab: GateDecision
 ) -> SelectionDecision:
@@ -568,12 +780,48 @@ def select_track(
         geometry.scientific_validity is not ScientificValidity.SCIENTIFIC
         or georeliab.scientific_validity is not ScientificValidity.SCIENTIFIC
     ):
+        validity = (
+            ScientificValidity.NON_SCIENTIFIC_SMOKE
+            if (
+                geometry.scientific_validity is ScientificValidity.NON_SCIENTIFIC_SMOKE
+                or georeliab.scientific_validity is ScientificValidity.NON_SCIENTIFIC_SMOKE
+            )
+            else ScientificValidity.NON_SCIENTIFIC_FIXTURE
+        )
         return SelectionDecision(
-            selected_track=SelectedTrack.NON_SCIENTIFIC,
-            reason="fixture evidence cannot select a scientific track",
+            selected_track=(
+                SelectedTrack.NON_SCIENTIFIC_SMOKE
+                if validity is ScientificValidity.NON_SCIENTIFIC_SMOKE
+                else SelectedTrack.NON_SCIENTIFIC
+            ),
+            reason=(
+                'smoke evidence cannot select a scientific track'
+                if validity is ScientificValidity.NON_SCIENTIFIC_SMOKE
+                else 'fixture evidence cannot select a scientific track'
+            ),
             geometry_status=geometry.status,
             georeliab_status=georeliab.status,
-            scientific_validity=ScientificValidity.NON_SCIENTIFIC_FIXTURE,
+            scientific_validity=validity,
+        )
+    if not geometry.status.is_terminal or not georeliab.status.is_terminal:
+        pending_georeliab = (
+            geometry.status is GateStatus.BLOCKED
+            and georeliab.status is GateStatus.PASS
+        )
+        return SelectionDecision(
+            selected_track=(
+                SelectedTrack.BLOCKED_PENDING_GEOMETRY
+                if pending_georeliab
+                else SelectedTrack.BLOCKED
+            ),
+            reason=(
+                'GEORELIAB_PASS_PENDING_GEOMETRY'
+                if pending_georeliab
+                else 'required scientific evidence is non-terminal'
+            ),
+            geometry_status=geometry.status,
+            georeliab_status=georeliab.status,
+            scientific_validity=ScientificValidity.SCIENTIFIC,
         )
     if geometry.status is GateStatus.PASS:
         return SelectionDecision(
@@ -589,17 +837,6 @@ def select_track(
         return SelectionDecision(
             selected_track=SelectedTrack.GEORELIAB,
             reason="Geometry did not pass and GeoReliab passed",
-            geometry_status=geometry.status,
-            georeliab_status=georeliab.status,
-            scientific_validity=ScientificValidity.SCIENTIFIC,
-        )
-    if (
-        geometry.status is GateStatus.BLOCKED
-        or georeliab.status is GateStatus.BLOCKED
-    ):
-        return SelectionDecision(
-            selected_track=SelectedTrack.BLOCKED,
-            reason="required scientific evidence is missing",
             geometry_status=geometry.status,
             georeliab_status=georeliab.status,
             scientific_validity=ScientificValidity.SCIENTIFIC,
