@@ -76,8 +76,9 @@ def _passing_synthetic_fog_record(monkeypatch, *, scene_id: int = 1):
 
 
 def _overlay(path: Path) -> Path:
+    runtime_root = path.parent / 'data'
     path.write_text(
-        "[runtime]\nroot = '/srv/private/smli/GeoReliab'\n"
+        "[runtime]\nroot = '" + str(runtime_root) + "'\n"
         "vggt_source = '/home/smli/vggt'\nmast3r_source = '/home/smli/mast3r'\n"
         "dust3r_source = '/home/smli/mast3r/dust3r'\ncroco_source = '/home/smli/mast3r/dust3r/croco'\n"
         "vggt_env = '/home/smli/env-vggt'\nmast3r_env = '/home/smli/env-mast3r'\nvggt_python = '3.10.20'\nvggt_torch = '2.3.1+cu121'\nmast3r_python = '3.10.20'\nmast3r_torch = '2.5.1+cu121'\ntyping_extensions_site = '/home/smli/miniforge3/pkgs/typing_extensions-4.15.0-pyhcf101f3_0/site-packages'\n"

@@ -1185,8 +1185,11 @@ def _validate_attempt05_resume_tooling_lineage(
         expected_tooling_tree,
     ):
         return dict(preflight)
+    authorization_path = getattr(context, "authorization_path", None)
+    if authorization_path is None:
+        raise V4ExecutionError("V4_ATTEMPT05_RECOVERY_SOURCE_REVISION_MISMATCH")
     recovery = validate_attempt05_recovery_revision(
-        authorization_path=context.authorization_path,
+        authorization_path=authorization_path,
     )
     if (
         recovery.get("from_tooling_commit") != source_commit
