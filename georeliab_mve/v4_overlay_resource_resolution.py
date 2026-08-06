@@ -304,7 +304,12 @@ def _hash_stable_file(
         initial = path.stat()
     except OSError as exc:
         raise OverlayResolutionError('V4_OVERLAY_RESOURCE_UNREADABLE') from exc
+    pre_injection_digest: str | None = None
     if before_hash is not None:
+        try:
+            pre_injection_digest = _sha256_file(path)
+        except OSError as exc:
+            raise OverlayResolutionError('V4_OVERLAY_RESOURCE_UNREADABLE') from exc
         before_hash(path)
     flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0)
     try:
@@ -330,13 +335,16 @@ def _hash_stable_file(
         for field in comparison_fields
     ):
         raise OverlayResolutionError('V4_OVERLAY_RESOURCE_CHANGED_DURING_HASH')
+    observed_digest = digest.hexdigest()
+    if pre_injection_digest is not None and pre_injection_digest != observed_digest:
+        raise OverlayResolutionError('V4_OVERLAY_RESOURCE_CHANGED_DURING_HASH')
     if not stat.S_ISREG(final.st_mode):
         raise OverlayResolutionError('V4_OVERLAY_RESOURCE_NOT_REGULAR_FILE')
     identity = {
         field: int(getattr(final, field))
         for field in identity_fields + ('st_ctime_ns',)
     }
-    return int(final.st_size), digest.hexdigest(), identity
+    return int(final.st_size), observed_digest, identity
 
 
 def _normalize_override(value: Path, expected: Path) -> None:

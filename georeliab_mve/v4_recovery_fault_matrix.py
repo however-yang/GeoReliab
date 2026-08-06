@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import errno
 from enum import Enum
 import hashlib
@@ -22,9 +22,8 @@ import signal
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Callable, Iterator, Mapping, Sequence
 from unittest.mock import patch
 
 from . import v4_attempt05_recovery as recovery
@@ -433,7 +432,6 @@ def _run_unit_case(case: FaultInjectionCase, case_root: Path) -> tuple[str, str,
     )
     controller = _FaultController(case.fault_point, case.fault_kind)
     checkpoint_failed = False
-    before_inventory = _inventory_sha(case_root)
     with _patched_fault_surface(controller):
         try:
             events = _unit_payload()
@@ -480,7 +478,6 @@ def _run_unit_case(case: FaultInjectionCase, case_root: Path) -> tuple[str, str,
         classification = "FATAL_IDENTITY_MISMATCH"
         action = recovery.RECOVERY_ACTION_ABORT_FATAL
         reason = f"RECONCILIATION_EXCEPTION:{type(exc).__name__}"
-    after_inventory = _inventory_sha(case_root)
     duplicate_count = sum(
         1 for item in _inventory(case_root) if "duplicate" in str(item["path"])
     )
@@ -642,10 +639,6 @@ def _run_mutation_case(case: FaultInjectionCase, case_root: Path) -> tuple[str, 
         )
         classification, action = _normalise_state(result)
         reason = str(result.get("reason", ""))
-        if checkpoint_failed:
-            classification = "QUARANTINED"
-            action = recovery.RECOVERY_ACTION_QUARANTINE
-            reason = "CHECKPOINT_NOT_DURABLE"
     except BaseException as exc:
         classification = "FATAL_IDENTITY_MISMATCH"
         action = recovery.RECOVERY_ACTION_ABORT_FATAL

@@ -61,6 +61,8 @@ def test_identity_and_liveness_cases_are_classified_without_scientific_payload(t
     selected = {
         "no-clobber-promotion",
         "identity-symlink",
+        "identity-content-mutation",
+        "identity-duplicate-key",
         "identity-path-mismatch",
         "liveness-live-worker",
         "liveness-dead-worker-stale-heartbeat",
@@ -71,6 +73,7 @@ def test_identity_and_liveness_cases_are_classified_without_scientific_payload(t
         observed = matrix._run_case(case, tmp_path / case.case_id)
         assert observed[0] == case.expected_classification
         assert observed[1] == case.expected_action
+        assert "NameError" not in observed[2]
         matrix._assert_no_scientific_payload({"case": case.to_dict(), "observation": observed[2]})
 
 
