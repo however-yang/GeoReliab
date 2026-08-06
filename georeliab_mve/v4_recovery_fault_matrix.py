@@ -42,6 +42,7 @@ CLASSIFICATIONS = {
 }
 GATE1_ALLOWLIST = {
     "georeliab_mve/v4_attempt05_execution.py",
+    "georeliab_mve/v4_overlay_resource_resolution.py",
     "georeliab_mve/v4_recovery_fault_matrix.py",
     "tests/test_preparation_round2.py",
     "tests/test_v4_recovery_fault_matrix.py",
