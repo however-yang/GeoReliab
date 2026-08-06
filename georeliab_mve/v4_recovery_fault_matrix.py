@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import platform
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -183,6 +184,7 @@ class FaultInjectionObservation:
             "schema_version": self.schema_version,
             "case_id": self.case_id,
             "expected_classification": self.expected_classification,
+            "expected_action": self.expected_action,
             "observed_classification": self.observed_classification,
             "observed_action": self.observed_action,
             "reason": self.reason,
@@ -850,6 +852,61 @@ def _assert_no_scientific_payload(payload: object) -> None:
         raise FaultMatrixError("V4_RECOVERY_SCIENTIFIC_PAYLOAD_DETECTED")
 
 
+def _ruff_tooling(repo: Path) -> dict[str, object]:
+    candidates: list[Path] = []
+    configured = os.environ.get("RUFF_BIN")
+    if configured:
+        candidates.append(Path(configured))
+    candidates.extend(
+        [
+            Path(sys.executable).with_name("ruff"),
+            Path(sys.executable).with_name("ruff3"),
+        ]
+    )
+    located = shutil.which("ruff")
+    if located:
+        candidates.append(Path(located))
+    ruff_path: Path | None = None
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            ruff_path = candidate.resolve()
+            break
+    if ruff_path is None:
+        return {
+            "available": False,
+            "passed": False,
+            "status": "TOOLING_BLOCKED_RUFF_UNAVAILABLE",
+            "path": None,
+        }
+    result = subprocess.run(
+        [
+            str(ruff_path),
+            "check",
+            "georeliab_mve/v4_recovery_fault_matrix.py",
+            "tests/test_v4_recovery_fault_matrix.py",
+        ],
+        cwd=repo,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        return {
+            "available": True,
+            "passed": False,
+            "status": "TOOLING_RUFF_CHECK_FAILED",
+            "path": str(ruff_path),
+            "returncode": result.returncode,
+        }
+    return {
+        "available": True,
+        "passed": True,
+        "status": "RUFF_CHECK_PASS",
+        "path": str(ruff_path),
+        "returncode": 0,
+    }
+
+
 def _environment(repo: Path, lineage: Mapping[str, object]) -> dict[str, object]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -916,6 +973,7 @@ def run_cpu_fault_matrix(
         and broad_count == 0
         and all(item.passed for item in observations)
     )
+    tooling_status = _ruff_tooling(repo)
     manifest = CpuFaultMatrixManifest(
         parent_commit=str(lineage["parent_commit"]),
         parent_tree=str(lineage["parent_tree"]),
@@ -962,12 +1020,23 @@ def run_cpu_fault_matrix(
         output_root / "case-results.jsonl",
         b"".join(_canonical_bytes(item.to_dict()) + b"\n" for item in observations),
     )
-    _write_json(output_root / "environment.json", _environment(repo, lineage))
+    _write_json(
+        output_root / "environment.json",
+        {**_environment(repo, lineage), "tooling": tooling_status},
+    )
     _write_json(output_root / "semantic-result.json", {"semantic_result_sha256": semantic_sha, "semantic_payload": semantic_payload, "scientific_result": NO_SCIENTIFIC_RESULT})
+    if not all_classified:
+        terminal_status = f"{FAIL_MARKER}=matrix"
+    elif tooling_status["status"] == "TOOLING_BLOCKED_RUFF_UNAVAILABLE":
+        terminal_status = "TOOLING_BLOCKED_RUFF_UNAVAILABLE"
+    elif not tooling_status["passed"]:
+        terminal_status = f"{FAIL_MARKER}=ruff"
+    else:
+        terminal_status = PASS_MARKER
     qualification = {
         "schema_version": SCHEMA_VERSION,
-        "status": PASS_MARKER if all_classified else f"{FAIL_MARKER}=matrix",
-        "runtime_status": READY_MARKER if all_classified else "V4_RECOVERY_RUNTIME_NOT_READY",
+        "status": terminal_status,
+        "runtime_status": READY_MARKER if terminal_status == PASS_MARKER else "V4_RECOVERY_RUNTIME_NOT_READY",
         "all_failure_injections_classified": all_classified,
         "case_count": len(cases),
         "passed_case_count": sum(item.passed for item in observations),
@@ -977,6 +1046,7 @@ def run_cpu_fault_matrix(
         "gate2_started": False,
         "pilot_started": False,
         "attempt06_started": False,
+        "tooling": tooling_status,
         "manifest_sha256": manifest_payload["manifest_sha256"],
         "semantic_result_sha256": semantic_sha,
     }

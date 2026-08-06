@@ -89,4 +89,5 @@ def test_observation_requires_expected_action_and_no_scientific_result() -> None
         overwrite_count=0,
     )
     assert observation.passed
+    assert observation.to_dict()["expected_action"] == recovery.RECOVERY_ACTION_NOOP
     assert observation.to_dict()["scientific_result"] == matrix.NO_SCIENTIFIC_RESULT
