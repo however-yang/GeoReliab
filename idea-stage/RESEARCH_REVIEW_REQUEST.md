@@ -1,3 +1,11 @@
+---
+status: superseded_historical
+authority: GEORELIAB_TASKBOOK.md
+execution_entry: false
+superseded_by: GEORELIAB_TASKBOOK.md#v2.2
+---
+
+> Historical supporting material retained for provenance. It is not an execution entry; the v2.2 mainline and current phase gates are defined by GEORELIAB_TASKBOOK.md.
 # Review Brief — 供外部评审模型使用（Codex MCP 配置后重跑）
 
 > 状态: ⚠️ 2026-07-26 Codex MCP 未配置，本 brief 尚未送审。

@@ -1,0 +1,72 @@
+{
+  "schema_version": "georeliab-v4-branch-archive-cleanup-1.0",
+  "archive_date": "2026-08-06",
+  "canonical": {
+    "branch": "codex/v4-canonical",
+    "commit": "a9c687c73eca6bc3a26659b3e0247c227e7c5238",
+    "tree": "c8c47baff7deb082e502db83f8fc8c942f5d3e3d",
+    "authority_platform": "linux/a100",
+    "gate_status": "V4_RECOVERY_CPU_FAULT_MATRIX_PASS_POSIX",
+    "runtime_status": "V4_RECOVERY_RUNTIME_READY_FOR_LINUX_A100",
+    "scientific_result": "NO_SCIENTIFIC_RESULT",
+    "windows_gate": "non_authoritative_portability_check",
+    "windows_status": "WINDOWS_PORTABILITY_BLOCKED_UNSUPPORTED_SIGNAL"
+  },
+  "final_local_branches": ["main", "codex/v4-canonical"],
+  "deleted_local_branches": [
+    "codex/p2-paired-governance-repair",
+    "codex/storage-architecture-refactor",
+    "codex/v4-gpu-selection-attempt-02",
+    "codex/v4-gpu-selection-attempt-03",
+    "codex/v4-gpu-selection-attempt-04",
+    "codex/v4-gpu-selection-authorization",
+    "codex/v4-mve-execution-attempt-05",
+    "codex/v4-overlay-resource-resolution-fix",
+    "codex/v4-ranking-warning",
+    "codex/v4-rectified-member-closure",
+    "real-georeliab-mve"
+  ],
+  "removed_worktree_records": [
+    "C:/tmp/georeliab-v4-mve-attempt05",
+    "D:/Workspace/GeoReliab/.worktrees/georeliab-real-mve",
+    "D:/Workspace/GeoReliab/.worktrees/p2-paired-governance-repair",
+    "D:/Workspace/GeoReliab/.worktrees/storage-architecture-refactor",
+    "D:/Workspace/GeoReliab/.worktrees/v4-gpu-selection-attempt-02",
+    "D:/Workspace/GeoReliab/.worktrees/v4-gpu-selection-attempt-03",
+    "D:/Workspace/GeoReliab/.worktrees/v4-gpu-selection-attempt-04",
+    "D:/Workspace/GeoReliab/.worktrees/v4-gpu-selection-authorization",
+    "D:/Workspace/GeoReliab/.worktrees/v4-mve-attempt05",
+    "D:/Workspace/GeoReliab/.worktrees/v4-overlay-resource-resolution-fix",
+    "D:/Workspace/GeoReliab/.worktrees/v4-ranking-warning",
+    "D:/Workspace/GeoReliab/.worktrees/v4-rectified-member-closure"
+  ],
+  "retained_worktrees": [
+    {
+      "path": "D:/Workspace/GeoReliab",
+      "reason": "main retained; 87 pre-existing untracked entries preserved"
+    },
+    {
+      "path": "D:/Workspace/GeoReliab/.worktrees/v4-mve-execution-attempt-05",
+      "commit": "b2f68315c316796e83058d0d1bcc8f34c0aaf074",
+      "archive_tag": "archive/georeliab-v4/detached-v4-mve-execution-attempt-05/b2f6831",
+      "reason": "fail-closed: permission-denied directories prevented a clean status proof"
+    }
+  ],
+  "filesystem_tombstones": [
+    {
+      "path": "C:/tmp/georeliab-v4-canonical-verify",
+      "git_worktree_record_removed": true,
+      "filesystem_status": "FILESYSTEM_TOMBSTONE_PENDING_HANDLE_RELEASE"
+    }
+  ],
+  "archive_tag_verification": {
+    "count": 12,
+    "failures": 0,
+    "all_resolve_to_recorded_commit_and_tree": true,
+    "required_message_fields_present": true
+  },
+  "remote_refs_changed": false,
+  "remote_branches_unchanged": true,
+  "worktree_prune_executed": true,
+  "gc_prune_now_executed": false
+}

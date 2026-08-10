@@ -1,3 +1,11 @@
+---
+status: superseded_historical
+authority: GEORELIAB_TASKBOOK.md
+execution_entry: false
+superseded_by: GEORELIAB_TASKBOOK.md#v2.2
+---
+
+> Historical document retained for provenance. It is not an execution entry; the v2.2 mainline and all current phase gates are defined by GEORELIAB_TASKBOOK.md.
 # Experiment Tracker — GeoReliab
 
 | Run ID | Milestone | Purpose | System / Variant | Split | Metrics | Priority | Status | Notes |

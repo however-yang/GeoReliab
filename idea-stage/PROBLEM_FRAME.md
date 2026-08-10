@@ -1,3 +1,11 @@
+---
+status: superseded_historical
+authority: GEORELIAB_TASKBOOK.md
+execution_entry: false
+superseded_by: GEORELIAB_TASKBOOK.md#v2.2
+---
+
+> Historical supporting material retained for provenance. It is not an execution entry; the v2.2 mainline and current phase gates are defined by GEORELIAB_TASKBOOK.md.
 # Robotics/CV Problem Frame — CVPR 论文选题
 
 **日期**: 2026-07-26（v2 修订）

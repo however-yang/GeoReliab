@@ -1,6 +1,12 @@
-# Research Idea Report (v3 — 完全放开的视觉方向)
+---
+status: superseded_historical
+authority: GEORELIAB_TASKBOOK.md
+execution_entry: false
+superseded_by: GEORELIAB_TASKBOOK.md#v2.2
+---
 
-> **当前权威决策**：历史 v3/v3.1 保留供追溯；执行排序已由文末 v3.2 覆盖。当前条件式主线为 Geometry causal audit，GeoReliab 为第一备选，Deformable World 暂停。
+> Historical document retained for provenance. It is not an execution entry; the v2.2 mainline and all current phase gates are defined by GEORELIAB_TASKBOOK.md.
+# Research Idea Report (v3 — 完全放开的视觉方向)
 
 **Direction**: CVPR 2027，视觉为中心，围绕技术栈（深度/3D重建/不确定性/具身感知）开放探索；医疗/机器人仅为可选应用域
 **Generated**: 2026-07-26（v3；v2=GeoReliab pipeline 报告见 `IDEA_REPORT_20260726_153000.md`）
@@ -97,34 +103,3 @@
 **主攻 Idea 3 GeoReliab**（在"最大化中稿率 + 难度可控 + SR 并行"的三重约束下 floor 最高），执行提速以对冲拥挤风险（9 月中旬 arXiv）。
 **保留切换阈值**: 仍先花一天跑两个 ≤2 GPU·h MVE；当且仅当 (a) GeoReliab MVE 显示"模型出人意料稳健"（主发现落空）**且** (b) Deformable MVE 显示陡峭相变，才切换到瘦身版 Idea 1（诊断+benchmark 为主、training-free 缓解为辅、adapter 为 stretch goal）。
 Idea 2 作为低成本备用（若主线中途受阻，6 周内可独立成文的逃生舱）。
-
----
-
-## v3.2 Novelty 复核与执行覆盖（2026-07-26，当前权威）
-
-### 排序修订
-
-| Idea | Novelty | 难度 | 当前处置 |
-|------|---------|------|----------|
-| Geometry-injected Spatial MLLM causal audit | 7.5–8/10 | 6–6.5/10 | **条件式主线**；先过双模型 hook/MVE 门 |
-| GeoReliab | 5.5–6.5/10 | 7.2/10 | **第一备选**；与 Geometry 并行做七天 MVE |
-| Deformable World | 5.5–6.5/10 | 8–8.5/10 | **暂停**；双 MVE 均失败时也不自动切入 |
-
-### 复核依据与安全主张
-
-- [Trust3R](https://arxiv.org/abs/2605.19539) 已覆盖 3D foundation model 概率不确定性、risk-coverage、OOD/failure detection 与下游加权；[Test3R](https://arxiv.org/abs/2506.13750) 和 [LoRA3D](https://arxiv.org/abs/2412.07746) 分别覆盖测试时一致性修复与置信度自校准。GeoReliab 不再宣称首个 3D GFM UQ/calibration。
-- [Spatial-MLLM](https://proceedings.neurips.cc/paper_files/paper/2025/hash/142b166c8b18b43774c4f0e0c1e9948e-Abstract-Conference.html)、[SpatialStack](https://spatial-stack.github.io/) 主要报告架构与准确率；[CVT-Bench](https://arxiv.org/abs/2603.21114) 审计视角反事实稳定性。当前可防守缺口是跨模型、分布匹配 geometry intervention 与 activation patching 的因果通道审计。
-- [PAGE-4D](https://arxiv.org/abs/2510.17568)、[VGGT4D](https://arxiv.org/abs/2511.19971)、[Any4D](https://arxiv.org/abs/2512.10935) 显著压缩 Deformable World 的空白与时间窗口。
-
-Geometry 的安全主张：固定 RGB、prompt、decoder 与 seed，通过统计匹配 geometry-feature swap、空间置乱和 activation patching，测量模型何时真正因果依赖几何表征。
-
-GeoReliab 的安全主张：审计冻结 3D GFM 的 native confidence 在 3D 一致退化下的失效与下游损害，并评估 zero-update 多视图不一致性信号。明确排除 conformal guarantee、reconstruction SOTA 和首次 UQ/校准等主张。
-
-### 固定选择矩阵
-
-1. Geometry PASS → Geometry 主线；即使 GeoReliab 同时 PASS 也不改变。
-2. Geometry 未通过且 GeoReliab PASS → GeoReliab 主线。
-3. 两条真实科学 gate 均 FAIL → 停止本轮项目并归还 SR 资源。
-4. 缺模型、数据、hook 或只运行 fixture → `BLOCKED`，不得选择主线。
-
-机器可执行协议与阈值见 `../configs/dual_mve_protocol.toml` 和 `../docs/DUAL_MVE_PROTOCOL.md`。当前 dry-run 仅验证基础设施，未产生任何模型或数据结论。
