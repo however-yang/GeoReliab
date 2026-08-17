@@ -90,23 +90,42 @@ def test_power_design_is_preregistered_and_has_deterministic_seeds():
 
 
 def test_pilot_go_undefined_and_execution_block_precedence():
-    scenes = build_pilot_partition("a" * 64).primary_scene_ids
-    decision = evaluate_pilot(_pilot_rows(scenes), scene_ids=scenes)
+    partition = build_pilot_partition("a" * 64)
+    scenes = partition.primary_scene_ids
+    decision = evaluate_pilot(
+        _pilot_rows(scenes), scene_ids=scenes, partition=partition
+    )
     assert decision.status == V4_PILOT_GO_TO_FULL_MVE
-    undefined = evaluate_pilot(_pilot_rows(scenes, classes=False), scene_ids=scenes)
+    undefined = evaluate_pilot(
+        _pilot_rows(scenes, classes=False),
+        scene_ids=scenes,
+        partition=partition,
+    )
     assert undefined.status == V4_PILOT_INCONCLUSIVE
-    blocked = evaluate_pilot(_pilot_rows(scenes), scene_ids=scenes, invalid_count=1)
+    blocked = evaluate_pilot(
+        _pilot_rows(scenes),
+        scene_ids=scenes,
+        partition=partition,
+        invalid_count=1,
+    )
     assert blocked.status == V4_PILOT_BLOCKED_EXECUTION
 
 
 def test_pilot_gate_extension_and_power_precedence():
-    scenes = build_pilot_partition("a" * 64).primary_scene_ids
-    primary_go = evaluate_pilot(_pilot_rows(scenes), scene_ids=scenes)
+    partition = build_pilot_partition("a" * 64)
+    scenes = partition.primary_scene_ids
+    primary_go = evaluate_pilot(
+        _pilot_rows(scenes), scene_ids=scenes, partition=partition
+    )
     gate = evaluate_pilot_gate(primary_go, power_15_pass=True, power_17_pass=True)
     assert gate.status == V4_PILOT_GO_TO_FULL_MVE
     assert gate.formal_confirmation_scene_count == 17
     assert not gate.extension_allowed
-    primary_inconclusive = evaluate_pilot(_pilot_rows(scenes, classes=False), scene_ids=scenes)
+    primary_inconclusive = evaluate_pilot(
+        _pilot_rows(scenes, classes=False),
+        scene_ids=scenes,
+        partition=partition,
+    )
     pending = evaluate_pilot_gate(
         primary_inconclusive,
         power_15_pass=True,
@@ -245,9 +264,18 @@ def test_scoped_20_scene_requires_agreeing_parity_callback():
 def test_extension_non_go_forbids_full_confirmation():
     partition = build_pilot_partition("a" * 64)
     primary_scenes = partition.primary_scene_ids
-    extension_scenes = partition.extension_scene_ids + partition.core_scene_ids[:3]
-    primary = evaluate_pilot(_pilot_rows(primary_scenes, classes=False), scene_ids=primary_scenes)
-    extension = evaluate_pilot(_pilot_rows(extension_scenes, classes=False), scene_ids=extension_scenes)
+    extension_scenes = partition.primary_scene_ids + partition.extension_scene_ids
+    primary = evaluate_pilot(
+        _pilot_rows(primary_scenes, classes=False),
+        scene_ids=primary_scenes,
+        partition=partition,
+    )
+    extension = evaluate_pilot(
+        _pilot_rows(extension_scenes, classes=False),
+        scene_ids=extension_scenes,
+        partition=partition,
+        extension=True,
+    )
     gate = evaluate_pilot_gate(primary, extension=extension, power_15_pass=True, power_17_pass=True, extension_authorized=True)
     assert gate.status == FULL_CONFIRMATION_FORBIDDEN
     assert gate.full_confirmation_forbidden
