@@ -76,7 +76,7 @@ def _passing_synthetic_fog_record(monkeypatch, *, scene_id: int = 1):
 
 
 def _overlay(path: Path) -> Path:
-    runtime_root = path.parent / 'data'
+    runtime_root = Path('/srv/private/georeliab-test')
     path.write_text(
         "[runtime]\nroot = '" + str(runtime_root) + "'\n"
         "vggt_source = '/home/smli/vggt'\nmast3r_source = '/home/smli/mast3r'\n"
@@ -105,6 +105,25 @@ def _overlay(path: Path) -> Path:
         encoding='utf-8',
     )
     return path
+
+
+@pytest.fixture
+def _validated_local_overlay_root(monkeypatch):
+    """Keep the production root guard while redirecting test writes to tmp_path."""
+    import georeliab_mve.prepare_dispatch_round1 as dispatch
+
+    load_validated_overlay = dispatch._overlay
+
+    def load_local_overlay(path: Path):
+        overlay = load_validated_overlay(path)
+        return type(overlay)(
+            str(path.parent / 'data'),
+            overlay.resources,
+            overlay.execution,
+            overlay.source,
+        )
+
+    monkeypatch.setattr(dispatch, '_overlay', load_local_overlay)
 
 
 def test_calibration_qa_rejects_each_required_nonmonotonic_failure(monkeypatch):
@@ -429,7 +448,9 @@ def test_test_render_lock_and_existing_artifacts_are_immutable(monkeypatch, tmp_
         dispatch._run_rendering(root, stage='test')
 
 
-def test_overlay_requires_every_frozen_identity(tmp_path):
+def test_overlay_requires_every_frozen_identity(
+    tmp_path, _validated_local_overlay_root
+):
     overlay = _overlay(tmp_path / 'overlay.toml')
     text = overlay.read_text(encoding='utf-8').replace("tartanair_depth_etag = 'depth-etag'\n", '')
     overlay.write_text(text, encoding='utf-8')
@@ -437,7 +458,9 @@ def test_overlay_requires_every_frozen_identity(tmp_path):
         run_prepare_operation(operation='download', data_root=tmp_path / 'data', state_path=tmp_path / 's.json', dry_run=False, overlay_path=overlay)
 
 
-def test_overlay_requires_frozen_typing_extensions_identity(tmp_path):
+def test_overlay_requires_frozen_typing_extensions_identity(
+    tmp_path, _validated_local_overlay_root
+):
     overlay = _overlay(tmp_path / 'overlay.toml')
     text = overlay.read_text(encoding='utf-8').replace("typing_extensions_sha256 = '433d11d170d3a24d2eb065ebc1bfe848cea7e3d7ce68567ab52bea2d4c2f7ed8'\n", '')
     overlay.write_text(text, encoding='utf-8')
@@ -445,7 +468,9 @@ def test_overlay_requires_frozen_typing_extensions_identity(tmp_path):
         run_prepare_operation(operation='verify', data_root=tmp_path / 'data', state_path=tmp_path / 's.json', dry_run=False, overlay_path=overlay)
 
 
-def test_non_dry_download_verify_index_and_manifests_have_success_paths(monkeypatch, tmp_path):
+def test_non_dry_download_verify_index_and_manifests_have_success_paths(
+    monkeypatch, tmp_path, _validated_local_overlay_root
+):
     import georeliab_mve.prepare_dispatch_round1 as dispatch
     from georeliab_mve.preparation import DtuScene
     from georeliab_mve.tartanair_range import RemoteZipIndex
@@ -495,7 +520,9 @@ def test_non_dry_download_verify_index_and_manifests_have_success_paths(monkeypa
 
 
 @pytest.mark.parametrize('operation', ('download', 'verify'))
-def test_prepare_writer_keeps_state_contract_authoritative(monkeypatch, tmp_path, operation):
+def test_prepare_writer_keeps_state_contract_authoritative(
+    monkeypatch, tmp_path, operation, _validated_local_overlay_root
+):
     import georeliab_mve.prepare_dispatch_round1 as dispatch
 
     root = tmp_path / 'data'
@@ -549,7 +576,9 @@ def test_prepare_writer_keeps_state_contract_authoritative(monkeypatch, tmp_path
     assert payload['remote_indexes'] == result['remote_indexes']
 
 
-def test_prepared_operation_invokes_production_writer(monkeypatch, tmp_path):
+def test_prepared_operation_invokes_production_writer(
+    monkeypatch, tmp_path, _validated_local_overlay_root
+):
     import georeliab_mve.prepare_dispatch_round1 as dispatch
 
     root = tmp_path / 'data'

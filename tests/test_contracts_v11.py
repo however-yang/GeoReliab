@@ -209,13 +209,15 @@ def _bundle_records(tmp_path, *, digest=''):
 
 def test_bundle_validator_rejects_payload_and_linkage_failures(tmp_path):
     manifest, prediction, audit = _bundle_records(tmp_path)
-    geometry = prediction.geometry_prediction_uri.removeprefix('file:///')
+    geometry = _file_uri_path(
+        prediction.geometry_prediction_uri, 'geometry_prediction_uri'
+    )
     np.savez(geometry, points_world=np.ones((2, 3)))
     with pytest.raises(ContractError, match='camera_c2w'):
         validate_artifact_bundle(manifest, prediction, audit)
 
     manifest, prediction, audit = _bundle_records(tmp_path)
-    mask = prediction.valid_mask_uri.removeprefix('file:///')
+    mask = _file_uri_path(prediction.valid_mask_uri, 'valid_mask_uri')
     np.savez(mask, valid_mask=np.array([True, False]))
     with pytest.raises(ContractError, match='provenance_count exceeds'):
         validate_artifact_bundle(manifest, prediction, audit)

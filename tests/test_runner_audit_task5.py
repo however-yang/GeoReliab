@@ -8,6 +8,7 @@ import numpy as np
 
 import georeliab_mve.runner_audit as runner_audit
 from georeliab_mve.contracts import (
+    _file_uri_path,
     PredictionArtifact,
     RunManifest,
     RunMode,
@@ -161,7 +162,9 @@ def test_runner_audit_writes_dense_bundle_and_gt_provenance(tmp_path: Path, monk
     )
 
     validate_artifact_bundle(manifest, prediction, audit)
-    dense_path = Path(audit.metadata["dense_audit_uri"].replace("file:///", ""))
+    dense_path = Path(
+        _file_uri_path(audit.metadata["dense_audit_uri"], "dense_audit_uri")
+    )
     with np.load(dense_path, allow_pickle=False) as dense:
         assert tuple(dense.files) == (
             "voxel_points",
@@ -174,7 +177,9 @@ def test_runner_audit_writes_dense_bundle_and_gt_provenance(tmp_path: Path, monk
         assert dense["voxel_points"].shape == (2, 3)
         np.testing.assert_allclose(dense["raw_confidence"], [2.0, 4.0])
         assert dense["failure_label"].tolist() == [False, False]
-    gt_path = Path(audit.metadata["gt_points_uri"].replace("file:///", ""))
+    gt_path = Path(
+        _file_uri_path(audit.metadata["gt_points_uri"], "gt_points_uri")
+    )
     assert audit.metadata["gt_points_sha256"] == _sha256_file(gt_path)
     assert audit.metadata["dense_audit_sha256"] == _sha256_file(dense_path)
     summary = json.loads(audit.metadata["audit_summary"])
@@ -199,7 +204,9 @@ def test_runner_audit_keeps_invalid_prediction_as_failure(tmp_path: Path, monkey
     )
 
     validate_artifact_bundle(manifest, prediction, audit)
-    dense_path = Path(audit.metadata["dense_audit_uri"].replace("file:///", ""))
+    dense_path = Path(
+        _file_uri_path(audit.metadata["dense_audit_uri"], "dense_audit_uri")
+    )
     with np.load(dense_path, allow_pickle=False) as dense:
         assert dense["voxel_points"].shape == (0, 3)
         assert dense["gt_error"].shape == (0,)

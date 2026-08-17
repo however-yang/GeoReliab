@@ -21,6 +21,7 @@ from georeliab_mve.audit import (
 import georeliab_mve.audit as audit_module
 from georeliab_mve.cli import main
 from georeliab_mve.contracts import (
+    _file_uri_path,
     AuditRecord,
     PredictionArtifact,
     RunManifest,
@@ -272,7 +273,9 @@ def test_invalid_bundle_writes_contract_valid_empty_dense(tmp_path: Path):
     validate_artifact_bundle(manifest, prediction, audit)
     dense = np.load(out / 'dense_audit.npz')
     assert dense['voxel_points'].shape == (0, 3)
-    shared_gt = Path(audit.metadata['gt_points_uri'].replace('file:///', ''))
+    shared_gt = Path(
+        _file_uri_path(audit.metadata['gt_points_uri'], 'gt_points_uri')
+    )
     assert shared_gt.parent.name == 'shared_gt'
     assert audit.metadata['gt_points_sha256'] == _sha256(shared_gt)
     with np.load(shared_gt, allow_pickle=False) as payload:

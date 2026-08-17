@@ -644,6 +644,7 @@ def _binding_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[P
         encoding="utf-8",
     )
     context = SimpleNamespace(
+        runtime_root=tmp_path,
         run_root=tmp_path / "run",
         tooling_commit="a" * 40,
         tooling_tree="b" * 40,
@@ -865,4 +866,3 @@ def test_construct_attempt05_runtime_bindings_rejects_state_camera_drift(tmp_pat
             overlay_config_path=overlay,
             adapter_factory=lambda *_args: object(),
         )
-
