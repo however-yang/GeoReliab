@@ -403,9 +403,42 @@ class PilotDecision:
     scene_dominance_lag: tuple[float, ...] = ()
     scene_dominance_pass: bool = False
 
+    def __post_init__(self) -> None:
+        allowed_statuses = {
+            V4_PILOT_GO_TO_FULL_MVE,
+            V4_PILOT_SCIENTIFIC_NO_GO,
+            V4_PILOT_INCONCLUSIVE,
+            V4_PILOT_BLOCKED_EXECUTION,
+        }
+        if self.status not in allowed_statuses:
+            raise ValueError("unsupported pilot decision status")
+        for field_name in (
+            "invalid_count",
+            "duplicate_count",
+            "identity_mismatch_count",
+        ):
+            value = getattr(self, field_name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
+        for field_name in (
+            "models",
+            "loso_auroc",
+            "loso_boundary_lag",
+            "scene_dominance_ranking",
+            "scene_dominance_lag",
+        ):
+            if not isinstance(getattr(self, field_name), tuple):
+                raise ValueError(f"{field_name} must be an immutable tuple")
+
     @property
     def execution_blocked(self) -> bool:
-        return any((self.invalid_count, self.duplicate_count, self.identity_mismatch_count))
+        return self.status == V4_PILOT_BLOCKED_EXECUTION or any(
+            (
+                self.invalid_count,
+                self.duplicate_count,
+                self.identity_mismatch_count,
+            )
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the complete machine-readable pilot decision."""
@@ -521,6 +554,7 @@ def evaluate_pilot(
     records: Sequence[object],
     *,
     scene_ids: Sequence[int],
+    partition: PilotPartitionManifest,
     invalid_count: int = 0,
     duplicate_count: int = 0,
     identity_mismatch_count: int = 0,
@@ -528,18 +562,69 @@ def evaluate_pilot(
 ) -> PilotDecision:
     """Evaluate development-only ranking and Boundary Lag pilot criteria."""
 
+    if not isinstance(partition, PilotPartitionManifest):
+        raise TypeError("pilot evaluator requires a frozen PilotPartitionManifest")
+    for field_name, value in (
+        ("invalid_count", invalid_count),
+        ("duplicate_count", duplicate_count),
+        ("identity_mismatch_count", identity_mismatch_count),
+    ):
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{field_name} must be a non-negative integer")
     scenes = _scene_ids(scene_ids)
-    if len(scenes) not in {3, 5}:
-        raise ValueError("pilot evaluator accepts only the preregistered 3- or 5-scene scope")
+    expected_scenes = (
+        partition.primary_scene_ids + partition.extension_scene_ids
+        if extension
+        else partition.primary_scene_ids
+    )
+    if scenes != expected_scenes:
+        return PilotDecision(
+            status=V4_PILOT_BLOCKED_EXECUTION,
+            reason_code="PILOT_PARTITION_SCOPE_MISMATCH",
+            macro_auroc=None,
+            pooled_boundary_lag_median=None,
+            late_warning_proportion=None,
+            models=(),
+            invalid_count=invalid_count,
+            duplicate_count=duplicate_count,
+            identity_mismatch_count=identity_mismatch_count + 1,
+        )
     try:
         lookup = _normalise_rows(records, scenes)
     except ValueError as exc:
-        return PilotDecision(V4_PILOT_BLOCKED_EXECUTION, str(exc), None, None, None, (), invalid_count, duplicate_count, identity_mismatch_count)
+        return PilotDecision(
+            status=V4_PILOT_BLOCKED_EXECUTION,
+            reason_code=str(exc),
+            macro_auroc=None,
+            pooled_boundary_lag_median=None,
+            late_warning_proportion=None,
+            models=(),
+            invalid_count=invalid_count,
+            duplicate_count=duplicate_count,
+            identity_mismatch_count=identity_mismatch_count,
+        )
     models = tuple(_model_metrics(lookup, model, scenes) for model in SCIENTIFIC_MODELS)
     if invalid_count or duplicate_count or identity_mismatch_count:
-        return PilotDecision(V4_PILOT_BLOCKED_EXECUTION, "EXECUTION_INTEGRITY_FAILURE", None, None, None, models, invalid_count, duplicate_count, identity_mismatch_count)
+        return PilotDecision(
+            status=V4_PILOT_BLOCKED_EXECUTION,
+            reason_code="EXECUTION_INTEGRITY_FAILURE",
+            macro_auroc=None,
+            pooled_boundary_lag_median=None,
+            late_warning_proportion=None,
+            models=models,
+            invalid_count=invalid_count,
+            duplicate_count=duplicate_count,
+            identity_mismatch_count=identity_mismatch_count,
+        )
     if any(not model.defined for model in models):
-        return PilotDecision(V4_PILOT_INCONCLUSIVE, "UNDEFINED_MODEL_METRIC", None, None, None, models)
+        return PilotDecision(
+            status=V4_PILOT_INCONCLUSIVE,
+            reason_code="UNDEFINED_MODEL_METRIC",
+            macro_auroc=None,
+            pooled_boundary_lag_median=None,
+            late_warning_proportion=None,
+            models=models,
+        )
     macro_auc = sum(model.auroc for model in models) / len(models)
     all_lags = [
         float(lag)
@@ -547,7 +632,14 @@ def evaluate_pilot(
         for lag in _scene_lags(lookup, model.model_id, scenes)
     ]
     if not all_lags:
-        return PilotDecision(V4_PILOT_INCONCLUSIVE, "NO_FAILURE_GROUPS", macro_auc, None, None, models)
+        return PilotDecision(
+            status=V4_PILOT_INCONCLUSIVE,
+            reason_code="NO_FAILURE_GROUPS",
+            macro_auroc=macro_auc,
+            pooled_boundary_lag_median=None,
+            late_warning_proportion=None,
+            models=models,
+        )
     pooled_lag = float(median(all_lags))
     late = sum(lag > 0 for lag in all_lags) / len(all_lags)
     min_positive = math.ceil(2 * len(scenes) / 3)
@@ -594,14 +686,14 @@ def evaluate_pilot(
     elif ranking_ok:
         paper = PAPER_RANKING_SUPPORTED_LAG_NOT_SUPPORTED
     return PilotDecision(
-        status,
-        reason,
-        macro_auc,
-        pooled_lag,
-        late,
-        models,
-        tuple(loso_auc),
-        tuple(loso_lag),
+        status=status,
+        reason_code=reason,
+        macro_auroc=macro_auc,
+        pooled_boundary_lag_median=pooled_lag,
+        late_warning_proportion=late,
+        models=models,
+        loso_auroc=tuple(loso_auc),
+        loso_boundary_lag=tuple(loso_lag),
         paper_claim_qualification=paper,
         scene_dominance_ranking=ranking_dominance,
         scene_dominance_lag=lag_dominance,
@@ -668,7 +760,7 @@ def evaluate_pilot_gate(
     promotes development evidence to a formal scientific result.
     """
 
-    if primary.execution_blocked:
+    if primary.status == V4_PILOT_BLOCKED_EXECUTION or primary.execution_blocked:
         return PilotGateDecision(
             V4_PILOT_BLOCKED_EXECUTION,
             "PRIMARY_EXECUTION_INTEGRITY_FAILURE",
@@ -738,7 +830,10 @@ def evaluate_pilot_gate(
             None,
             extension_authorized,
         )
-    if extension.execution_blocked:
+    if (
+        extension.status == V4_PILOT_BLOCKED_EXECUTION
+        or extension.execution_blocked
+    ):
         return PilotGateDecision(
             V4_PILOT_BLOCKED_EXECUTION,
             "EXTENSION_EXECUTION_INTEGRITY_FAILURE",
@@ -1235,6 +1330,13 @@ class ScopedWarningEvidence:
             normalized_source = self.source_attempt_id.casefold().replace("-", "").replace("_", "")
             if "attempt05" in normalized_source:
                 raise ValueError("Attempt-05 predictions are forbidden in scoped evidence")
+            if any(
+                marker in normalized_source
+                for marker in ("localgate2", "gate2smoke", "recoverysmoke")
+            ):
+                raise ValueError(
+                    "Gate 2 smoke predictions are forbidden in scoped evidence"
+                )
 
     @property
     def schedule_identity_sha256(self) -> str:
