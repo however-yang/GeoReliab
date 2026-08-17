@@ -1234,7 +1234,10 @@ def test_cli_model_all_uses_frozen_env_workers_and_dry_run_does_not(tmp_path: Pa
     assert len(calls) == 2
     assert str(calls[0][0]).replace("\\", "/").endswith("/env/vggt/bin/python")
     assert str(calls[1][0]).replace("\\", "/").endswith("/env/mast3r/bin/python")
-    assert all("GeoReliab" in item["cwd"] for item in call_kwargs)
+    expected_source_root = Path(runner.__file__).resolve().parents[1]
+    assert all(
+        Path(item["cwd"]).resolve() == expected_source_root for item in call_kwargs
+    )
     assert all("PYTHONPATH" in item["env"] for item in call_kwargs)
     payload = json.loads(capsys.readouterr().out)
     assert payload["model_isolation"] == "per-frozen-env-python"

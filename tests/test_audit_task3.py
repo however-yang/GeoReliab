@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from georeliab_mve.contracts import (
+    _file_uri_path,
     PredictionArtifact,
     RunManifest,
     RunMode,
@@ -417,7 +418,9 @@ def test_audit_cli_bundle_mode_writes_dense_npz_and_validated_audit(tmp_path: Pa
     assert (out_dir / 'dense_audit.npz').exists()
     audit = json.loads((out_dir / 'audit_record.json').read_text(encoding='utf-8'))
     assert audit['metadata']['dense_audit_uri'].startswith('file:')
-    shared_gt = Path(audit['metadata']['gt_points_uri'].replace('file:///', ''))
+    shared_gt = Path(
+        _file_uri_path(audit['metadata']['gt_points_uri'], 'gt_points_uri')
+    )
     assert shared_gt.parent.name == 'shared_gt'
     with np.load(shared_gt, allow_pickle=False) as payload:
         assert np.array_equal(payload['gt_points'], np.load(gt_points))

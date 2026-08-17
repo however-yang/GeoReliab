@@ -758,7 +758,7 @@ def construct_attempt05_runtime_bindings(
     runtime_binding_sha256 = _sha256_file(runtime_binding_path)
     device = "cuda:0"
     runner_context = RunnerContext(
-        root=Path(__file__).resolve().parents[1],
+        root=context.runtime_root,
         output_root=context.run_root,
         config_path=overlay_config_path,
         device=device,
@@ -1412,7 +1412,6 @@ def run_attempt05_pipeline(
         peak_memory_mb=totals.peak_memory_mb,
         finalizer_result=finalizer_result,
     )
-
 
 
 
