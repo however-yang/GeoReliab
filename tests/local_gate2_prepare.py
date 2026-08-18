@@ -47,6 +47,10 @@ LOCAL_STATUS = "LOCAL_GATE2_DEVELOPMENT_INPUT_READY"
 FORMAL_HOME_SCHEMA_VERSION = "georeliab-v4-formal-home-gate2-input-closure-1.0"
 FORMAL_HOME_STATUS = "V4_FORMAL_HOME_GATE2_INPUT_CLOSURE_READY"
 FORMAL_HOME_VALIDATION_CLASS = "FORMAL_GATE2_INPUT_CLOSURE"
+FORMAL_HOME_AUDIT_STATUS = "V4_FORMAL_HOME_GATE2_INPUT_CLOSURE_AUDIT_PASS"
+FORMAL_FREEZE_LOG_SCHEMA_VERSION = (
+    "georeliab-v4-formal-home-gate2-freeze-log-1.0"
+)
 FORMAL_GATE2_AUTH_SCHEMA_VERSION = "georeliab-v4-formal-gate2-authorization-1.0"
 FORMAL_GATE2_AUTH_STATUS = "V4_FORMAL_GATE2_EXECUTION_AUTHORIZED"
 RECTIFIED_URL = "https://roboimagedata2.compute.dtu.dk/data/MVS/Rectified.zip"
@@ -771,6 +775,365 @@ def write_formal_home_closure(
     return path
 
 
+def _read_json_mapping(path: Path, *, reason: str) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LocalGate2PreparationError(reason) from exc
+    if not isinstance(payload, dict):
+        raise LocalGate2PreparationError(reason)
+    return payload
+
+
+def _require_dedicated_formal_root(
+    formal_root: Path, *, require_fresh: bool
+) -> Path:
+    resolved = require_home_owned_root(formal_root)
+    expected = (Path.home().resolve() / "georeliab-gate2-formal").resolve()
+    if resolved != expected:
+        raise LocalGate2PreparationError(
+            f"FORMAL_GATE2_DEDICATED_ROOT_REQUIRED:{expected}"
+        )
+    if require_fresh and resolved.exists():
+        raise LocalGate2PreparationError(
+            f"FORMAL_GATE2_FRESH_ROOT_NO_CLOBBER_COLLISION:{resolved}"
+        )
+    return resolved
+
+
+def _validate_existing_resource_audit(
+    *,
+    source_root: Path,
+    resource_audit: Mapping[str, object],
+    overlay_path: Path,
+) -> dict[str, object]:
+    if (
+        resource_audit.get("schema_version")
+        != "georeliab-v4-local-gate2-resource-audit-1.0"
+        or resource_audit.get("status")
+        != "LOCAL_GATE2_DEVELOPMENT_RESOURCES_READY"
+        or resource_audit.get("validation_class")
+        != "LOCAL_GATE2_DEVELOPMENT_VALIDATION"
+        or resource_audit.get("formal_gate2_equivalent") is not False
+        or resource_audit.get("scientific_result") != NO_SCIENTIFIC_RESULT
+    ):
+        raise LocalGate2PreparationError("FORMAL_GATE2_RESOURCE_IDENTITY_INVALID")
+    expected_overlay = (
+        source_root / "manifests" / "local-gate2-overlay.toml"
+    ).resolve()
+    if overlay_path.resolve() != expected_overlay or not overlay_path.is_file():
+        raise LocalGate2PreparationError("FORMAL_GATE2_OVERLAY_PATH_INVALID")
+    if Path(str(resource_audit.get("overlay_path", ""))).resolve() != expected_overlay:
+        raise LocalGate2PreparationError("FORMAL_GATE2_OVERLAY_PATH_INVALID")
+    overlay_sha256 = sha256_file(overlay_path)
+    if resource_audit.get("overlay_sha256") != overlay_sha256:
+        raise LocalGate2PreparationError("FORMAL_GATE2_OVERLAY_DIGEST_MISMATCH")
+
+    models = resource_audit.get("models")
+    if not isinstance(models, list) or len(models) != 2 or not all(
+        isinstance(row, Mapping) for row in models
+    ):
+        raise LocalGate2PreparationError("FORMAL_GATE2_RESOURCE_MODELS_INVALID")
+    by_name = {str(row.get("model", "")): row for row in models}
+    if set(by_name) != {"VGGT", "MASt3R"}:
+        raise LocalGate2PreparationError("FORMAL_GATE2_RESOURCE_MODELS_INVALID")
+    expected_fields = {
+        "VGGT": {
+            "source_commit": VGGT_SOURCE_COMMIT,
+            "checkpoint_sha256": VGGT_CHECKPOINT_SHA256,
+        },
+        "MASt3R": {
+            "source_commit": MAST3R_SOURCE_COMMIT,
+            "checkpoint_sha256": MAST3R_CHECKPOINT_SHA256,
+            "config_sha256": MAST3R_CONFIG_SHA256,
+            "dust3r_source_commit": DUST3R_SOURCE_COMMIT,
+            "croco_source_commit": CROCO_SOURCE_COMMIT,
+        },
+    }
+    for model, fields in expected_fields.items():
+        row = by_name[model]
+        if any(row.get(field) != value for field, value in fields.items()):
+            raise LocalGate2PreparationError(
+                f"FORMAL_GATE2_RESOURCE_IDENTITY_INVALID:{model}"
+            )
+    return dict(resource_audit)
+
+
+def _formal_freeze_event(event: str, **fields: object) -> dict[str, object]:
+    return {
+        "schema_version": FORMAL_FREEZE_LOG_SCHEMA_VERSION,
+        "recorded_at": _utc_now(),
+        "event": event,
+        "validation_class": FORMAL_HOME_VALIDATION_CLASS,
+        "scientific_result": NO_SCIENTIFIC_RESULT,
+        **fields,
+    }
+
+
+def _write_formal_freeze_artifacts(
+    *, staging_root: Path, closure_payload: Mapping[str, object]
+) -> Path:
+    closure_path = staging_root / "manifests" / "formal-gate2-input-closure.json"
+    _atomic_write(closure_path, _canonical_bytes(closure_payload))
+    events = [
+        _formal_freeze_event(
+            "SOURCE_CLOSURE_REVALIDATED",
+            source_closure_path=closure_payload["source_closure_path"],
+            source_closure_sha256=closure_payload["source_closure_sha256"],
+            checked_member_count=48,
+            checked_binding_count=6,
+        ),
+        _formal_freeze_event(
+            "RESOURCE_AUDIT_REVALIDATED",
+            resource_audit_path=closure_payload["resource_audit_path"],
+            resource_audit_sha256=closure_payload["resource_audit_sha256"],
+            overlay_sha256=closure_payload["overlay_sha256"],
+        ),
+        _formal_freeze_event(
+            "FORMAL_HOME_CLOSURE_FROZEN",
+            closure_path=str(
+                Path(str(closure_payload["root"]))
+                / "manifests"
+                / "formal-gate2-input-closure.json"
+            ),
+            closure_sha256=sha256_file(closure_path),
+            status=FORMAL_HOME_STATUS,
+        ),
+    ]
+    events_path = staging_root / "logs" / "formal-home-freeze-events.jsonl"
+    _atomic_write(events_path, b"".join(_canonical_bytes(row) for row in events))
+    text_lines = []
+    for row in events:
+        fields = " ".join(
+            f"{key}={json.dumps(value, sort_keys=True)}"
+            for key, value in sorted(row.items())
+            if key not in {"schema_version", "recorded_at", "event"}
+        )
+        text_lines.append(f"[{row['recorded_at']}] {row['event']} {fields}\n")
+    text_path = staging_root / "logs" / "formal-home-freeze.log"
+    _atomic_write(text_path, "".join(text_lines).encode("utf-8"))
+
+    manifest_rows = []
+    for path in (closure_path, events_path, text_path):
+        relative = path.relative_to(staging_root)
+        manifest_rows.append(f"{sha256_file(path)}  {relative.as_posix()}\n")
+    _atomic_write(
+        staging_root / "FORMAL_FREEZE_MANIFEST.sha256",
+        "".join(manifest_rows).encode("utf-8"),
+    )
+    return closure_path
+
+
+def _freeze_formal_home_closure(
+    *,
+    source_root: Path,
+    formal_root: Path,
+    production_source_commit: str,
+    production_source_tree: str,
+    test_only_source_commit: str,
+) -> Path:
+    resolved_source = require_home_owned_root(source_root)
+    resolved_formal = _require_dedicated_formal_root(
+        formal_root, require_fresh=True
+    )
+    if resolved_source == resolved_formal:
+        raise LocalGate2PreparationError("FORMAL_GATE2_ROOT_PROVENANCE_INVALID")
+
+    source_path = (
+        resolved_source / "manifests" / "local-gate2-input-closure.json"
+    )
+    source_payload = validate_local_closure(source_path)
+    resource_path = (
+        resolved_source / "manifests" / "local-gate2-resource-audit.json"
+    )
+    resource_payload = _read_json_mapping(
+        resource_path, reason="FORMAL_GATE2_RESOURCE_AUDIT_UNREADABLE"
+    )
+    overlay_path = resolved_source / "manifests" / "local-gate2-overlay.toml"
+    resource_payload = _validate_existing_resource_audit(
+        source_root=resolved_source,
+        resource_audit=resource_payload,
+        overlay_path=overlay_path,
+    )
+    payload = build_formal_home_closure_payload(
+        source_closure=source_payload,
+        source_closure_path=source_path,
+        source_closure_sha256=sha256_file(source_path),
+        resource_audit=resource_payload,
+        resource_audit_path=resource_path,
+        resource_audit_sha256=sha256_file(resource_path),
+        overlay_path=overlay_path,
+        overlay_sha256=sha256_file(overlay_path),
+        formal_root=resolved_formal,
+        production_source_commit=production_source_commit,
+        production_source_tree=production_source_tree,
+        test_only_source_commit=test_only_source_commit,
+    )
+    validated = validate_formal_home_closure_payload(
+        payload, expected_formal_root=resolved_formal
+    )
+    staging_root = resolved_formal.with_name(
+        resolved_formal.name + f".partial-{os.getpid()}"
+    )
+    if staging_root.exists():
+        raise LocalGate2PreparationError(
+            f"FORMAL_GATE2_STAGING_COLLISION:{staging_root}"
+        )
+    staging_root.mkdir()
+    staged_closure = _write_formal_freeze_artifacts(
+        staging_root=staging_root, closure_payload=validated
+    )
+    if resolved_formal.exists():
+        raise LocalGate2PreparationError(
+            f"FORMAL_GATE2_FRESH_ROOT_NO_CLOBBER_COLLISION:{resolved_formal}"
+        )
+    os.replace(staging_root, resolved_formal)
+    return resolved_formal / staged_closure.relative_to(staging_root)
+
+
+def freeze_formal_home_closure(
+    *,
+    source_root: Path,
+    formal_root: Path,
+    production_source_commit: str,
+    production_source_tree: str,
+    test_only_source_commit: str,
+) -> Path:
+    return _freeze_formal_home_closure(
+        source_root=source_root,
+        formal_root=formal_root,
+        production_source_commit=production_source_commit,
+        production_source_tree=production_source_tree,
+        test_only_source_commit=test_only_source_commit,
+    )
+
+
+def _validate_freeze_manifest(formal_root: Path) -> None:
+    manifest_path = formal_root / "FORMAL_FREEZE_MANIFEST.sha256"
+    try:
+        rows = manifest_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise LocalGate2PreparationError(
+            "FORMAL_GATE2_FREEZE_MANIFEST_UNREADABLE"
+        ) from exc
+    expected = {
+        "manifests/formal-gate2-input-closure.json",
+        "logs/formal-home-freeze-events.jsonl",
+        "logs/formal-home-freeze.log",
+    }
+    seen: set[str] = set()
+    for row in rows:
+        try:
+            digest, relative = row.split("  ", 1)
+        except ValueError as exc:
+            raise LocalGate2PreparationError(
+                "FORMAL_GATE2_FREEZE_MANIFEST_INVALID"
+            ) from exc
+        _require_hex_identity(
+            digest, width=64, reason="FORMAL_GATE2_FREEZE_MANIFEST_INVALID"
+        )
+        if relative not in expected or relative in seen:
+            raise LocalGate2PreparationError(
+                "FORMAL_GATE2_FREEZE_MANIFEST_INVALID"
+            )
+        path = formal_root / relative
+        if not path.is_file() or sha256_file(path) != digest:
+            raise LocalGate2PreparationError(
+                "FORMAL_GATE2_FREEZE_ARTIFACT_DIGEST_MISMATCH"
+            )
+        seen.add(relative)
+    if seen != expected:
+        raise LocalGate2PreparationError("FORMAL_GATE2_FREEZE_MANIFEST_INVALID")
+
+
+def audit_formal_home_closure(
+    *,
+    formal_root: Path,
+    expected_production_source_commit: str,
+    expected_production_source_tree: str,
+    expected_test_only_source_commit: str,
+) -> dict[str, object]:
+    resolved_formal = _require_dedicated_formal_root(
+        formal_root, require_fresh=False
+    )
+    closure_path = (
+        resolved_formal / "manifests" / "formal-gate2-input-closure.json"
+    )
+    closure = _read_json_mapping(
+        closure_path, reason="FORMAL_GATE2_CLOSURE_UNREADABLE"
+    )
+    closure = validate_formal_home_closure_payload(
+        closure, expected_formal_root=resolved_formal
+    )
+    expected_identities = {
+        "production_source_commit": expected_production_source_commit,
+        "production_source_tree": expected_production_source_tree,
+        "test_only_source_commit": expected_test_only_source_commit,
+    }
+    for field, expected in expected_identities.items():
+        _require_hex_identity(
+            expected,
+            width=40,
+            reason="FORMAL_GATE2_EXPECTED_SOURCE_IDENTITY_INVALID",
+        )
+        if closure.get(field) != expected:
+            raise LocalGate2PreparationError(
+                f"FORMAL_GATE2_SOURCE_COMMIT_IDENTITY_MISMATCH:{field}"
+            )
+
+    source_path = Path(str(closure["source_closure_path"])).resolve()
+    if not source_path.is_file() or sha256_file(source_path) != closure.get(
+        "source_closure_sha256"
+    ):
+        raise LocalGate2PreparationError("FORMAL_GATE2_SOURCE_DIGEST_MISMATCH")
+    source = validate_local_closure(source_path)
+    if Path(str(source.get("root", ""))).resolve() != Path(
+        str(closure.get("source_root", ""))
+    ).resolve():
+        raise LocalGate2PreparationError("FORMAL_GATE2_SOURCE_ROOT_IDENTITY_MISMATCH")
+
+    resource_path = Path(str(closure["resource_audit_path"])).resolve()
+    if not resource_path.is_file() or sha256_file(resource_path) != closure.get(
+        "resource_audit_sha256"
+    ):
+        raise LocalGate2PreparationError("FORMAL_GATE2_RESOURCE_DIGEST_MISMATCH")
+    resource = _read_json_mapping(
+        resource_path, reason="FORMAL_GATE2_RESOURCE_AUDIT_UNREADABLE"
+    )
+    overlay_path = Path(str(closure["overlay_path"])).resolve()
+    if not overlay_path.is_file() or sha256_file(overlay_path) != closure.get(
+        "overlay_sha256"
+    ):
+        raise LocalGate2PreparationError("FORMAL_GATE2_OVERLAY_DIGEST_MISMATCH")
+    _validate_existing_resource_audit(
+        source_root=Path(str(closure["source_root"])),
+        resource_audit=resource,
+        overlay_path=overlay_path,
+    )
+    _validate_freeze_manifest(resolved_formal)
+
+    authorization_present = (
+        resolved_formal / "manifests" / "formal-gate2-authorization.json"
+    ).exists()
+    run_root_present = (resolved_formal / "runs").exists()
+    if authorization_present or run_root_present:
+        raise LocalGate2PreparationError("FORMAL_GATE2_EXECUTION_SIDE_EFFECT_PRESENT")
+    smoke = closure["smoke_manifest"]
+    if not isinstance(smoke, Mapping):
+        raise LocalGate2PreparationError("FORMAL_GATE2_SMOKE_IDENTITY_INVALID")
+    return {
+        "status": FORMAL_HOME_AUDIT_STATUS,
+        "checked_member_count": closure["member_count"],
+        "checked_binding_count": len(closure["bindings"]),
+        "checked_unit_count": len(smoke["unit_keys"]),
+        "authorization_present": authorization_present,
+        "run_root_present": run_root_present,
+        "gate2_started": closure["gate2_started"],
+        "pilot_started": closure["pilot_started"],
+        "scientific_result": NO_SCIENTIFIC_RESULT,
+    }
+
+
 def validate_formal_gate2_authorization(
     authorization: Mapping[str, object],
     *,
@@ -961,11 +1324,44 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("plan", "materialize", "audit", "audit-resources"):
         command = subparsers.add_parser(name)
         command.add_argument("--root", type=Path, required=True)
+    freeze = subparsers.add_parser("freeze-formal-home")
+    freeze.add_argument("--source-root", type=Path, required=True)
+    freeze.add_argument("--formal-root", type=Path, required=True)
+    freeze.add_argument("--production-source-commit", required=True)
+    freeze.add_argument("--production-source-tree", required=True)
+    freeze.add_argument("--test-only-source-commit", required=True)
+    formal_audit = subparsers.add_parser("audit-formal-home")
+    formal_audit.add_argument("--formal-root", type=Path, required=True)
+    formal_audit.add_argument("--expected-production-source-commit", required=True)
+    formal_audit.add_argument("--expected-production-source-tree", required=True)
+    formal_audit.add_argument("--expected-test-only-source-commit", required=True)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "freeze-formal-home":
+        print(
+            freeze_formal_home_closure(
+                source_root=args.source_root,
+                formal_root=args.formal_root,
+                production_source_commit=args.production_source_commit,
+                production_source_tree=args.production_source_tree,
+                test_only_source_commit=args.test_only_source_commit,
+            )
+        )
+        return 0
+    if args.command == "audit-formal-home":
+        result = audit_formal_home_closure(
+            formal_root=args.formal_root,
+            expected_production_source_commit=(
+                args.expected_production_source_commit
+            ),
+            expected_production_source_tree=args.expected_production_source_tree,
+            expected_test_only_source_commit=args.expected_test_only_source_commit,
+        )
+        print(f"{result['status']} {args.formal_root.expanduser().resolve()}")
+        return 0
     root = require_home_owned_root(args.root)
     if args.command == "plan":
         path = write_plan(root)
