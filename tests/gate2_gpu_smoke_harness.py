@@ -59,7 +59,11 @@ from georeliab_mve.v4_counterfactuals import (  # noqa: E402
 from georeliab_mve.v4_attempt05_inputs import (  # noqa: E402
     validate_attempt05_input_closure,
 )
-from tests.local_gate2_prepare import validate_local_closure  # noqa: E402
+from tests.local_gate2_prepare import (  # noqa: E402
+    validate_formal_gate2_authorization,
+    validate_formal_home_closure_payload,
+    validate_local_closure,
+)
 
 
 SCHEMA_VERSION = "georeliab-v4-gate2-gpu-smoke-harness-1.0"
@@ -145,6 +149,22 @@ def _require_home_output(path: Path) -> None:
     home = Path.home().resolve()
     if resolved == home or home not in resolved.parents:
         raise Gate2HarnessError("LOCAL_GATE2_OUTPUT_OUTSIDE_HOME_FORBIDDEN")
+
+
+def _require_formal_home_path(path: Path) -> Path:
+    resolved = path.expanduser().resolve()
+    formal_root = (Path.home() / "georeliab-gate2-formal").resolve()
+    if resolved == formal_root or formal_root not in resolved.parents:
+        raise Gate2HarnessError("FORMAL_GATE2_HOME_ROOT_OUTPUT_INVALID")
+    return resolved
+
+
+def _require_formal_home_output(path: Path) -> None:
+    """Require a fresh output descendant of the dedicated formal home root."""
+
+    resolved = _require_formal_home_path(path)
+    if resolved.exists():
+        raise Gate2HarnessError(f"FORMAL_GATE2_OUTPUT_NOT_FRESH_EXISTS:{resolved}")
 
 
 def _fsync_append(path: Path, payload: bytes) -> None:
@@ -328,6 +348,40 @@ def _state_rows(path: Path) -> dict[tuple[int, str], ModelIndependentState]:
     return {(state.scene_id, state.state_id): state for state in states}
 
 
+def _closure_input_rows(
+    payload: Mapping[str, object], *, boundary: str
+) -> tuple[
+    dict[tuple[int, str], Mapping[str, Any]],
+    dict[tuple[int, str], Any],
+]:
+    """Load the same six frozen L3 bit bindings behind an explicit boundary."""
+
+    raw_bindings = payload.get("bindings")
+    if not isinstance(raw_bindings, list):
+        raise Gate2HarnessError(f"{boundary}_GATE2_BINDINGS_INVALID")
+    bindings: dict[tuple[int, str], Mapping[str, Any]] = {}
+    states: dict[tuple[int, str], Any] = {}
+    for row in raw_bindings:
+        if not isinstance(row, Mapping):
+            raise Gate2HarnessError(f"{boundary}_GATE2_BINDINGS_INVALID")
+        key = (int(row.get("scene_id", -1)), str(row.get("state_id", "")))
+        raw_views = row.get("views")
+        if key in bindings or key[1] != "L3" or not isinstance(raw_views, list):
+            raise Gate2HarnessError(f"{boundary}_GATE2_BINDINGS_INVALID")
+        hashes = tuple(
+            SimpleNamespace(view_id=int(view["view_id"]), sha256=str(view["sha256"]))
+            for view in raw_views
+            if isinstance(view, Mapping)
+        )
+        if len(hashes) != 8:
+            raise Gate2HarnessError(f"{boundary}_GATE2_BINDINGS_INVALID")
+        bindings[key] = row
+        states[key] = SimpleNamespace(input_sha256_by_view=hashes)
+    if len(bindings) != 6:
+        raise Gate2HarnessError(f"{boundary}_GATE2_BINDING_COUNT_INVALID")
+    return bindings, states
+
+
 def _local_input_rows(
     closure_path: Path,
 ) -> tuple[
@@ -336,31 +390,26 @@ def _local_input_rows(
 ]:
     """Load only the six L3 bindings from the test-only local closure."""
 
-    payload = validate_local_closure(closure_path)
-    raw_bindings = payload.get("bindings")
-    if not isinstance(raw_bindings, list):
-        raise Gate2HarnessError("LOCAL_GATE2_BINDINGS_INVALID")
-    bindings: dict[tuple[int, str], Mapping[str, Any]] = {}
-    states: dict[tuple[int, str], Any] = {}
-    for row in raw_bindings:
-        if not isinstance(row, Mapping):
-            raise Gate2HarnessError("LOCAL_GATE2_BINDINGS_INVALID")
-        key = (int(row.get("scene_id", -1)), str(row.get("state_id", "")))
-        raw_views = row.get("views")
-        if key in bindings or key[1] != "L3" or not isinstance(raw_views, list):
-            raise Gate2HarnessError("LOCAL_GATE2_BINDINGS_INVALID")
-        hashes = tuple(
-            SimpleNamespace(view_id=int(view["view_id"]), sha256=str(view["sha256"]))
-            for view in raw_views
-            if isinstance(view, Mapping)
-        )
-        if len(hashes) != 8:
-            raise Gate2HarnessError("LOCAL_GATE2_BINDINGS_INVALID")
-        bindings[key] = row
-        states[key] = SimpleNamespace(input_sha256_by_view=hashes)
-    if len(bindings) != 6:
-        raise Gate2HarnessError("LOCAL_GATE2_BINDING_COUNT_INVALID")
-    return bindings, states
+    return _closure_input_rows(
+        validate_local_closure(closure_path), boundary="LOCAL"
+    )
+
+
+def _formal_home_input_rows(
+    closure_path: Path,
+) -> tuple[
+    dict[tuple[int, str], Mapping[str, Any]],
+    dict[tuple[int, str], Any],
+]:
+    """Load revalidated bits without reading any prior prediction output."""
+
+    payload = _read_json(closure_path)
+    if not isinstance(payload, Mapping):
+        raise Gate2HarnessError("FORMAL_GATE2_CLOSURE_INVALID")
+    validated = validate_formal_home_closure_payload(
+        payload, expected_formal_root=closure_path.resolve().parents[1]
+    )
+    return _closure_input_rows(validated, boundary="FORMAL")
 
 
 def _bound_views(
@@ -590,6 +639,7 @@ def _run_model_inference(
     inference_root: Path,
     timeout_seconds: float,
     local_development: bool = False,
+    home_owned_formal: bool = False,
 ) -> PredictionArtifact:
     inference_root.mkdir(parents=True, exist_ok=False)
     request_path = inference_root / "request.json"
@@ -634,7 +684,11 @@ def _run_model_inference(
                 "-I",
                 "-B",
                 "-c",
-                _LOCAL_MODEL_WORKER_CODE if local_development else _MODEL_WORKER_CODE,
+                (
+                    _LOCAL_MODEL_WORKER_CODE
+                    if local_development or home_owned_formal
+                    else _MODEL_WORKER_CODE
+                ),
                 str(repo),
                 str(request_path),
                 str(result_path),
@@ -768,9 +822,13 @@ def _run_unit_worker(args: argparse.Namespace) -> int:
         raise Gate2HarnessError("GATE2_NON_L3_UNIT_FORBIDDEN")
     overlay = _overlay_payload(args.overlay_config)
     overlay_sha = sha256_file(args.overlay_config)
+    home_owned_formal = bool(getattr(args, "home_owned_formal", False))
     if args.local_development:
         runtime_binding_path = args.input_closure_dir / "local-gate2-input-closure.json"
         runtime_rows, states = _local_input_rows(runtime_binding_path)
+    elif home_owned_formal:
+        runtime_binding_path = args.input_closure_dir / "formal-gate2-input-closure.json"
+        runtime_rows, states = _formal_home_input_rows(runtime_binding_path)
     else:
         runtime_binding_path = args.input_closure_dir / "v4-runtime-state-bindings.json"
         states_path = args.input_closure_dir / "v4-model-independent-states.json"
@@ -848,6 +906,7 @@ def _run_unit_worker(args: argparse.Namespace) -> int:
             inference_root=inference_root,
             timeout_seconds=args.model_timeout_seconds,
             local_development=args.local_development,
+            home_owned_formal=home_owned_formal,
         )
         _write_json_no_clobber(
             inference_receipt_root / f"attempt-{attempt_index:02d}.json",
@@ -1017,10 +1076,16 @@ def _worker_command(
     unit_key: str,
     fault_phase: str | None,
 ) -> list[str]:
+    if bool(getattr(args, "home_owned_formal", False)):
+        worker_command = "_formal-home-unit-worker"
+    elif args.local_development:
+        worker_command = "_local-unit-worker"
+    else:
+        worker_command = "_unit-worker"
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
-        "_local-unit-worker" if args.local_development else "_unit-worker",
+        worker_command,
         "--output-root",
         str(args.output_root),
         "--input-closure-dir",
@@ -1094,9 +1159,71 @@ def _write_manifest(output_root: Path) -> None:
     atomic_write_bytes(target, ("\n".join(rows) + "\n").encode("utf-8"))
 
 
+def _formal_home_preflight(args: argparse.Namespace) -> dict[str, object]:
+    """Validate closure and authorization before output creation or GPU probes."""
+
+    input_dir = _require_formal_home_path(args.input_closure_dir)
+    authorization_path = _require_formal_home_path(args.authorization_manifest)
+    if input_dir.name != "manifests" or authorization_path.parent != input_dir:
+        raise Gate2HarnessError("FORMAL_GATE2_MANIFEST_ROOT_IDENTITY_INVALID")
+    if authorization_path.name != "formal-gate2-authorization.json":
+        raise Gate2HarnessError("FORMAL_GATE2_AUTHORIZATION_PATH_INVALID")
+    closure_path = input_dir / "formal-gate2-input-closure.json"
+    closure_payload = _read_json(closure_path)
+    if not isinstance(closure_payload, Mapping):
+        raise Gate2HarnessError("FORMAL_GATE2_CLOSURE_INVALID")
+    formal_root = input_dir.parent
+    closure = validate_formal_home_closure_payload(
+        closure_payload, expected_formal_root=formal_root
+    )
+    if (
+        closure.get("production_source_commit") != CANONICAL_COMMIT
+        or closure.get("production_source_tree") != CANONICAL_TREE
+    ):
+        raise Gate2HarnessError("FORMAL_GATE2_PRODUCTION_SOURCE_IDENTITY_MISMATCH")
+    overlay_path = args.overlay_config.expanduser().resolve()
+    if (
+        Path(str(closure.get("overlay_path", ""))).expanduser().resolve()
+        != overlay_path
+        or closure.get("overlay_sha256") != sha256_file(overlay_path)
+    ):
+        raise Gate2HarnessError("FORMAL_GATE2_OVERLAY_DIGEST_MISMATCH")
+    authorization_payload = _read_json(authorization_path)
+    if not isinstance(authorization_payload, Mapping):
+        raise Gate2HarnessError("FORMAL_GATE2_AUTHORIZATION_INVALID")
+    authorization = validate_formal_gate2_authorization(
+        authorization_payload,
+        expected_closure_sha256=sha256_file(closure_path),
+        expected_output_root=args.output_root,
+    )
+    if (
+        authorization.get("production_source_commit")
+        != closure.get("production_source_commit")
+        or authorization.get("test_only_source_commit")
+        != closure.get("test_only_source_commit")
+        or authorization.get("schedule_identity_sha256")
+        != closure.get("schedule_identity_sha256")
+    ):
+        raise Gate2HarnessError("FORMAL_GATE2_AUTHORIZATION_PROVENANCE_MISMATCH")
+    for field in ("max_gpu_seconds", "max_wall_seconds", "max_storage_bytes"):
+        if getattr(args, field) != authorization.get(field):
+            raise Gate2HarnessError(f"FORMAL_GATE2_AUTHORIZATION_BUDGET_MISMATCH:{field}")
+    return {
+        "closure_path": closure_path,
+        "closure": closure,
+        "authorization_path": authorization_path,
+        "authorization": authorization,
+    }
+
+
 def _run_supervisor(args: argparse.Namespace) -> int:
     repo = Path(__file__).resolve().parents[1]
-    if args.local_development:
+    home_owned_formal = bool(getattr(args, "home_owned_formal", False))
+    formal_preflight: dict[str, object] | None = None
+    if home_owned_formal:
+        _require_formal_home_output(args.output_root)
+        formal_preflight = _formal_home_preflight(args)
+    elif args.local_development:
         _require_home_output(args.output_root)
         _require_home_output(args.input_closure_dir)
     else:
@@ -1106,10 +1233,15 @@ def _run_supervisor(args: argparse.Namespace) -> int:
     args.output_root.mkdir(parents=True, exist_ok=False)
     log = EventLog(args.output_root)
     started = time.monotonic()
+    authorization_note = (
+        str(formal_preflight["authorization"]["authorization_note"])
+        if formal_preflight is not None
+        else args.authorization_note
+    )
     try:
         log.write(
             "LOCAL_GATE2_START" if args.local_development else "GATE2_START",
-            authorization_note=args.authorization_note,
+            authorization_note=authorization_note,
             validation_class=(
                 LOCAL_VALIDATION_CLASS if args.local_development else "FORMAL_GATE2"
             ),
@@ -1141,6 +1273,19 @@ def _run_supervisor(args: argparse.Namespace) -> int:
                 raise Gate2HarnessError("LOCAL_GATE2_SMOKE_MANIFEST_MISSING")
             smoke = RecoverySmokeManifest.from_mapping(embedded_smoke)
             schedule_path = None
+        elif home_owned_formal:
+            assert formal_preflight is not None
+            input_closure_path = formal_preflight["closure_path"]
+            input_closure = formal_preflight["closure"]
+            if not isinstance(input_closure_path, Path) or not isinstance(
+                input_closure, Mapping
+            ):
+                raise Gate2HarnessError("FORMAL_GATE2_PREFLIGHT_STATE_INVALID")
+            embedded_smoke = input_closure.get("smoke_manifest")
+            if not isinstance(embedded_smoke, Mapping):
+                raise Gate2HarnessError("FORMAL_GATE2_SMOKE_MANIFEST_MISSING")
+            smoke = RecoverySmokeManifest.from_mapping(embedded_smoke)
+            schedule_path = None
         else:
             input_closure_path = (
                 args.input_closure_dir / "v4-attempt05-input-closure.json"
@@ -1170,16 +1315,27 @@ def _run_supervisor(args: argparse.Namespace) -> int:
             "input_closure_status": input_closure["status"],
             "schedule_identity_sha256": smoke.schedule_identity_sha256,
             "runtime_binding_path": str(input_closure_path)
-            if args.local_development
+            if args.local_development or home_owned_formal
             else str(args.input_closure_dir / "v4-runtime-state-bindings.json"),
             "runtime_binding_sha256": sha256_file(input_closure_path)
-            if args.local_development
+            if args.local_development or home_owned_formal
             else sha256_file(args.input_closure_dir / "v4-runtime-state-bindings.json"),
             "overlay_config": str(args.overlay_config),
             "overlay_sha256": sha256_file(args.overlay_config),
             "attempt05_predictions_read": False,
             "scientific_result": NO_SCIENTIFIC_RESULT,
         }
+        if formal_preflight is not None:
+            authorization_path = formal_preflight["authorization_path"]
+            if not isinstance(authorization_path, Path):
+                raise Gate2HarnessError("FORMAL_GATE2_PREFLIGHT_STATE_INVALID")
+            input_manifest.update(
+                {
+                    "authorization_manifest": str(authorization_path),
+                    "authorization_sha256": sha256_file(authorization_path),
+                    "prediction_outputs_reused": False,
+                }
+            )
         if schedule_path is not None:
             input_manifest.update(
                 {
@@ -1412,7 +1568,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-gpu-seconds", type=float, default=21600.0)
     run.add_argument("--max-wall-seconds", type=float, default=43200.0)
     run.add_argument("--max-storage-bytes", type=int, default=50 * 1024**3)
-    run.set_defaults(local_development=False)
+    run.set_defaults(local_development=False, home_owned_formal=False)
 
     local_run = subparsers.add_parser("local-run")
     local_run.add_argument("--input-closure-dir", type=Path, required=True)
@@ -1424,7 +1580,23 @@ def build_parser() -> argparse.ArgumentParser:
     local_run.add_argument("--max-gpu-seconds", type=float, default=21600.0)
     local_run.add_argument("--max-wall-seconds", type=float, default=43200.0)
     local_run.add_argument("--max-storage-bytes", type=int, default=50 * 1024**3)
-    local_run.set_defaults(local_development=True)
+    local_run.set_defaults(local_development=True, home_owned_formal=False)
+
+    formal_home_run = subparsers.add_parser("formal-home-run")
+    formal_home_run.add_argument("--input-closure-dir", type=Path, required=True)
+    formal_home_run.add_argument("--overlay-config", type=Path, required=True)
+    formal_home_run.add_argument("--output-root", type=Path, required=True)
+    formal_home_run.add_argument(
+        "--authorization-manifest", type=Path, required=True
+    )
+    formal_home_run.add_argument("--model-timeout-seconds", type=float, default=7200.0)
+    formal_home_run.add_argument("--unit-timeout-seconds", type=float, default=7500.0)
+    formal_home_run.add_argument("--max-gpu-seconds", type=float, default=21600.0)
+    formal_home_run.add_argument("--max-wall-seconds", type=float, default=43200.0)
+    formal_home_run.add_argument(
+        "--max-storage-bytes", type=int, default=25 * 1024**3
+    )
+    formal_home_run.set_defaults(local_development=False, home_owned_formal=True)
 
     worker = subparsers.add_parser("_unit-worker")
     worker.add_argument("--input-closure-dir", type=Path, required=True)
@@ -1434,7 +1606,7 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--unit-key", required=True)
     worker.add_argument("--fault-phase", choices=sorted(INTERRUPTION_PHASES))
     worker.add_argument("--model-timeout-seconds", type=float, default=7200.0)
-    worker.set_defaults(local_development=False)
+    worker.set_defaults(local_development=False, home_owned_formal=False)
 
     local_worker = subparsers.add_parser("_local-unit-worker")
     local_worker.add_argument("--input-closure-dir", type=Path, required=True)
@@ -1444,13 +1616,31 @@ def build_parser() -> argparse.ArgumentParser:
     local_worker.add_argument("--unit-key", required=True)
     local_worker.add_argument("--fault-phase", choices=sorted(INTERRUPTION_PHASES))
     local_worker.add_argument("--model-timeout-seconds", type=float, default=7200.0)
-    local_worker.set_defaults(local_development=True)
+    local_worker.set_defaults(local_development=True, home_owned_formal=False)
+
+    formal_home_worker = subparsers.add_parser("_formal-home-unit-worker")
+    formal_home_worker.add_argument("--input-closure-dir", type=Path, required=True)
+    formal_home_worker.add_argument("--overlay-config", type=Path, required=True)
+    formal_home_worker.add_argument("--output-root", type=Path, required=True)
+    formal_home_worker.add_argument("--smoke-manifest", type=Path, required=True)
+    formal_home_worker.add_argument("--unit-key", required=True)
+    formal_home_worker.add_argument(
+        "--fault-phase", choices=sorted(INTERRUPTION_PHASES)
+    )
+    formal_home_worker.add_argument(
+        "--model-timeout-seconds", type=float, default=7200.0
+    )
+    formal_home_worker.set_defaults(local_development=False, home_owned_formal=True)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.command in {"_unit-worker", "_local-unit-worker"}:
+    if args.command in {
+        "_unit-worker",
+        "_local-unit-worker",
+        "_formal-home-unit-worker",
+    }:
         return _run_unit_worker(args)
     return _run_supervisor(args)
 

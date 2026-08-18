@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -30,6 +31,8 @@ from georeliab_mve.tartanair_range import (  # noqa: E402
 from georeliab_mve.adapters import verify_frozen_runtime  # noqa: E402
 from georeliab_mve.runner import _frozen_runtime_from_config  # noqa: E402
 from georeliab_mve.v4_attempt05_recovery import (  # noqa: E402
+    AUTHORIZED_GPU_UUID,
+    AUTHORIZED_PHYSICAL_GPU_INDEX,
     NO_SCIENTIFIC_RESULT,
     build_recovery_smoke_manifest,
     sha256_file,
@@ -41,6 +44,11 @@ SCHEMA_VERSION = "georeliab-v4-local-gate2-input-closure-1.0"
 PLAN_SCHEMA_VERSION = "georeliab-v4-local-gate2-plan-1.0"
 LOG_SCHEMA_VERSION = "georeliab-v4-local-gate2-preparation-log-1.0"
 LOCAL_STATUS = "LOCAL_GATE2_DEVELOPMENT_INPUT_READY"
+FORMAL_HOME_SCHEMA_VERSION = "georeliab-v4-formal-home-gate2-input-closure-1.0"
+FORMAL_HOME_STATUS = "V4_FORMAL_HOME_GATE2_INPUT_CLOSURE_READY"
+FORMAL_HOME_VALIDATION_CLASS = "FORMAL_GATE2_INPUT_CLOSURE"
+FORMAL_GATE2_AUTH_SCHEMA_VERSION = "georeliab-v4-formal-gate2-authorization-1.0"
+FORMAL_GATE2_AUTH_STATUS = "V4_FORMAL_GATE2_EXECUTION_AUTHORIZED"
 RECTIFIED_URL = "https://roboimagedata2.compute.dtu.dk/data/MVS/Rectified.zip"
 RECTIFIED_BYTES = 129_593_443_783
 RECTIFIED_ETAG = "1e2c5f05c7-5652dcf644cb3"
@@ -504,6 +512,330 @@ def validate_local_closure(path: Path) -> dict[str, object]:
     if actual_members != expected_members:
         raise LocalGate2PreparationError("LOCAL_GATE2_MEMBER_SET_INVALID")
     return payload
+
+
+def _require_hex_identity(value: object, *, width: int, reason: str) -> str:
+    rendered = str(value)
+    if len(rendered) != width or any(
+        character not in "0123456789abcdef" for character in rendered
+    ):
+        raise LocalGate2PreparationError(reason)
+    return rendered
+
+
+def _validate_formal_bindings(payload: Mapping[str, object]) -> None:
+    smoke = payload.get("smoke_manifest")
+    bindings = payload.get("bindings")
+    if not isinstance(smoke, Mapping):
+        raise LocalGate2PreparationError("FORMAL_GATE2_SMOKE_IDENTITY_INVALID")
+    unit_keys = smoke.get("unit_keys")
+    if not isinstance(unit_keys, list) or len(unit_keys) != 12:
+        raise LocalGate2PreparationError("FORMAL_GATE2_UNIT_IDENTITY_INVALID")
+    if len(set(str(value) for value in unit_keys)) != 12:
+        raise LocalGate2PreparationError("FORMAL_GATE2_UNIT_IDENTITY_DUPLICATE")
+    if dict(smoke) != dict(local_smoke_manifest()):
+        raise LocalGate2PreparationError("FORMAL_GATE2_SMOKE_IDENTITY_INVALID")
+    if not isinstance(bindings, list) or len(bindings) != 6:
+        raise LocalGate2PreparationError("FORMAL_GATE2_BINDING_IDENTITY_INVALID")
+    scene_ids = payload.get("scene_ids")
+    if not isinstance(scene_ids, list) or len(scene_ids) != 6:
+        raise LocalGate2PreparationError("FORMAL_GATE2_SCENE_IDENTITY_INVALID")
+    ordered_view_ids = payload.get("ordered_view_ids")
+    if ordered_view_ids != list(LOCAL_ORDERED_VIEW_IDS):
+        raise LocalGate2PreparationError("FORMAL_GATE2_VIEW_IDENTITY_INVALID")
+    seen_scenes: set[int] = set()
+    view_count = 0
+    for binding in bindings:
+        if not isinstance(binding, Mapping):
+            raise LocalGate2PreparationError("FORMAL_GATE2_BINDING_IDENTITY_INVALID")
+        scene_id = int(binding.get("scene_id", -1))
+        views = binding.get("views")
+        if (
+            scene_id not in scene_ids
+            or scene_id in seen_scenes
+            or binding.get("state_id") != "L3"
+            or binding.get("ordered_view_ids") != list(LOCAL_ORDERED_VIEW_IDS)
+            or not isinstance(views, list)
+            or len(views) != 8
+        ):
+            raise LocalGate2PreparationError("FORMAL_GATE2_BINDING_IDENTITY_INVALID")
+        actual_view_ids: list[int] = []
+        for view in views:
+            if not isinstance(view, Mapping):
+                raise LocalGate2PreparationError("FORMAL_GATE2_VIEW_IDENTITY_INVALID")
+            view_id = int(view.get("view_id", -1))
+            actual_view_ids.append(view_id)
+            _require_hex_identity(
+                view.get("sha256"),
+                width=64,
+                reason="FORMAL_GATE2_VIEW_DIGEST_INVALID",
+            )
+            if view.get("source_sha256") != view.get("sha256"):
+                raise LocalGate2PreparationError(
+                    "FORMAL_GATE2_VIEW_PROVENANCE_INVALID"
+                )
+            if not str(view.get("path", "")):
+                raise LocalGate2PreparationError("FORMAL_GATE2_VIEW_PATH_INVALID")
+        if actual_view_ids != list(LOCAL_ORDERED_VIEW_IDS):
+            raise LocalGate2PreparationError("FORMAL_GATE2_VIEW_IDENTITY_INVALID")
+        seen_scenes.add(scene_id)
+        view_count += len(views)
+    if seen_scenes != set(int(value) for value in scene_ids) or view_count != 48:
+        raise LocalGate2PreparationError("FORMAL_GATE2_BINDING_IDENTITY_INVALID")
+    if payload.get("member_count") != 48:
+        raise LocalGate2PreparationError("FORMAL_GATE2_MEMBER_COUNT_INVALID")
+
+
+def build_formal_home_closure_payload(
+    *,
+    source_closure: Mapping[str, object],
+    source_closure_path: Path,
+    source_closure_sha256: str,
+    resource_audit: Mapping[str, object],
+    resource_audit_path: Path,
+    resource_audit_sha256: str,
+    overlay_path: Path,
+    overlay_sha256: str,
+    formal_root: Path,
+    production_source_commit: str,
+    production_source_tree: str,
+    test_only_source_commit: str,
+) -> dict[str, object]:
+    """Rebind validated local bits into a distinct, non-executing formal closure."""
+
+    if (
+        source_closure.get("schema_version") != SCHEMA_VERSION
+        or source_closure.get("status") != LOCAL_STATUS
+        or source_closure.get("validation_class")
+        != "LOCAL_GATE2_DEVELOPMENT_VALIDATION"
+        or source_closure.get("formal_gate2_equivalent") is not False
+    ):
+        raise LocalGate2PreparationError("FORMAL_GATE2_SOURCE_IDENTITY_INVALID")
+    if (
+        source_closure.get("attempt05_predictions_read") is not False
+        or source_closure.get("scientific_result") != NO_SCIENTIFIC_RESULT
+        or source_closure.get("schedule_identity_sha256")
+        != LOCAL_SCHEDULE_IDENTITY
+    ):
+        raise LocalGate2PreparationError("FORMAL_GATE2_SOURCE_PROVENANCE_INVALID")
+    _validate_formal_bindings(source_closure)
+    if (
+        resource_audit.get("schema_version")
+        != "georeliab-v4-local-gate2-resource-audit-1.0"
+        or resource_audit.get("status")
+        != "LOCAL_GATE2_DEVELOPMENT_RESOURCES_READY"
+        or resource_audit.get("validation_class")
+        != "LOCAL_GATE2_DEVELOPMENT_VALIDATION"
+        or resource_audit.get("formal_gate2_equivalent") is not False
+        or resource_audit.get("scientific_result") != NO_SCIENTIFIC_RESULT
+    ):
+        raise LocalGate2PreparationError("FORMAL_GATE2_RESOURCE_IDENTITY_INVALID")
+    models = resource_audit.get("models")
+    if not isinstance(models, list) or not all(
+        isinstance(row, Mapping) for row in models
+    ):
+        raise LocalGate2PreparationError("FORMAL_GATE2_RESOURCE_MODELS_INVALID")
+    if [row.get("model") for row in models] != ["VGGT", "MASt3R"]:
+        raise LocalGate2PreparationError("FORMAL_GATE2_RESOURCE_MODELS_INVALID")
+    for row in models:
+        if not isinstance(row, Mapping):
+            raise LocalGate2PreparationError("FORMAL_GATE2_RESOURCE_MODELS_INVALID")
+        _require_hex_identity(
+            row.get("checkpoint_sha256"),
+            width=64,
+            reason="FORMAL_GATE2_RESOURCE_DIGEST_INVALID",
+        )
+    identities = (
+        (source_closure_sha256, 64, "FORMAL_GATE2_SOURCE_DIGEST_INVALID"),
+        (resource_audit_sha256, 64, "FORMAL_GATE2_RESOURCE_DIGEST_INVALID"),
+        (overlay_sha256, 64, "FORMAL_GATE2_OVERLAY_DIGEST_INVALID"),
+        (production_source_commit, 40, "FORMAL_GATE2_PRODUCTION_IDENTITY_INVALID"),
+        (production_source_tree, 40, "FORMAL_GATE2_PRODUCTION_IDENTITY_INVALID"),
+        (test_only_source_commit, 40, "FORMAL_GATE2_TEST_ONLY_IDENTITY_INVALID"),
+    )
+    for value, width, reason in identities:
+        _require_hex_identity(value, width=width, reason=reason)
+    if resource_audit.get("overlay_sha256") != overlay_sha256:
+        raise LocalGate2PreparationError("FORMAL_GATE2_OVERLAY_DIGEST_MISMATCH")
+    resolved_formal_root = formal_root.expanduser().resolve()
+    source_root = Path(str(source_closure.get("root", ""))).expanduser().resolve()
+    if resolved_formal_root == source_root:
+        raise LocalGate2PreparationError("FORMAL_GATE2_ROOT_PROVENANCE_INVALID")
+    return {
+        "schema_version": FORMAL_HOME_SCHEMA_VERSION,
+        "status": FORMAL_HOME_STATUS,
+        "validation_class": FORMAL_HOME_VALIDATION_CLASS,
+        "formal_gate2_equivalent": True,
+        "source_validation_class": "LOCAL_GATE2_DEVELOPMENT_VALIDATION",
+        "input_bits_revalidated": True,
+        "resource_bits_revalidated": True,
+        "prediction_outputs_reused": False,
+        "attempt05_predictions_read": False,
+        "gate2_started": False,
+        "pilot_started": False,
+        "attempt06_started": False,
+        "execution_authorized": False,
+        "root": str(resolved_formal_root),
+        "source_root": str(source_root),
+        "source_closure_path": str(source_closure_path.expanduser().resolve()),
+        "source_closure_sha256": source_closure_sha256,
+        "resource_audit_path": str(resource_audit_path.expanduser().resolve()),
+        "resource_audit_sha256": resource_audit_sha256,
+        "overlay_path": str(overlay_path.expanduser().resolve()),
+        "overlay_sha256": overlay_sha256,
+        "production_source_commit": production_source_commit,
+        "production_source_tree": production_source_tree,
+        "test_only_source_commit": test_only_source_commit,
+        "schedule_identity_sha256": source_closure["schedule_identity_sha256"],
+        "smoke_manifest": deepcopy(source_closure["smoke_manifest"]),
+        "scene_ids": deepcopy(source_closure["scene_ids"]),
+        "ordered_view_ids": deepcopy(source_closure["ordered_view_ids"]),
+        "state_id": "L3",
+        "model_ids": ["VGGT", "MASt3R"],
+        "bindings": deepcopy(source_closure["bindings"]),
+        "member_count": 48,
+        "resources": deepcopy(models),
+        "scientific_result": NO_SCIENTIFIC_RESULT,
+    }
+
+
+def validate_formal_home_closure_payload(
+    payload: Mapping[str, object], *, expected_formal_root: Path
+) -> dict[str, object]:
+    """Validate the separate formal identity; a relabelled local closure fails."""
+
+    if (
+        payload.get("schema_version") != FORMAL_HOME_SCHEMA_VERSION
+        or payload.get("status") != FORMAL_HOME_STATUS
+        or payload.get("validation_class") != FORMAL_HOME_VALIDATION_CLASS
+    ):
+        raise LocalGate2PreparationError("FORMAL_GATE2_CLOSURE_IDENTITY_INVALID")
+    if (
+        payload.get("formal_gate2_equivalent") is not True
+        or payload.get("source_validation_class")
+        != "LOCAL_GATE2_DEVELOPMENT_VALIDATION"
+        or payload.get("input_bits_revalidated") is not True
+        or payload.get("resource_bits_revalidated") is not True
+    ):
+        raise LocalGate2PreparationError("FORMAL_GATE2_REVALIDATION_PROVENANCE_INVALID")
+    if (
+        payload.get("prediction_outputs_reused") is not False
+        or payload.get("attempt05_predictions_read") is not False
+        or payload.get("gate2_started") is not False
+        or payload.get("pilot_started") is not False
+        or payload.get("attempt06_started") is not False
+        or payload.get("execution_authorized") is not False
+    ):
+        raise LocalGate2PreparationError("FORMAL_GATE2_EXECUTION_PROVENANCE_INVALID")
+    if payload.get("scientific_result") != NO_SCIENTIFIC_RESULT:
+        raise LocalGate2PreparationError("FORMAL_GATE2_SCIENTIFIC_RESULT_FORBIDDEN")
+    expected_root = expected_formal_root.expanduser().resolve()
+    if Path(str(payload.get("root", ""))).expanduser().resolve() != expected_root:
+        raise LocalGate2PreparationError("FORMAL_GATE2_ROOT_IDENTITY_INVALID")
+    if payload.get("schedule_identity_sha256") != LOCAL_SCHEDULE_IDENTITY:
+        raise LocalGate2PreparationError("FORMAL_GATE2_SCHEDULE_IDENTITY_INVALID")
+    for field, width in (
+        ("source_closure_sha256", 64),
+        ("resource_audit_sha256", 64),
+        ("overlay_sha256", 64),
+        ("production_source_commit", 40),
+        ("production_source_tree", 40),
+        ("test_only_source_commit", 40),
+    ):
+        _require_hex_identity(
+            payload.get(field),
+            width=width,
+            reason=f"FORMAL_GATE2_{field.upper()}_IDENTITY_INVALID",
+        )
+    if payload.get("model_ids") != ["VGGT", "MASt3R"]:
+        raise LocalGate2PreparationError("FORMAL_GATE2_MODEL_IDENTITY_INVALID")
+    _validate_formal_bindings(payload)
+    return dict(payload)
+
+
+def write_formal_home_closure(
+    formal_root: Path, payload: Mapping[str, object]
+) -> Path:
+    """Write one immutable formal closure below a distinct home-owned root."""
+
+    resolved = require_home_owned_root(formal_root)
+    validated = validate_formal_home_closure_payload(
+        payload, expected_formal_root=resolved
+    )
+    path = resolved / "manifests" / "formal-gate2-input-closure.json"
+    if path.exists():
+        raise LocalGate2PreparationError(
+            f"FORMAL_GATE2_CLOSURE_NO_CLOBBER_COLLISION:{path}"
+        )
+    _atomic_write(path, _canonical_bytes(validated))
+    return path
+
+
+def validate_formal_gate2_authorization(
+    authorization: Mapping[str, object],
+    *,
+    expected_closure_sha256: str,
+    expected_output_root: Path,
+) -> dict[str, object]:
+    """Fail closed unless one machine-readable formal Gate 2 run is authorized."""
+
+    _require_hex_identity(
+        expected_closure_sha256,
+        width=64,
+        reason="FORMAL_GATE2_EXPECTED_CLOSURE_DIGEST_INVALID",
+    )
+    if (
+        authorization.get("schema_version") != FORMAL_GATE2_AUTH_SCHEMA_VERSION
+        or authorization.get("status") != FORMAL_GATE2_AUTH_STATUS
+        or authorization.get("validation_class") != "FORMAL_GATE2"
+    ):
+        raise LocalGate2PreparationError("FORMAL_GATE2_AUTH_IDENTITY_INVALID")
+    if authorization.get("user_approved") is not True or not str(
+        authorization.get("authorization_note", "")
+    ).strip():
+        raise LocalGate2PreparationError("FORMAL_GATE2_USER_AUTHORIZATION_REQUIRED")
+    if authorization.get("formal_closure_sha256") != expected_closure_sha256:
+        raise LocalGate2PreparationError("FORMAL_GATE2_CLOSURE_DIGEST_MISMATCH")
+    if (
+        authorization.get("gpu_uuid") != AUTHORIZED_GPU_UUID
+        or authorization.get("physical_gpu_index")
+        != AUTHORIZED_PHYSICAL_GPU_INDEX
+    ):
+        raise LocalGate2PreparationError("FORMAL_GATE2_GPU_IDENTITY_MISMATCH")
+    if authorization.get("pilot_started") is not False or authorization.get(
+        "attempt06_started"
+    ) is not False:
+        raise LocalGate2PreparationError("FORMAL_GATE2_DOWNSTREAM_PILOT_FORBIDDEN")
+    if authorization.get("scientific_result") != NO_SCIENTIFIC_RESULT:
+        raise LocalGate2PreparationError("FORMAL_GATE2_SCIENTIFIC_RESULT_FORBIDDEN")
+    if authorization.get("gate2_started") is not False:
+        raise LocalGate2PreparationError("FORMAL_GATE2_AUTH_ALREADY_STARTED")
+    expected_output = expected_output_root.expanduser().resolve()
+    if Path(str(authorization.get("output_root", ""))).expanduser().resolve() != (
+        expected_output
+    ):
+        raise LocalGate2PreparationError("FORMAL_GATE2_AUTH_OUTPUT_ROOT_MISMATCH")
+    for field, ceiling in (
+        ("max_gpu_seconds", 21_600),
+        ("max_wall_seconds", 43_200),
+        ("max_storage_bytes", 25 * 1024**3),
+    ):
+        value = authorization.get(field)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise LocalGate2PreparationError("FORMAL_GATE2_AUTH_BUDGET_INVALID")
+        if value <= 0 or value > ceiling:
+            raise LocalGate2PreparationError("FORMAL_GATE2_AUTH_BUDGET_INVALID")
+    for field in ("production_source_commit", "test_only_source_commit"):
+        _require_hex_identity(
+            authorization.get(field),
+            width=40,
+            reason="FORMAL_GATE2_AUTH_SOURCE_IDENTITY_INVALID",
+        )
+    if authorization.get("schedule_identity_sha256") != LOCAL_SCHEDULE_IDENTITY:
+        raise LocalGate2PreparationError(
+            "FORMAL_GATE2_AUTH_SCHEDULE_IDENTITY_INVALID"
+        )
+    return dict(authorization)
 
 
 def materialize(root: Path, *, archive_url: str = RECTIFIED_URL) -> Path:
