@@ -26,6 +26,7 @@ from georeliab_mve.v4_attempt05_recovery import (  # noqa: E402
     RecoverySmokeManifest,
     evaluate_recovery_smoke,
 )
+from tests import local_gate2_prepare as local_gate2  # noqa: E402
 
 
 SCHEMA_VERSION = "georeliab-v4-gate2-pilot-readiness-audit-1.0"
@@ -460,6 +461,221 @@ def _audit_local_input_binding(gate2_root: Path, run_root: Path) -> dict[str, ob
     }
 
 
+def _resolved_path(value: object, *, reason: str) -> Path:
+    if not isinstance(value, str) or not value:
+        _fail(reason)
+    return Path(value).expanduser().resolve()
+
+
+def _require_exact_digest(
+    path: Path, expected: object, *, reason: str
+) -> str:
+    if not path.is_file() or not isinstance(expected, str):
+        _fail(reason)
+    observed = _sha256_file(path)
+    if observed != expected:
+        _fail(reason)
+    return observed
+
+
+def _audit_formal_home_input_binding(
+    gate2_root: Path, run_root: Path
+) -> tuple[dict[str, object], Mapping[str, object]]:
+    """Verify a formal closure whose immutable source bits stay in local root."""
+
+    formal_root = gate2_root.resolve()
+    input_manifest_path = (run_root / "input-manifest.json").resolve()
+    input_manifest = _read_json(input_manifest_path)
+    closure_path = _resolved_path(
+        input_manifest.get("input_closure_path"),
+        reason="G2_FORMAL_INPUT_CLOSURE_PATH_MISSING",
+    )
+    expected_closure_path = (
+        formal_root / "manifests" / "formal-gate2-input-closure.json"
+    ).resolve()
+    if closure_path != expected_closure_path:
+        _fail("G2_FORMAL_INPUT_CLOSURE_PATH_INVALID")
+    closure_sha256 = _require_exact_digest(
+        closure_path,
+        input_manifest.get("input_closure_sha256"),
+        reason="G2_INPUT_CLOSURE_DIGEST_MISMATCH",
+    )
+    if (
+        _resolved_path(
+            input_manifest.get("runtime_binding_path"),
+            reason="G2_FORMAL_RUNTIME_BINDING_PATH_MISSING",
+        )
+        != closure_path
+        or input_manifest.get("runtime_binding_sha256") != closure_sha256
+    ):
+        _fail("G2_FORMAL_RUNTIME_BINDING_IDENTITY_MISMATCH")
+    if input_manifest.get("attempt05_predictions_read") is not False:
+        _fail("G2_ATTEMPT05_INPUT_REUSE_FORBIDDEN")
+    if input_manifest.get("prediction_outputs_reused") is not False:
+        _fail("G2_PREDICTION_OUTPUT_REUSE_FORBIDDEN")
+    _require_no_scientific_result(
+        input_manifest, "G2_FORMAL_INPUT_SCIENTIFIC_RESULT_FORBIDDEN"
+    )
+
+    closure = _read_json(closure_path)
+    try:
+        closure = local_gate2.validate_formal_home_closure_payload(
+            closure, expected_formal_root=formal_root
+        )
+    except Exception as exc:
+        raise ReadinessAuditError(
+            f"G2_FORMAL_CLOSURE_INVALID:{type(exc).__name__}:{exc}"
+        ) from exc
+    source_root = _resolved_path(
+        closure.get("source_root"), reason="G2_FORMAL_SOURCE_ROOT_MISSING"
+    )
+    if source_root == formal_root:
+        _fail("G2_FORMAL_SOURCE_ROOT_IDENTITY_MISMATCH")
+    source_path = _resolved_path(
+        closure.get("source_closure_path"),
+        reason="G2_FORMAL_SOURCE_CLOSURE_PATH_MISSING",
+    )
+    if source_path != (
+        source_root / "manifests" / "local-gate2-input-closure.json"
+    ).resolve():
+        _fail("G2_FORMAL_SOURCE_ROOT_IDENTITY_MISMATCH")
+    source_sha256 = _require_exact_digest(
+        source_path,
+        closure.get("source_closure_sha256"),
+        reason="G2_FORMAL_SOURCE_CLOSURE_DIGEST_MISMATCH",
+    )
+    try:
+        source = local_gate2.validate_local_closure(source_path)
+    except Exception as exc:
+        raise ReadinessAuditError(
+            f"G2_FORMAL_SOURCE_CLOSURE_INVALID:{type(exc).__name__}:{exc}"
+        ) from exc
+    if _resolved_path(
+        source.get("root"), reason="G2_FORMAL_SOURCE_ROOT_IDENTITY_MISMATCH"
+    ) != source_root:
+        _fail("G2_FORMAL_SOURCE_ROOT_IDENTITY_MISMATCH")
+
+    overlay_path = _resolved_path(
+        closure.get("overlay_path"), reason="G2_FORMAL_OVERLAY_PATH_MISSING"
+    )
+    if (
+        overlay_path
+        != (source_root / "manifests" / "local-gate2-overlay.toml").resolve()
+        or _resolved_path(
+            input_manifest.get("overlay_config"),
+            reason="G2_FORMAL_OVERLAY_PATH_MISSING",
+        )
+        != overlay_path
+    ):
+        _fail("G2_FORMAL_OVERLAY_PATH_INVALID")
+    overlay_sha256 = _require_exact_digest(
+        overlay_path,
+        closure.get("overlay_sha256"),
+        reason="G2_FORMAL_OVERLAY_DIGEST_MISMATCH",
+    )
+    if input_manifest.get("overlay_sha256") != overlay_sha256:
+        _fail("G2_FORMAL_OVERLAY_DIGEST_MISMATCH")
+
+    resource_path = _resolved_path(
+        closure.get("resource_audit_path"),
+        reason="G2_FORMAL_RESOURCE_AUDIT_PATH_MISSING",
+    )
+    if resource_path != (
+        source_root / "manifests" / "local-gate2-resource-audit.json"
+    ).resolve():
+        _fail("G2_FORMAL_RESOURCE_AUDIT_PATH_INVALID")
+    resource_sha256 = _require_exact_digest(
+        resource_path,
+        closure.get("resource_audit_sha256"),
+        reason="G2_FORMAL_RESOURCE_AUDIT_DIGEST_MISMATCH",
+    )
+    resource = _read_json(resource_path)
+    if resource.get("formal_gate2_equivalent") is not False:
+        _fail("G2_FORMAL_LOCAL_RESOURCE_PROMOTION_FORBIDDEN")
+    try:
+        local_gate2._validate_existing_resource_audit(
+            source_root=source_root,
+            resource_audit=resource,
+            overlay_path=overlay_path,
+        )
+    except Exception as exc:
+        raise ReadinessAuditError(
+            f"G2_FORMAL_RESOURCE_AUDIT_INVALID:{type(exc).__name__}:{exc}"
+        ) from exc
+
+    authorization_path = _resolved_path(
+        input_manifest.get("authorization_manifest"),
+        reason="G2_FORMAL_AUTHORIZATION_PATH_MISSING",
+    )
+    if authorization_path != (
+        formal_root / "manifests" / "formal-gate2-authorization.json"
+    ).resolve():
+        _fail("G2_FORMAL_AUTHORIZATION_PATH_INVALID")
+    authorization_sha256 = _require_exact_digest(
+        authorization_path,
+        input_manifest.get("authorization_sha256"),
+        reason="G2_FORMAL_AUTHORIZATION_DIGEST_MISMATCH",
+    )
+    authorization = _read_json(authorization_path)
+    try:
+        authorization = local_gate2.validate_formal_gate2_authorization(
+            authorization,
+            expected_closure_sha256=closure_sha256,
+            expected_output_root=run_root,
+        )
+    except Exception as exc:
+        raise ReadinessAuditError(
+            f"G2_FORMAL_AUTHORIZATION_INVALID:{type(exc).__name__}:{exc}"
+        ) from exc
+    if (
+        authorization.get("production_source_commit")
+        != closure.get("production_source_commit")
+        or authorization.get("test_only_source_commit")
+        != closure.get("test_only_source_commit")
+        or authorization.get("schedule_identity_sha256")
+        != closure.get("schedule_identity_sha256")
+    ):
+        _fail("G2_FORMAL_AUTHORIZATION_PROVENANCE_MISMATCH")
+
+    bindings = source.get("bindings")
+    if not isinstance(bindings, Sequence) or isinstance(
+        bindings, (str, bytes, bytearray)
+    ):
+        _fail("G2_FORMAL_SOURCE_BINDINGS_INVALID")
+    view_count = sum(
+        len(binding.get("views", ()))
+        for binding in bindings
+        if isinstance(binding, Mapping)
+    )
+    if len(bindings) != 6 or view_count != 48:
+        _fail("G2_FORMAL_SOURCE_BINDINGS_INVALID")
+    return (
+        {
+            "topology": "FORMAL_HOME_DUAL_ROOT",
+            "input_manifest_path": str(input_manifest_path),
+            "formal_root": str(formal_root),
+            "formal_closure_path": str(closure_path),
+            "formal_closure_sha256": closure_sha256,
+            "formal_closure_formal_equivalent": True,
+            "source_root": str(source_root),
+            "source_closure_path": str(source_path),
+            "source_closure_sha256": source_sha256,
+            "resource_audit_path": str(resource_path),
+            "resource_audit_sha256": resource_sha256,
+            "local_resource_formal_equivalent": False,
+            "overlay_path": str(overlay_path),
+            "overlay_sha256": overlay_sha256,
+            "authorization_path": str(authorization_path),
+            "authorization_sha256": authorization_sha256,
+            "scene_count": len(bindings),
+            "view_count": view_count,
+            "attempt05_predictions_read": False,
+            "prediction_outputs_reused": False,
+        },
+        resource,
+    )
+
+
 def audit_g2(
     *,
     repo: Path,
@@ -477,9 +693,21 @@ def audit_g2(
     qualification = _read_json(run_root / "qualification.json")
     smoke_payload = _read_json(run_root / "smoke-manifest.json")
     source = _read_json(run_root / "source-manifest.json")
-    resource = _read_json(
-        gate2_root / "manifests" / "local-gate2-resource-audit.json"
+    input_manifest = _read_json(run_root / "input-manifest.json")
+    closure_text = input_manifest.get("input_closure_path")
+    formal_home = (
+        isinstance(closure_text, str)
+        and Path(closure_text).name == "formal-gate2-input-closure.json"
     )
+    if formal_home:
+        input_binding, resource = _audit_formal_home_input_binding(
+            gate2_root, run_root
+        )
+    else:
+        resource = _read_json(
+            gate2_root / "manifests" / "local-gate2-resource-audit.json"
+        )
+        input_binding = _audit_local_input_binding(gate2_root, run_root)
     for value, reason in (
         (qualification, "G2_SCIENTIFIC_RESULT_FORBIDDEN"),
         (smoke_payload, "G2_SMOKE_SCIENTIFIC_RESULT_FORBIDDEN"),
@@ -527,8 +755,6 @@ def audit_g2(
         critical_paths=GATE2_CRITICAL_PATHS,
         label="G2",
     )
-    input_binding = _audit_local_input_binding(gate2_root, run_root)
-
     status = qualification.get("status")
     validation_class = qualification.get("validation_class")
     equivalent = qualification.get("formal_gate2_equivalent")
@@ -536,7 +762,15 @@ def audit_g2(
     if status == FORMAL_GATE2_STATUS:
         if validation_class != FORMAL_GATE2_CLASS:
             _fail("G2_FORMAL_CLASS_MISMATCH")
-        if equivalent is not True or resource_equivalent is not True:
+        if equivalent is not True:
+            _fail("G2_FORMAL_EQUIVALENCE_MISMATCH")
+        if formal_home:
+            if (
+                input_binding.get("formal_closure_formal_equivalent") is not True
+                or resource_equivalent is not False
+            ):
+                _fail("G2_FORMAL_EQUIVALENCE_MISMATCH")
+        elif resource_equivalent is not True:
             _fail("G2_FORMAL_EQUIVALENCE_MISMATCH")
         gate_status = G2_FORMAL_PASS
         formal = True
