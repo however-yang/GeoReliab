@@ -27,7 +27,8 @@ from tests import pilot_partition_authorization_audit as audit
 ADMISSION_READY = "V4_PILOT_ADMISSION_READY_FOR_EXPLICIT_AUTHORIZATION"
 ADMISSION_SCHEMA = "georeliab-v4-gate2-pilot-readiness-audit-1.0"
 SCHEDULE_SHA = "1" * 64
-PROTOCOL_SHA = "2" * 64
+PROTOCOL_BYTES = b"frozen georeliab v4 protocol fixture\n"
+PROTOCOL_SHA = hashlib.sha256(PROTOCOL_BYTES).hexdigest()
 SOURCE_COMMIT = "3" * 40
 SOURCE_TREE = "4" * 40
 GPU_UUID = "GPU-" + "5" * 32
@@ -149,7 +150,6 @@ def _case(tmp_path: Path, *, suffix: str = "01") -> dict[str, Path]:
             "schema_version": "georeliab-v4-formal-gate2-input-closure-1.0",
             "status": "FORMAL_GATE2_INPUT_CLOSURE_READY",
             "schedule_identity_sha256": SCHEDULE_SHA,
-            "protocol_sha256": PROTOCOL_SHA,
             "production_source_commit": SOURCE_COMMIT,
             "production_source_tree": SOURCE_TREE,
             "attempt05_predictions_read": False,
@@ -159,6 +159,9 @@ def _case(tmp_path: Path, *, suffix: str = "01") -> dict[str, Path]:
     )
     admission = home / "georeliab-v4-pilot/readiness/formal-admission/report.json"
     _write_json(admission, _admission_payload(formal_closure))
+    protocol = home / "georeliab-v4-pilot/readiness/protocol/GEORELIAB_V4_PROTOCOL.md"
+    protocol.parent.mkdir(parents=True, exist_ok=True)
+    protocol.write_bytes(PROTOCOL_BYTES)
     resource = home / "georeliab-v4-pilot/readiness/resources/pilot-resource-candidate.json"
     _write_json(resource, _resource_payload())
     run_root = home / f"georeliab-v4-pilot/runs/development-pilot-{suffix}"
@@ -178,6 +181,7 @@ def _case(tmp_path: Path, *, suffix: str = "01") -> dict[str, Path]:
             "resource_manifest_path": str(resource.resolve()),
             "resource_manifest_sha256": _sha(resource),
             "schedule_identity_sha256": SCHEDULE_SHA,
+            "protocol_path": str(protocol.resolve()),
             "protocol_sha256": PROTOCOL_SHA,
             "production_source_commit": SOURCE_COMMIT,
             "production_source_tree": SOURCE_TREE,
@@ -210,6 +214,7 @@ def _case(tmp_path: Path, *, suffix: str = "01") -> dict[str, Path]:
         "home": home,
         "formal_closure": formal_closure,
         "admission": admission,
+        "protocol": protocol,
         "resource": resource,
         "request": request,
         "run_root": run_root,
@@ -292,6 +297,11 @@ def test_admission_digest_and_auditor_lineage_tamper_fail_closed(
 
     with pytest.raises(audit.PilotFreezeAuthorizationError, match="AUDITOR"):
         _prepare(rehashed)
+
+    protocol_tamper = _case(tmp_path, suffix="protocol-tamper")
+    protocol_tamper["protocol"].write_bytes(PROTOCOL_BYTES + b"tamper\n")
+    with pytest.raises(audit.PilotFreezeAuthorizationError, match="PROTOCOL"):
+        _prepare(protocol_tamper)
 
 
 def test_partition_is_deterministic_and_binds_schedule_protocol_and_models(
@@ -406,6 +416,8 @@ def test_authorization_binds_user_gpu_budget_partition_and_fresh_run_root(
     assert authorization["authorization_note"]
     assert authorization["admission_report_sha256"] == _sha(case["admission"])
     assert authorization["partition_sha256"] == partition["partition_sha256"]
+    assert authorization["protocol_path"] == str(case["protocol"].resolve())
+    assert authorization["protocol_sha256"] == PROTOCOL_SHA
     assert authorization["gpu_uuid"] == GPU_UUID
     assert authorization["physical_gpu_count"] == 1
     assert authorization["max_gpu_seconds"] == 21_600
