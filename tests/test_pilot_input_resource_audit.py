@@ -1,4 +1,4 @@
-"""Fourteen CPU-only contracts for fresh Pilot inputs and resources."""
+"""Eighteen CPU-only contracts for fresh Pilot inputs and resources."""
 
 from __future__ import annotations
 
@@ -411,7 +411,7 @@ def _ready_case(tmp_path: Path, *, suffix: str = "01") -> dict[str, Path]:
     _prepare_resource(resources)
     frozen = _freeze_case(tmp_path, resources["output"], suffix=suffix)
     inventory = _staged_inventory(frozen, resources["output"], suffix=suffix)
-    return {
+    case = {
         **frozen,
         "resource_request": resources["request"],
         "resource_manifest": resources["output"],
@@ -419,6 +419,8 @@ def _ready_case(tmp_path: Path, *, suffix: str = "01") -> dict[str, Path]:
         "preflight_output": frozen["home"]
         / f"georeliab-v4-pilot/readiness/pilot-input-preflight-{suffix}",
     }
+    _strengthen_fog_bindings(case)
+    return case
 
 
 def _prepare_inputs(case: dict[str, Path]) -> dict[str, object]:

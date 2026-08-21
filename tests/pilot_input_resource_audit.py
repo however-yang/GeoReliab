@@ -11,16 +11,19 @@ from collections.abc import Mapping, Sequence
 import hashlib
 from itertools import combinations
 import json
+import math
 from pathlib import Path, PurePosixPath
 import re
 
 from georeliab_mve.v4_counterfactuals import (
     AssetEvidence,
     CounterfactualContractError,
+    DTU_OFFICIAL_SCENE_SET,
     FOG_STATES,
     ModelIndependentState,
     SCIENTIFIC_MODELS,
     SCIENTIFIC_STATES,
+    TEST_SCENE_IDS,
     materialize_dtu_state_identity,
 )
 from georeliab_mve.v4_science_lock import V4_PROTOCOL_SHA256
@@ -119,15 +122,51 @@ _ASSET_KEYS = frozenset({"member", "path", "sha256"})
 _FOG_ASSET_KEYS = frozenset({"member", "path", "sha256", "fog_generation"})
 _FOG_GENERATION_KEYS = frozenset(
     {
+        "schema_version",
+        "scene_id",
+        "state_id",
+        "severity",
+        "view_id",
+        "fog_member",
+        "fog_sha256",
         "source_state_id",
+        "source_member",
         "source_sha256",
-        "calibration_sha256",
-        "recipe_sha256",
+        "gt_sha256",
+        "camera_sha256",
+        "corruption_calibration_sha256",
+        "fog_recipe_sha256",
+        "renderer",
+        "implementation_version",
+        "beta",
+        "d_ref",
+        "airlight",
+        "fog_binding_sha256",
+    }
+)
+_FOG_CALIBRATION_KEYS = frozenset(
+    {
+        "schema_version",
+        "status",
+        "validation_class",
+        "scientific_result",
+        "source_split_role",
+        "source_scene_ids",
+        "pilot_scene_ids",
+        "scene_disjoint",
+        "split_fingerprint_sha256",
+        "inventory_sha256",
+        "d_ref",
+        "airlight",
+        "fog_betas",
+        "implementation_version",
+        "pilot_started",
     }
 )
 _BUNDLE_FILES = frozenset(
     {
         "manifests/pilot-model-independent-states.json",
+        "manifests/pilot-fog-generation-bindings.json",
         "manifests/pilot-unit-records.json",
         "manifests/pilot-input-closure.json",
         "pilot-input-preflight.json",
@@ -484,6 +523,94 @@ def _validate_schedule(
     return result
 
 
+def _validate_fog_calibration(
+    path: Path,
+    *,
+    expected_sha: str,
+    pilot_scene_ids: tuple[int, ...],
+) -> dict[str, object]:
+    if _sha256_file(path) != expected_sha:
+        _fail("FOG_CALIBRATION_DIGEST_MISMATCH")
+    value = _read_object(path, "FOG_CALIBRATION_JSON_INVALID")
+    if set(value) != _FOG_CALIBRATION_KEYS:
+        _fail("FOG_CALIBRATION_SCHEMA_INVALID")
+    if (
+        value.get("schema_version")
+        != "georeliab-v4-pilot-fog-calibration-1.0"
+        or value.get("status") != "V4_PILOT_FOG_CALIBRATION_FROZEN"
+        or value.get("validation_class") != DEVELOPMENT_EVIDENCE_ONLY
+        or value.get("scientific_result") != NO_SCIENTIFIC_RESULT
+        or value.get("source_split_role") != "CALIBRATION"
+        or value.get("implementation_version") != "georeliab-corruptions-v1"
+        or value.get("pilot_started") is not False
+    ):
+        _fail("FOG_CALIBRATION_HEADER_INVALID")
+    source_scenes = value.get("source_scene_ids")
+    if not isinstance(source_scenes, Sequence) or isinstance(
+        source_scenes, (str, bytes, bytearray)
+    ):
+        _fail("FOG_CALIBRATION_SPLIT_INVALID")
+    source_scene_ids = tuple(source_scenes)
+    if (
+        len(source_scene_ids) != 20
+        or len(set(source_scene_ids)) != 20
+        or any(
+            type(scene) is not int or scene not in DTU_OFFICIAL_SCENE_SET
+            for scene in source_scene_ids
+        )
+        or set(source_scene_ids) & set(TEST_SCENE_IDS)
+        or tuple(value.get("pilot_scene_ids", ())) != pilot_scene_ids
+        or value.get("scene_disjoint") is not True
+    ):
+        _fail("FOG_CALIBRATION_SPLIT_OVERLAP_OR_DISJOINTNESS_INVALID")
+    _require_sha(
+        value.get("split_fingerprint_sha256"),
+        "FOG_CALIBRATION_SPLIT_FINGERPRINT_INVALID",
+    )
+    _require_sha(
+        value.get("inventory_sha256"),
+        "FOG_CALIBRATION_INVENTORY_DIGEST_INVALID",
+    )
+    d_ref = value.get("d_ref")
+    airlight = value.get("airlight")
+    betas = value.get("fog_betas")
+    if (
+        not isinstance(d_ref, (int, float))
+        or isinstance(d_ref, bool)
+        or not math.isfinite(float(d_ref))
+        or float(d_ref) <= 0
+        or not isinstance(airlight, Sequence)
+        or isinstance(airlight, (str, bytes, bytearray))
+        or len(airlight) != 3
+        or any(
+            not isinstance(item, (int, float))
+            or isinstance(item, bool)
+            or not math.isfinite(float(item))
+            or not 0 <= float(item) <= 1
+            for item in airlight
+        )
+        or not isinstance(betas, Sequence)
+        or isinstance(betas, (str, bytes, bytearray))
+        or len(betas) != 3
+        or any(
+            not isinstance(item, (int, float))
+            or isinstance(item, bool)
+            or not math.isfinite(float(item))
+            or float(item) <= 0
+            for item in betas
+        )
+        or not float(betas[0]) < float(betas[1]) < float(betas[2])
+    ):
+        _fail("FOG_CALIBRATION_PARAMETERS_INVALID")
+    return dict(value)
+
+
+def _fog_binding_without_digest(value: Mapping[str, object]) -> dict[str, object]:
+    return {
+        key: item for key, item in value.items() if key != "fog_binding_sha256"
+    }
+
+
 def _validate_scene(
     value: object,
     *,
@@ -491,8 +618,9 @@ def _validate_scene(
     ordered_views: tuple[int, ...],
     input_root: Path,
     calibration_sha: str,
+    calibration: Mapping[str, object],
     source_root: Path,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     if not isinstance(value, Mapping) or set(value) != _SCENE_KEYS:
         _fail("INPUT_SCENE_SCHEMA_INVALID")
     if value.get("scene_id") != scene_id:
@@ -551,24 +679,71 @@ def _validate_scene(
 
     l3 = evidence_by_state["L3"]
     states: list[dict[str, object]] = []
+    fog_bindings: list[dict[str, object]] = []
     for state_id in SCIENTIFIC_STATES:
         if state_id in FOG_STATES:
+            severity = int(state_id[-1])
+            fog_betas = calibration["fog_betas"]
+            beta = fog_betas[severity - 1]
+            recipe = {
+                "schema_version": "georeliab-v4-pilot-fog-recipe-1.0",
+                "renderer": "Koschmieder",
+                "state_id": state_id,
+                "severity": severity,
+                "beta": beta,
+                "d_ref": calibration["d_ref"],
+                "airlight": calibration["airlight"],
+                "implementation_version": calibration["implementation_version"],
+                "corruption_calibration_sha256": calibration_sha,
+            }
+            recipe_sha = _sha256_value(recipe)
             for view in ordered_views:
                 generation = metadata_by_state[state_id][view].get("fog_generation")
                 if not isinstance(generation, Mapping) or set(generation) != (
                     _FOG_GENERATION_KEYS
                 ):
                     _fail("FOG_GENERATION_SCHEMA_INVALID")
-                if (
-                    generation.get("source_state_id") != "L3"
-                    or generation.get("source_sha256") != l3[view].sha256
-                    or generation.get("calibration_sha256") != calibration_sha
-                ):
-                    _fail("FOG_L3_SOURCE_BINDING_MISMATCH")
-                _require_sha(
-                    generation.get("recipe_sha256"),
-                    "FOG_RECIPE_DIGEST_INVALID",
+                expected = {
+                    "schema_version": (
+                        "georeliab-v4-pilot-fog-generation-binding-1.0"
+                    ),
+                    "scene_id": scene_id,
+                    "state_id": state_id,
+                    "severity": severity,
+                    "view_id": view,
+                    "fog_member": (
+                        f"SyntheticFog/scan{scene_id}/{state_id}/"
+                        f"rect_{view:03d}_3_r5000.png"
+                    ),
+                    "fog_sha256": evidence_by_state[state_id][view].sha256,
+                    "source_state_id": "L3",
+                    "source_member": (
+                        f"Rectified/scan{scene_id}/rect_{view:03d}_3_r5000.png"
+                    ),
+                    "source_sha256": l3[view].sha256,
+                    "gt_sha256": gt.sha256,
+                    "camera_sha256": cameras[view].sha256,
+                    "corruption_calibration_sha256": calibration_sha,
+                    "fog_recipe_sha256": recipe_sha,
+                    "renderer": "Koschmieder",
+                    "implementation_version": calibration[
+                        "implementation_version"
+                    ],
+                    "beta": beta,
+                    "d_ref": calibration["d_ref"],
+                    "airlight": calibration["airlight"],
+                }
+                if any(generation.get(key) != item for key, item in expected.items()):
+                    _fail("FOG_GENERATION_BINDING_MISMATCH")
+                binding_sha = _require_sha(
+                    generation.get("fog_binding_sha256"),
+                    "FOG_BINDING_DIGEST_INVALID",
                 )
+                if binding_sha != _sha256_value(
+                    _fog_binding_without_digest(generation)
+                ):
+                    _fail("FOG_BINDING_DIGEST_MISMATCH")
+                fog_bindings.append(dict(generation))
         try:
             state = materialize_dtu_state_identity(
                 source_root=source_root,
@@ -584,7 +759,7 @@ def _validate_scene(
         except CounterfactualContractError as exc:
             raise PilotInputResourceError(f"INPUT_STATE_IDENTITY_INVALID:{exc}") from exc
         states.append(state.to_dict())
-    return states
+    return states, fog_bindings
 
 
 def _storage_accounting(root: Path) -> dict[str, int]:
@@ -737,8 +912,11 @@ def prepare_pilot_input_resource_preflight(
         staged.get("fog_calibration_sha256"),
         "FOG_CALIBRATION_DIGEST_INVALID",
     )
-    if _sha256_file(calibration_path) != calibration_sha:
-        _fail("FOG_CALIBRATION_DIGEST_MISMATCH")
+    calibration = _validate_fog_calibration(
+        calibration_path,
+        expected_sha=calibration_sha,
+        pilot_scene_ids=scenes,
+    )
 
     scene_rows = staged.get("scenes")
     if not isinstance(scene_rows, Sequence) or isinstance(
@@ -748,19 +926,32 @@ def prepare_pilot_input_resource_preflight(
     if len(scene_rows) != 3:
         _fail("INPUT_SCENE_INVENTORY_INVALID")
     state_records: list[dict[str, object]] = []
+    fog_bindings: list[dict[str, object]] = []
     for scene_id, row in zip(scenes, scene_rows, strict=True):
-        state_records.extend(
-            _validate_scene(
-                row,
-                scene_id=scene_id,
-                ordered_views=views_by_scene[scene_id],
-                input_root=input_root,
-                calibration_sha=calibration_sha,
-                source_root=Path(source_root),
-            )
+        scene_states, scene_bindings = _validate_scene(
+            row,
+            scene_id=scene_id,
+            ordered_views=views_by_scene[scene_id],
+            input_root=input_root,
+            calibration_sha=calibration_sha,
+            calibration=calibration,
+            source_root=Path(source_root),
         )
+        state_records.extend(scene_states)
+        fog_bindings.extend(scene_bindings)
     if len(state_records) != 30:
         _fail("INPUT_STATE_INVENTORY_INVALID")
+    binding_identities = {
+        (row["scene_id"], row["state_id"], row["view_id"])
+        for row in fog_bindings
+    }
+    binding_digests = {row["fog_binding_sha256"] for row in fog_bindings}
+    if (
+        len(fog_bindings) != 72
+        or len(binding_identities) != 72
+        or len(binding_digests) != 72
+    ):
+        _fail("FOG_GENERATION_BINDING_INVENTORY_INVALID_OR_DUPLICATE")
 
     by_identity = {
         (row["scene_id"], row["state_id"]): row["state_identity_sha256"]
@@ -810,10 +1001,12 @@ def prepare_pilot_input_resource_preflight(
         _fail("BINDING_RUN_ROOT_NOT_FRESH")
 
     states_path = output / "manifests/pilot-model-independent-states.json"
+    fog_bindings_path = output / "manifests/pilot-fog-generation-bindings.json"
     units_path = output / "manifests/pilot-unit-records.json"
     closure_path = output / "manifests/pilot-input-closure.json"
     preflight_path = output / "pilot-input-preflight.json"
     states_bytes = _canonical_bytes(state_records)
+    fog_bindings_bytes = _canonical_bytes(fog_bindings)
     units_bytes = _canonical_bytes(units)
     closure: dict[str, object] = {
         "schema_version": INPUT_CLOSURE_SCHEMA,
@@ -832,13 +1025,20 @@ def prepare_pilot_input_resource_preflight(
         "schedule_identity_sha256": schedule_identity,
         "protocol_sha256": V4_PROTOCOL_SHA256,
         "input_root": str(input_root),
+        "fog_calibration_path": str(calibration_path),
+        "fog_calibration_sha256": calibration_sha,
+        "fog_calibration_split_fingerprint_sha256": calibration[
+            "split_fingerprint_sha256"
+        ],
         "scene_ids": list(scenes),
         "state_ids": list(SCIENTIFIC_STATES),
         "model_order": list(SCIENTIFIC_MODELS),
         "state_inventory_sha256": _sha256_bytes(states_bytes),
+        "fog_generation_inventory_sha256": _sha256_bytes(fog_bindings_bytes),
         "unit_inventory_sha256": _sha256_bytes(units_bytes),
         "primary_scene_count": 3,
         "state_identity_count": 30,
+        "fog_generation_binding_count": 72,
         "execution_unit_count": 60,
         "storage_accounting": storage,
         "max_storage_bytes": max_storage,
@@ -875,6 +1075,7 @@ def prepare_pilot_input_resource_preflight(
 
     output.mkdir(parents=True, exist_ok=False)
     _write_json_no_clobber(states_path, state_records)
+    _write_json_no_clobber(fog_bindings_path, fog_bindings)
     _write_json_no_clobber(units_path, units)
     _write_json_no_clobber(closure_path, closure)
     _write_json_no_clobber(preflight_path, preflight)
@@ -928,20 +1129,31 @@ def verify_pilot_input_resource_bundle(root: Path) -> dict[str, object]:
             _fail(f"MANIFEST_DIGEST_MISMATCH:{relative}")
 
     states_path = resolved / "manifests/pilot-model-independent-states.json"
+    fog_bindings_path = (
+        resolved / "manifests/pilot-fog-generation-bindings.json"
+    )
     units_path = resolved / "manifests/pilot-unit-records.json"
     closure_path = resolved / "manifests/pilot-input-closure.json"
     preflight_path = resolved / "pilot-input-preflight.json"
     states = _read_json(states_path, "MANIFEST_STATES_JSON_INVALID")
+    fog_bindings = _read_json(
+        fog_bindings_path, "MANIFEST_FOG_BINDINGS_JSON_INVALID"
+    )
     units = _read_json(units_path, "MANIFEST_UNITS_JSON_INVALID")
     if not isinstance(states, list) or len(states) != 30:
         _fail("MANIFEST_STATE_INVENTORY_INVALID")
+    if not isinstance(fog_bindings, list) or len(fog_bindings) != 72:
+        _fail("MANIFEST_FOG_BINDING_INVENTORY_INVALID")
     if not isinstance(units, list) or len(units) != 60:
         _fail("MANIFEST_UNIT_INVENTORY_INVALID")
     try:
         parsed_states = [ModelIndependentState.from_dict(row) for row in states]
     except CounterfactualContractError as exc:
         raise PilotInputResourceError(f"MANIFEST_STATE_IDENTITY_INVALID:{exc}") from exc
-    if len({row.state_identity_sha256 for row in parsed_states}) != 30:
+    if (
+        len({row.state_identity_sha256 for row in parsed_states}) != 30
+        or len({(row.scene_id, row.state_id) for row in parsed_states}) != 30
+    ):
         _fail("MANIFEST_STATE_IDENTITY_DUPLICATE")
 
     closure = _read_object(closure_path, "MANIFEST_CLOSURE_JSON_INVALID")
@@ -957,6 +1169,138 @@ def verify_pilot_input_resource_bundle(root: Path) -> dict[str, object]:
         or closure.get("execution_unit_count") != 60
     ):
         _fail("MANIFEST_CLOSURE_BINDING_MISMATCH")
+    if (
+        closure.get("fog_generation_binding_count") != 72
+        or closure.get("fog_generation_inventory_sha256")
+        != _sha256_file(fog_bindings_path)
+    ):
+        _fail("MANIFEST_FOG_INVENTORY_BINDING_MISMATCH")
+
+    scene_ids = tuple(dict.fromkeys(row.scene_id for row in parsed_states))
+    if (
+        len(scene_ids) != 3
+        or closure.get("scene_ids") != list(scene_ids)
+        or closure.get("state_ids") != list(SCIENTIFIC_STATES)
+    ):
+        _fail("MANIFEST_CLOSURE_SCIENTIFIC_AXIS_MISMATCH")
+    input_text = closure.get("input_root")
+    calibration_text = closure.get("fog_calibration_path")
+    if not isinstance(input_text, str) or not isinstance(calibration_text, str):
+        _fail("MANIFEST_FOG_CALIBRATION_PATH_INVALID")
+    input_raw = Path(input_text)
+    calibration_raw = Path(calibration_text)
+    if (
+        not input_raw.is_absolute()
+        or not input_raw.is_dir()
+        or input_raw.is_symlink()
+        or not calibration_raw.is_absolute()
+        or not calibration_raw.is_file()
+        or calibration_raw.is_symlink()
+    ):
+        _fail("MANIFEST_FOG_CALIBRATION_PATH_INVALID")
+    input_root = input_raw.resolve(strict=True)
+    calibration_path = calibration_raw.resolve(strict=True)
+    if not _inside(calibration_path, input_root):
+        _fail("MANIFEST_FOG_CALIBRATION_ROOT_INVALID")
+    calibration_sha = _require_sha(
+        closure.get("fog_calibration_sha256"),
+        "MANIFEST_FOG_CALIBRATION_DIGEST_INVALID",
+    )
+    calibration = _validate_fog_calibration(
+        calibration_path,
+        expected_sha=calibration_sha,
+        pilot_scene_ids=scene_ids,
+    )
+    if closure.get("fog_calibration_split_fingerprint_sha256") != calibration.get(
+        "split_fingerprint_sha256"
+    ):
+        _fail("MANIFEST_FOG_CALIBRATION_SPLIT_BINDING_MISMATCH")
+
+    fog_states = {
+        (row.scene_id, row.state_id): row
+        for row in parsed_states
+        if row.state_id in FOG_STATES
+    }
+    binding_identities: set[tuple[int, str, int]] = set()
+    binding_digests: set[str] = set()
+    for value in fog_bindings:
+        if not isinstance(value, Mapping) or set(value) != _FOG_GENERATION_KEYS:
+            _fail("MANIFEST_FOG_BINDING_SCHEMA_INVALID")
+        binding_sha = _require_sha(
+            value.get("fog_binding_sha256"),
+            "MANIFEST_FOG_BINDING_DIGEST_INVALID",
+        )
+        if binding_sha != _sha256_value(_fog_binding_without_digest(value)):
+            _fail("MANIFEST_FOG_BINDING_DIGEST_MISMATCH")
+        scene_id = value.get("scene_id")
+        state_id = value.get("state_id")
+        view_id = value.get("view_id")
+        if (
+            type(scene_id) is not int
+            or not isinstance(state_id, str)
+            or type(view_id) is not int
+            or (scene_id, state_id) not in fog_states
+        ):
+            _fail("MANIFEST_FOG_BINDING_IDENTITY_INVALID")
+        state = fog_states[(scene_id, state_id)]
+        if view_id not in state.ordered_view_ids:
+            _fail("MANIFEST_FOG_BINDING_VIEW_INVALID")
+        severity = int(state_id[-1])
+        beta = calibration["fog_betas"][severity - 1]
+        recipe = {
+            "schema_version": "georeliab-v4-pilot-fog-recipe-1.0",
+            "renderer": "Koschmieder",
+            "state_id": state_id,
+            "severity": severity,
+            "beta": beta,
+            "d_ref": calibration["d_ref"],
+            "airlight": calibration["airlight"],
+            "implementation_version": calibration["implementation_version"],
+            "corruption_calibration_sha256": calibration_sha,
+        }
+        expected = {
+            "schema_version": "georeliab-v4-pilot-fog-generation-binding-1.0",
+            "scene_id": scene_id,
+            "state_id": state_id,
+            "severity": severity,
+            "view_id": view_id,
+            "fog_member": (
+                f"SyntheticFog/scan{scene_id}/{state_id}/"
+                f"rect_{view_id:03d}_3_r5000.png"
+            ),
+            "fog_sha256": dict(
+                (row.view_id, row.sha256) for row in state.input_sha256_by_view
+            )[view_id],
+            "source_state_id": "L3",
+            "source_member": (
+                f"Rectified/scan{scene_id}/rect_{view_id:03d}_3_r5000.png"
+            ),
+            "source_sha256": dict(
+                (row.view_id, row.sha256)
+                for row in state.source_input_sha256_by_view
+            )[view_id],
+            "gt_sha256": state.gt_point_cloud_sha256,
+            "camera_sha256": dict(
+                (row.view_id, row.sha256) for row in state.camera_sha256_by_view
+            )[view_id],
+            "corruption_calibration_sha256": calibration_sha,
+            "fog_recipe_sha256": _sha256_value(recipe),
+            "renderer": "Koschmieder",
+            "implementation_version": calibration["implementation_version"],
+            "beta": beta,
+            "d_ref": calibration["d_ref"],
+            "airlight": calibration["airlight"],
+        }
+        if any(value.get(key) != item for key, item in expected.items()):
+            _fail("MANIFEST_FOG_BINDING_STATE_OR_RECIPE_MISMATCH")
+        identity = (scene_id, state_id, view_id)
+        if identity in binding_identities or binding_sha in binding_digests:
+            _fail("MANIFEST_FOG_BINDING_DUPLICATE")
+        binding_identities.add(identity)
+        binding_digests.add(binding_sha)
+    if len(binding_identities) != 72 or len(binding_digests) != 72:
+        _fail("MANIFEST_FOG_BINDING_INVENTORY_INVALID")
+
     preflight = _read_object(preflight_path, "MANIFEST_PREFLIGHT_JSON_INVALID")
     required = {
         "schema_version": INPUT_PREFLIGHT_SCHEMA,
