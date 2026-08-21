@@ -431,6 +431,131 @@ def _prepare_inputs(case: dict[str, Path]) -> dict[str, object]:
     )
 
 
+FOG_CALIBRATION_SCENES = (
+    2,
+    3,
+    5,
+    7,
+    8,
+    14,
+    17,
+    18,
+    20,
+    21,
+    22,
+    25,
+    26,
+    28,
+    30,
+    31,
+    35,
+    36,
+    37,
+    38,
+)
+
+
+def _strengthen_fog_bindings(
+    case: dict[str, Path],
+    *,
+    calibration_scene_ids: tuple[int, ...] = FOG_CALIBRATION_SCENES,
+) -> None:
+    inventory = _read_json(case["inventory"])
+    calibration_path = Path(inventory["fog_calibration_path"])
+    calibration = {
+        "schema_version": "georeliab-v4-pilot-fog-calibration-1.0",
+        "status": "V4_PILOT_FOG_CALIBRATION_FROZEN",
+        "validation_class": audit.DEVELOPMENT_EVIDENCE_ONLY,
+        "scientific_result": audit.NO_SCIENTIFIC_RESULT,
+        "source_split_role": "CALIBRATION",
+        "source_scene_ids": list(calibration_scene_ids),
+        "pilot_scene_ids": [9, 34, 118],
+        "scene_disjoint": not bool(
+            set(calibration_scene_ids) & {9, 34, 118}
+        ),
+        "split_fingerprint_sha256": "8" * 64,
+        "inventory_sha256": "9" * 64,
+        "d_ref": 12.5,
+        "airlight": [0.75, 0.8, 0.85],
+        "fog_betas": [0.01, 0.02, 0.03],
+        "implementation_version": "georeliab-corruptions-v1",
+        "pilot_started": False,
+    }
+    _write_json(calibration_path, calibration)
+    calibration_sha = _sha(calibration_path)
+    inventory["fog_calibration_sha256"] = calibration_sha
+
+    for scene in inventory["scenes"]:
+        scene_id = scene["scene_id"]
+        cameras = {
+            view: row
+            for view, row in zip(
+                scene["ordered_view_ids"], scene["cameras"], strict=True
+            )
+        }
+        states = {row["state_id"]: row for row in scene["states"]}
+        l3 = {
+            view: row
+            for view, row in zip(
+                scene["ordered_view_ids"],
+                states["L3"]["rgb_inputs"],
+                strict=True,
+            )
+        }
+        for state_id in ("fog-s1", "fog-s2", "fog-s3"):
+            severity = int(state_id[-1])
+            beta = calibration["fog_betas"][severity - 1]
+            recipe = {
+                "schema_version": "georeliab-v4-pilot-fog-recipe-1.0",
+                "renderer": "Koschmieder",
+                "state_id": state_id,
+                "severity": severity,
+                "beta": beta,
+                "d_ref": calibration["d_ref"],
+                "airlight": calibration["airlight"],
+                "implementation_version": calibration[
+                    "implementation_version"
+                ],
+                "corruption_calibration_sha256": calibration_sha,
+            }
+            recipe_sha = _sha_value(recipe)
+            for view, fog_row in zip(
+                scene["ordered_view_ids"],
+                states[state_id]["rgb_inputs"],
+                strict=True,
+            ):
+                binding = {
+                    "schema_version": (
+                        "georeliab-v4-pilot-fog-generation-binding-1.0"
+                    ),
+                    "scene_id": scene_id,
+                    "state_id": state_id,
+                    "severity": severity,
+                    "view_id": view,
+                    "fog_member": fog_row["member"],
+                    "fog_sha256": fog_row["sha256"],
+                    "source_state_id": "L3",
+                    "source_member": l3[view]["member"],
+                    "source_sha256": l3[view]["sha256"],
+                    "gt_sha256": scene["gt_point_cloud"]["sha256"],
+                    "camera_sha256": cameras[view]["sha256"],
+                    "corruption_calibration_sha256": calibration_sha,
+                    "fog_recipe_sha256": recipe_sha,
+                    "renderer": "Koschmieder",
+                    "implementation_version": calibration[
+                        "implementation_version"
+                    ],
+                    "beta": beta,
+                    "d_ref": calibration["d_ref"],
+                    "airlight": calibration["airlight"],
+                }
+                fog_row["fog_generation"] = {
+                    **binding,
+                    "fog_binding_sha256": _sha_value(binding),
+                }
+    _write_json(case["inventory"], inventory)
+
+
 # Resource identity and isolation: 5 contracts.
 def test_independent_resource_audit_binds_two_frozen_models(tmp_path: Path) -> None:
     case = _resource_case(tmp_path)
@@ -733,3 +858,103 @@ def test_cpu_preflight_cannot_dispatch_gpu_start_pilot_or_auto_progress(
     assert result["automatic_progression_allowed"] is False
     assert result["next_action"] == "RUN_SEPARATE_GPU_PREFLIGHT_AFTER_USER_REVIEW"
     assert not case["run_root"].exists()
+
+
+# Real fog generation and calibration closure: 4 additional contracts.
+def test_strong_fog_receipts_bind_every_output_input_and_recipe(
+    tmp_path: Path,
+) -> None:
+    case = _ready_case(tmp_path, suffix="strong-fog")
+    _strengthen_fog_bindings(case)
+
+    _prepare_inputs(case)
+    root = case["preflight_output"]
+    bindings = json.loads(
+        (root / "manifests/pilot-fog-generation-bindings.json").read_text()
+    )
+    closure = _read_json(root / "manifests/pilot-input-closure.json")
+
+    assert len(bindings) == 72
+    assert len({row["fog_binding_sha256"] for row in bindings}) == 72
+    assert {row["renderer"] for row in bindings} == {"Koschmieder"}
+    assert {row["implementation_version"] for row in bindings} == {
+        "georeliab-corruptions-v1"
+    }
+    assert closure["fog_generation_binding_count"] == 72
+    assert closure["fog_generation_inventory_sha256"] == _sha(
+        root / "manifests/pilot-fog-generation-bindings.json"
+    )
+
+
+def test_fog_receipt_or_declared_output_digest_tamper_fails_closed(
+    tmp_path: Path,
+) -> None:
+    valid = _ready_case(tmp_path, suffix="fog-valid-before-tamper")
+    _strengthen_fog_bindings(valid)
+    _prepare_inputs(valid)
+
+    for index, mutation in enumerate(("receipt", "declared-output")):
+        case = _ready_case(tmp_path, suffix=f"fog-binding-tamper-{index}")
+        _strengthen_fog_bindings(case)
+        inventory = _read_json(case["inventory"])
+        fog = inventory["scenes"][0]["states"][-1]["rgb_inputs"][0]
+        if mutation == "receipt":
+            fog["fog_generation"]["camera_sha256"] = "a" * 64
+        else:
+            path = Path(fog["path"])
+            path.write_bytes(path.read_bytes() + b"re-encoded\n")
+            fog["sha256"] = _sha(path)
+        _write_json(case["inventory"], inventory)
+        with pytest.raises(
+            audit.PilotInputResourceError,
+            match="FOG.*(BINDING|DIGEST)|INPUT.*ASSET",
+        ):
+            _prepare_inputs(case)
+
+
+def test_fog_calibration_requires_frozen_disjoint_nonpilot_split(
+    tmp_path: Path,
+) -> None:
+    valid = _ready_case(tmp_path, suffix="fog-calibration-valid")
+    _strengthen_fog_bindings(valid)
+    _prepare_inputs(valid)
+
+    overlap = _ready_case(tmp_path, suffix="fog-calibration-overlap")
+    _strengthen_fog_bindings(
+        overlap,
+        calibration_scene_ids=(*FOG_CALIBRATION_SCENES[:-1], 9),
+    )
+    with pytest.raises(
+        audit.PilotInputResourceError,
+        match="FOG_CALIBRATION.*(SPLIT|OVERLAP|DISJOINT)",
+    ):
+        _prepare_inputs(overlap)
+
+
+def test_fog_binding_manifest_missing_duplicate_and_tamper_fail_closed(
+    tmp_path: Path,
+) -> None:
+    case = _ready_case(tmp_path, suffix="fog-binding-manifest")
+    _strengthen_fog_bindings(case)
+    _prepare_inputs(case)
+    root = case["preflight_output"]
+    binding_path = root / "manifests/pilot-fog-generation-bindings.json"
+
+    rows = json.loads(binding_path.read_text())
+    assert len(rows) == 72
+    rows[-1] = rows[0]
+    _write_json(binding_path, rows)
+    manifest = root / "MANIFEST.sha256"
+    text = manifest.read_text(encoding="ascii")
+    old = next(
+        line.split("  ", 1)[0]
+        for line in text.splitlines()
+        if line.endswith("pilot-fog-generation-bindings.json")
+    )
+    manifest.write_text(text.replace(old, _sha(binding_path)), encoding="ascii")
+
+    with pytest.raises(
+        audit.PilotInputResourceError,
+        match="FOG.*(DUPLICATE|INVENTORY)|MANIFEST.*FOG",
+    ):
+        audit.verify_pilot_input_resource_bundle(root)
